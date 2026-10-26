@@ -3,6 +3,8 @@
 //!     cargo run -p chat-example
 //!
 //! `CHAT_DB` and `CHAT_ADDR` override the database path and the address.
+//! Ctrl-C or SIGTERM ends every live stream, so browsers reconnect, then
+//! stops the server.
 
 use chat_example::{Chat, router};
 use std::sync::Arc;
@@ -14,6 +16,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chat = Arc::new(Chat::open(&path)?);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("live chat on http://{addr}, chats in {path}");
-    axum::serve(listener, router(chat)).await?;
+    let closing = chat.clone();
+    axum::serve(listener, router(chat))
+        .with_graceful_shutdown(async move {
+            stopped().await;
+            // Live streams end, so their browsers reconnect, and the server
+            // can finish its open requests and exit.
+            closing.close();
+        })
+        .await?;
     Ok(())
+}
+
+/// Waits for Ctrl-C or, on Unix, SIGTERM, which deploy tools send.
+async fn stopped() {
+    let interrupt = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = interrupt => {}
+        () = terminate => {}
+    }
 }

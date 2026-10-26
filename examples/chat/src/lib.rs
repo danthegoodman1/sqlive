@@ -6,7 +6,7 @@
 
 use axum::Router;
 use axum::extract::{Json, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
@@ -19,7 +19,7 @@ use sqlive::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, watch};
 
 /// The live query each room shows.
@@ -58,6 +58,9 @@ impl ChatRow {
     }
 }
 
+/// How soon a browser reconnects after its stream ends, as at shutdown.
+const RECONNECT: Duration = Duration::from_secs(1);
+
 /// A room's live query result.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RoomResult {
@@ -65,6 +68,10 @@ pub struct RoomResult {
     /// Newest first, as the query orders them.
     pub chats: Vec<ChatRow>,
     pub read_set: String,
+    /// The rows' hash, sent as the event's id. A reconnecting browser sends
+    /// it back as `Last-Event-ID`.
+    #[serde(skip)]
+    pub hash: ResultHash,
 }
 
 /// The room's version, and what the follower did for the room while it
@@ -136,6 +143,7 @@ struct Hub {
 pub struct Chat {
     db: Arc<LiveDb>,
     hub: Arc<Mutex<Hub>>,
+    closing: watch::Sender<bool>,
 }
 
 /// One viewer of a room; the room closes when its last viewer drops.
@@ -143,6 +151,7 @@ pub struct Viewer {
     pub room: String,
     pub stats: watch::Receiver<RoomStats>,
     mailbox: Arc<Mailbox>,
+    closing: watch::Receiver<bool>,
     id: u64,
     hub: Weak<Mutex<Hub>>,
 }
@@ -188,6 +197,7 @@ fn split(result: QueryResult<ChatRow>) -> (RoomResult, ReadSet) {
         version: result.version,
         chats: result.rows,
         read_set: result.read_set.to_string(),
+        hash: result.hash,
     };
     (shown, result.read_set)
 }
@@ -221,7 +231,17 @@ impl Chat {
             .name("chat-follower".to_owned())
             .spawn(move || follow(changes, weak_db, weak_hub))
             .expect("starting the follower thread");
-        Ok(Chat { db, hub })
+        Ok(Chat {
+            db,
+            hub,
+            closing: watch::Sender::new(false),
+        })
+    }
+
+    /// Ends every live stream, as the server does before it exits; browsers
+    /// then reconnect, to this server or the one that replaces it.
+    pub fn close(&self) {
+        self.closing.send_replace(true);
     }
 
     /// The database, for writes the page does not make.
@@ -249,6 +269,17 @@ impl Chat {
 
     /// Joins a room and queries it for the new viewer.
     pub fn watch(&self, room: &str) -> sqlive::Result<Viewer> {
+        self.join(room, None)
+    }
+
+    /// Joins a room for a viewer who holds the result with hash `held`, as
+    /// a reconnecting browser does. The viewer gets the room's rows only
+    /// once they differ from the ones it holds.
+    pub fn resume(&self, room: &str, held: ResultHash) -> sqlive::Result<Viewer> {
+        self.join(room, Some(held))
+    }
+
+    fn join(&self, room: &str, held: Option<ResultHash>) -> sqlive::Result<Viewer> {
         // Querying under the hub's lock keeps the follower from checking a
         // commit between this query and the room joining the index.
         let mut hub = lock(&self.hub);
@@ -277,7 +308,9 @@ impl Chat {
         entry.version = version;
         entry.hash = hash;
         let mailbox = Arc::new(Mailbox::default());
-        mailbox.put(shown);
+        if held != Some(hash) {
+            mailbox.put(shown);
+        }
         entry.viewers.insert(id, mailbox.clone());
         let stats = entry.stats.clone();
         drop(hub);
@@ -293,6 +326,7 @@ impl Chat {
             room: room.to_owned(),
             stats: receiver,
             mailbox,
+            closing: self.closing.subscribe(),
             id,
             hub: Arc::downgrade(&self.hub),
         })
@@ -388,6 +422,7 @@ fn rerun(db: &LiveDb, hub: &Mutex<Hub>, room: &str) {
                         version,
                         chats: rows,
                         read_set: read_set.to_string(),
+                        hash,
                     };
                     push(entry, &Arc::new(shown));
                 }
@@ -486,6 +521,7 @@ async fn post_chat(
 fn result_event(result: &RoomResult) -> Event {
     Event::default()
         .event("result")
+        .id(result.hash.to_string())
         .json_data(result)
         .expect("a result serializes")
 }
@@ -500,22 +536,32 @@ fn stats_event(stats: &RoomStats) -> Event {
 async fn live(
     State(chat): State<Arc<Chat>>,
     Path(room): Path<String>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, Failure> {
     check_room(&room)?;
-    let mut viewer = tokio::task::spawn_blocking(move || chat.watch(&room))
-        .await
-        .map_err(server_error)?
-        .map_err(server_error)?;
-    let first = stats_event(&viewer.stats.borrow_and_update());
+    // A reconnecting browser names the last result it received.
+    let held = headers
+        .get("last-event-id")
+        .and_then(|id| id.to_str().ok())
+        .and_then(ResultHash::from_hex);
+    let mut viewer = tokio::task::spawn_blocking(move || match held {
+        Some(held) => chat.resume(&room, held),
+        None => chat.watch(&room),
+    })
+    .await
+    .map_err(server_error)?
+    .map_err(server_error)?;
+    let first = stats_event(&viewer.stats.borrow_and_update()).retry(RECONNECT);
     Ok(Sse::new(updates(first, viewer)).keep_alive(KeepAlive::default()))
 }
 
 /// The room's stats, then each result and each change to the stats, until
-/// the room closes or the client leaves and drops the viewer.
+/// the chat closes or the client leaves and drops the viewer.
 fn updates(first: Event, viewer: Viewer) -> impl Stream<Item = Result<Event, Infallible>> {
     use futures_util::StreamExt;
     let later = futures_util::stream::unfold(viewer, |mut viewer| async move {
         let event = tokio::select! {
+            _ = viewer.closing.wait_for(|closing| *closing) => return None,
             result = viewer.mailbox.next() => result_event(&result),
             changed = viewer.stats.changed() => {
                 changed.ok()?;

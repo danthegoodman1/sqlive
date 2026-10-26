@@ -386,6 +386,22 @@ MUTANTS = [
         "a joining chat viewer leaves the room's viewers behind",
         [(CHAT, "if entry.hash != hash { push(entry, &shown); }", "")],
     ),
+    (
+        "a resuming chat viewer gets the rows it holds",
+        [(CHAT, "if held != Some(hash) { mailbox.put(shown); }", "mailbox.put(shown);")],
+    ),
+    (
+        "chat results carry no event id",
+        [(CHAT, ".id(result.hash.to_string())", "")],
+    ),
+    (
+        "the chat server ignores Last-Event-ID",
+        [(CHAT, '.get("last-event-id")', '.get("x-unused")')],
+    ),
+    (
+        "closing the chat leaves live streams open",
+        [(CHAT, "self.closing.send_replace(true);", "")],
+    ),
 ]
 
 

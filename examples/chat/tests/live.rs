@@ -112,6 +112,24 @@ async fn a_rerun_that_finds_the_same_rows_pushes_nothing() {
 }
 
 #[tokio::test]
+async fn a_viewer_who_holds_the_current_rows_resumes_without_them() {
+    let chat = Chat::open(&temp_db("resume")).unwrap();
+    chat.post("a", "ann", "hello").unwrap();
+    let held = next(&chat.watch("a").unwrap()).await.hash;
+    let current = chat.resume("a", held).unwrap();
+    assert!(
+        current.try_result().is_none(),
+        "the viewer holds these rows"
+    );
+    chat.post("a", "bo", "again").unwrap();
+    assert_eq!(bodies(&*next(&current).await), ["again", "hello"]);
+    // A viewer holding older rows gets the room's rows at once.
+    let behind = chat.resume("a", held).unwrap();
+    let rows = behind.try_result().expect("the room's newer rows");
+    assert_eq!(bodies(&rows), ["again", "hello"]);
+}
+
+#[tokio::test]
 async fn a_slow_viewer_skips_to_the_newest_result() {
     let chat = Chat::open(&temp_db("slow")).unwrap();
     let mut a = chat.watch("a").unwrap();
@@ -269,32 +287,67 @@ async fn chats_survive_a_restart() {
     assert_eq!(bodies(&result), ["chat 2", "chat 1", "chat 0"]);
 }
 
-/// Sends a request and reads until the response holds `want`.
-async fn http(port: u16, request: String, want: &str) -> String {
+/// A request whose response a test reads in steps.
+struct Response {
+    stream: tokio::net::TcpStream,
+    text: String,
+}
+
+async fn request(port: u16, request: &str) -> Response {
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    let mut buffer = [0u8; 4096];
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !response.contains(want) {
-            let n = stream.read(&mut buffer).await.unwrap();
-            assert!(n > 0, "the connection closed before {want:?}: {response}");
-            response.push_str(&String::from_utf8_lossy(&buffer[..n]));
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("no {want:?} in time: {response}"));
-    response
+    Response {
+        stream,
+        text: String::new(),
+    }
+}
+
+impl Response {
+    /// Reads until the response holds `want`.
+    async fn until(&mut self, want: &str) {
+        let mut buffer = [0u8; 4096];
+        let (stream, text) = (&mut self.stream, &mut self.text);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !text.contains(want) {
+                let n = stream.read(&mut buffer).await.unwrap();
+                assert!(n > 0, "the connection closed before {want:?}: {text}");
+                text.push_str(&String::from_utf8_lossy(&buffer[..n]));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {want:?} in time: {}", self.text));
+    }
+}
+
+/// Sends a request and reads until the response holds `want`.
+async fn http(port: u16, request_text: String, want: &str) -> String {
+    let mut response = request(port, &request_text).await;
+    response.until(want).await;
+    response.text
+}
+
+fn post(room: &str, author: &str, body: &str) -> String {
+    let json = format!(r#"{{"author":"{author}","body":"{body}"}}"#);
+    format!(
+        "POST /rooms/{room}/chats HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+        json.len()
+    )
+}
+
+/// Serves `chat` on a free port and returns the port.
+async fn serve(chat: &Arc<Chat>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(axum::serve(listener, router(chat.clone())).into_future());
+    port
 }
 
 #[tokio::test]
 async fn the_page_and_routes_serve_over_http() {
     let chat = Arc::new(Chat::open(&temp_db("http")).unwrap());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(axum::serve(listener, router(chat)).into_future());
+    let port = serve(&chat).await;
 
     let page = http(
         port,
@@ -305,28 +358,16 @@ async fn the_page_and_routes_serve_over_http() {
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
     assert!(page.contains("10 most recent chats"));
 
-    let live = tokio::spawn(http(
-        port,
-        "GET /rooms/lobby/live HTTP/1.1\r\nHost: x\r\n\r\n".into(),
-        "\"body\":\"over http\"",
-    ));
-    let body = r#"{"author":"ann","body":"over http"}"#;
-    // The live stream joins the room before the post lands, or reads the
-    // chat in its first result; either way it sees it.
-    let posted = http(
-        port,
-        format!(
-            "POST /rooms/lobby/chats HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        ),
-        "\"version\"",
-    )
-    .await;
+    let mut live = request(port, "GET /rooms/lobby/live HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    live.until("event: stats").await;
+    let posted = http(port, post("lobby", "ann", "over http"), "\"version\"").await;
     assert!(posted.starts_with("HTTP/1.1 200"), "{posted}");
-    let stream = live.await.unwrap();
-    assert!(stream.contains("text/event-stream"), "{stream}");
-    assert!(stream.contains("event: result"), "{stream}");
-    assert!(stream.contains("event: stats"), "{stream}");
+    live.until("\"body\":\"over http\"").await;
+    assert!(live.text.contains("text/event-stream"), "{}", live.text);
+    assert!(live.text.contains("retry: 1000"), "{}", live.text);
+    // Each result carries its rows' hash as its id.
+    let held = next(&chat.watch("lobby").unwrap()).await.hash;
+    assert!(live.text.contains(&format!("id: {held}")), "{}", live.text);
 
     let rejected = http(
         port,
@@ -355,4 +396,40 @@ async fn the_page_and_routes_serve_over_http() {
     )
     .await;
     assert!(long.starts_with("HTTP/1.1 400"), "{long}");
+}
+
+/// A browser that reconnects, as after a deploy, sends the id of the last
+/// result it received and gets rows only once they change.
+#[tokio::test]
+async fn a_reconnecting_browser_gets_rows_only_when_they_changed() {
+    let chat = Arc::new(Chat::open(&temp_db("reconnect")).unwrap());
+    let port = serve(&chat).await;
+    chat.post("lobby", "ann", "before").unwrap();
+    let held = next(&chat.watch("lobby").unwrap()).await.hash;
+
+    let mut resumed = request(
+        port,
+        &format!("GET /rooms/lobby/live HTTP/1.1\r\nHost: x\r\nLast-Event-ID: {held}\r\n\r\n"),
+    )
+    .await;
+    resumed.until("event: stats").await;
+    http(port, post("lobby", "bo", "after"), "\"version\"").await;
+    resumed.until("\"body\":\"after\"").await;
+    assert_eq!(
+        resumed.text.matches("event: result").count(),
+        1,
+        "only the changed rows arrive: {}",
+        resumed.text
+    );
+}
+
+#[tokio::test]
+async fn closing_the_chat_ends_every_live_stream() {
+    let chat = Arc::new(Chat::open(&temp_db("closing")).unwrap());
+    let port = serve(&chat).await;
+    let mut live = request(port, "GET /rooms/lobby/live HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    live.until("event: result").await;
+    chat.close();
+    // The response's last chunk.
+    live.until("\r\n0\r\n\r\n").await;
 }

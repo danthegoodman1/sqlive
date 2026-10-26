@@ -263,9 +263,13 @@ collation, `NULL` handling) for you.
   generated columns are left out. Text that is not valid UTF-8 appears lossily
   converted, though changes to it are still detected exactly.
 - **Restarts:** the retained log lives in memory. After a restart, `changes_since(v)`
-  for any `v` below the current version yields `Lagged`.
+  for any `v` below the current version yields `Lagged`, so re-run each live query. A
+  `rerun` against the hash a client holds sends that client no rows when nothing
+  changed.
 - **Scope:** SqLive sees writes made through `write` on this `LiveDb`. Route every
-  write through it.
+  write through it. During a blue/green deploy, move writes to the new process in one
+  step: each process learns of the other's commits only at its own next write or
+  query, and then lags every open stream.
 
 ## How it works
 
@@ -314,6 +318,11 @@ viewers over server-sent events (`GET /rooms/{room}/live`). A room keeps only th
 version and hash of the rows its viewers hold, and each viewer holds at most one
 unsent result: a newer one replaces it. If the follower falls behind the log, it
 re-runs every room. `POST /rooms/{room}/chats` writes a chat.
+
+Each result event's id is its rows' hash. A browser that reconnects, as after a
+deploy, sends that id back as `Last-Event-ID`, and the server sends the room's rows
+only once they differ from it. On Ctrl-C or SIGTERM the server ends every live stream,
+so browsers reconnect at once, and then exits.
 
 ## Development
 
