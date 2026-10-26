@@ -35,6 +35,8 @@ SCHEMA = "crates/live/src/schema.rs"
 DEPS = "crates/live/src/deps.rs"
 READ = "crates/live/src/read.rs"
 READ_SET = "crates/live/src/read_set.rs"
+CONSTRAINTS = "crates/live/src/constraints.rs"
+COMPARE = "crates/live/src/compare.rs"
 
 STEP_TIMEOUT = 900
 
@@ -156,8 +158,8 @@ MUTANTS = [
     # Phase 4
     (
         "deletes do not intersect",
-        [(READ_SET, "change.op != Op::Update || table.reads_changed_column(change)",
-          "change.op == Op::Insert || (change.op == Op::Update && table.reads_changed_column(change))")],
+        [(READ_SET, "if change.op == Op::Update && !table.reads_changed_column(change) {",
+          "if change.op == Op::Delete || (change.op == Op::Update && !table.reads_changed_column(change)) {")],
     ),
     (
         "a read set keeps only the first column it reads",
@@ -202,6 +204,68 @@ MUTANTS = [
         "read sets compare reals by value, so 0.0 equals -0.0",
         [(READ_SET, "(Value::Real(x), Value::Real(y)) => x.to_bits() == y.to_bits(),",
           "(Value::Real(x), Value::Real(y)) => x == y,")],
+    ),
+    # Phase 5
+    (
+        "constants skip the column's affinity",
+        [(CONSTRAINTS, "let value = apply_affinity(self.conn, value, info.affinity)?;", "let value = Some(value)?;")],
+    ),
+    (
+        "NOCASE folds nothing",
+        [(COMPARE, "Collation::NoCase => text.iter().map(u8::to_ascii_lowercase).collect(),",
+          "Collation::NoCase => text.to_vec(),")],
+    ),
+    (
+        "RTRIM trims nothing",
+        [(COMPARE, "text[..end].to_vec()", "text.to_vec()")],
+    ),
+    (
+        "integers and reals compare inexactly",
+        [(COMPARE, "Ordering::Equal => (i as f64).partial_cmp(&r).unwrap_or(Ordering::Equal),",
+          "Ordering::Equal => Ordering::Equal,")],
+    ),
+    (
+        "window bounds exclude ties",
+        [(CONSTRAINTS, "order_cmp(value, boundary, collation, *descending, *nulls_first).is_le(),",
+          "order_cmp(value, boundary, collation, *descending, *nulls_first).is_lt(),")],
+    ),
+    (
+        "only new rows are checked",
+        [(READ_SET, "[&change.old, &change.new]", "[&change.new]")],
+    ),
+    (
+        "a window that is not full keeps its bound",
+        [(READ, "&& filling == Some(out.len() as u64 + 1)", "&& filling.is_some()")],
+    ),
+    (
+        "NULLs sort first under DESC",
+        [(CONSTRAINTS, "None => !descending,", "None => true,")],
+    ),
+    (
+        "LIMIT offset, count reads as LIMIT count OFFSET offset",
+        [(CONSTRAINTS, "TokenType::TK_COMMA if depth == 0 => comma = true,",
+          "TokenType::TK_COMMA if depth == 0 => comma = false,")],
+    ),
+    (
+        "the nullable side of a left join keeps its constraints",
+        [(CONSTRAINTS, "&& !context.occurrences[occurrence].nullable", "")],
+    ),
+    (
+        "OR splits like AND",
+        [(CONSTRAINTS, "Expr::Binary(left, Operator::And, right) => {",
+          "Expr::Binary(left, Operator::And | Operator::Or, right) => {")],
+    ),
+    (
+        "aggregates inside expressions get a window",
+        [(CONSTRAINTS, "ResultColumn::Expr(e, _) => is_plain_column(e),", "ResultColumn::Expr(..) => true,")],
+    ),
+    (
+        "subqueries in FILTER and OVER go unseen",
+        [(CONSTRAINTS, "order_by.is_some() || filter_over.is_some() ||", "")],
+    ),
+    (
+        "a flipped comparison keeps its operator",
+        [(CONSTRAINTS, "let op = if flipped { flip(*op)? } else { *op };", "let op = *op;")],
     ),
 ]
 

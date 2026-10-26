@@ -203,7 +203,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 4A: Reader pool, `query`, `snapshot`, commits in flight | `crates/live/src/read.rs`, `Log::begin_commit` and `Log::catch_up`; `a_held_snapshot_ignores_later_writes`, `a_result_never_runs_ahead_of_the_log` (four reader threads beside a writer; no result runs ahead and no stream lags) in `crates/live/tests/queries.rs`; `seeds_5476_and_8109_a_snapshot_sqlite_ended_reads_nothing_newer` in `crates/sim/tests/seeds.rs`. |
+| Complete | Work | 4A: Reader pool, `query`, `snapshot`, commits in flight | `crates/live/src/read.rs`, `Log::begin_commit` and `Log::catch_up`; `a_held_snapshot_ignores_later_writes`, `a_result_never_runs_ahead_of_the_log` (four reader threads beside a writer; no result runs ahead and no stream lags) in `crates/live/tests/queries.rs`; `seeds_5476_and_5551_a_snapshot_sqlite_ended_reads_nothing_newer` in `crates/sim/tests/seeds.rs`. |
 | Complete | Work | 4B: Authorizer dependencies | `crates/live/src/deps.rs`; `views_ctes_subqueries_and_joins_report_their_base_tables`, `a_query_may_not_end_its_snapshot_reach_another_database_or_write`, `a_schema_change_refreshes_the_reads_of_a_repeated_query`, `a_full_text_query_depends_on_its_shadow_tables`, `an_external_content_query_depends_on_its_content_table`. |
 | Complete | Work | 4C: Table-level `ReadSet` and `intersects` | `crates/live/src/read_set.rs`; `intersects_finds_the_events_that_can_change_a_result`, `an_update_between_texts_that_are_not_utf8_intersects`, `a_query_of_the_version_table_sees_every_commit`, `a_query_of_an_internal_table_sees_every_commit`. |
 | Complete | Work | 4D: Simulator queries and subscriptions | `crates/sim/src/live/{queries,subscriptions}.rs`; views in `crates/sim/src/live/schema.rs`; `Live::follow`, `Live::hold`, `Live::check_hold`, `Live::settle`. Subscription options draw from their own PRNG stream, and a held snapshot spans the step's own write, so earlier draws stay unchanged. |
@@ -222,7 +222,7 @@ Scope:
 - 5B Comparator: SQLite's storage-class order, column affinity applied to operands, and the `BINARY`, `NOCASE` and `RTRIM` collations, both declared and explicit. Columns with app-registered collations fall back to table level.
 - 5C Window bounds: when the first `ORDER BY` term is a plain column of a constrained table and the query returned `LIMIT` rows, bound by the last row in `ORDER BY` order (direction, collation, `NULLS FIRST`/`LAST`), inclusive. Applies with `OFFSET` too. Drop the bound when fewer rows return.
 - 5D Fallback: any table the authorizer reports without extracted constraints gets table level. So do tables under `OR`, functions of columns, subqueries, and the nullable side of a `LEFT JOIN`. Skip window bounds with `GROUP BY` and `DISTINCT`.
-- 5E Simulator: the query generator covers supported and fallback shapes, mixed-type values, collations, `NULL`s, tied sort keys and `OFFSET`.
+- 5E Simulator: the query generator covers supported and fallback shapes, mixed-type values, collations, `NULL`s, tied sort keys, `OFFSET` and `LIMIT offset, count`. Shapes added in this phase draw from their own PRNG stream.
 
 Out of scope:
 - Join keys collected from results for inner tables.
@@ -231,25 +231,25 @@ Completion gate:
 All properties hold over a 10,000-seed sweep with faults and crashes enabled; `scripts/mutants` catches every Phase 5 planted bug; `/code-review` findings are resolved.
 
 Testing plan:
-- Differential test: the comparator agrees with SQLite (`SELECT ?1 <op> ?2 COLLATE ...`) on random value pairs for every operator, affinity and collation.
-- Unit tests for extraction and window bounds, including ties and `NULLS LAST`.
+- Differential tests: the comparator agrees with SQLite (`SELECT ?1 < ?2 COLLATE ...`) on every pair of edge values under each collation, and read sets agree with SQLite's `WHERE` on random stored values for every operator, affinity and collation.
+- Unit tests for extraction and window bounds, including ties, `OFFSET`, `NULLS FIRST`/`LAST` and `NULL` boundaries.
 - Properties: the Phase 4 live-result property. An equality subscription on key A never re-runs for an event that touches only key B.
-- Planted bugs: affinity ignored; `NOCASE` ignored; exclusive bounds at ties; only new rows checked; the bound kept when fewer than `LIMIT` rows return; `NULL` placed first under `DESC`; a table the authorizer reports dropped when extraction finds nothing.
+- Planted bugs: affinity ignored; `NOCASE` and `RTRIM` ignored; inexact integer-real comparison; exclusive bounds at ties; only new rows checked; the bound kept when fewer than `LIMIT` rows return; `NULL` placed first under `DESC`; the `LIMIT offset, count` form misread; the nullable side of a left join constrained; `OR` split like `AND`; flipped comparisons; aggregates in expressions given a window; subqueries in `FILTER`/`OVER` missed.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Decision | Parser crate: `sqlite3-parser` or its turso fork | Needs: comparison of API stability and SQLite grammar coverage. |
-| Incomplete | Work | 5A: Constraint extraction and parameter binding | Missing: `crates/live/src/constraints.rs`; unit tests. |
-| Incomplete | Work | 5B: SQLite comparator | Missing: `crates/live/src/compare.rs`; differential test. |
-| Incomplete | Work | 5C: Window bounds | Missing: unit tests for ties, `OFFSET` and `NULLS FIRST`/`LAST`. |
-| Incomplete | Work | 5D: Fallbacks | Missing: unit tests for each fallback shape. |
-| Incomplete | Work | 5E: Simulator query shapes and values | Missing: generator changes in `crates/sim/src/queries.rs`. |
-| Incomplete | Test | Live-result and precision properties | Missing: seed tests; precision property. |
-| Incomplete | Test | Phase 5 planted bugs | Missing: `scripts/mutants` report, 7 of 7 caught. |
-| Incomplete | Gate | 10,000-seed sweep | Missing: sweep output. |
-| Incomplete | Gate | Code review | Missing: `/code-review` findings and resolutions. |
+| Complete | Decision | Parser crate | `sqlite3-parser` 0.17 (`Cargo.toml`). It reads `LIMIT a, b` as `LIMIT a OFFSET b`, so `limit_uses_comma` in `crates/live/src/constraints.rs` detects the form from the tokens. |
+| Complete | Work | 5A: Constraint extraction and parameter binding | `crates/live/src/constraints.rs` (`analyze`, `number_parameters`); `every_parameter_form_binds_its_value_into_the_constraint` in `crates/live/tests/windows.rs`; `read_sets_intersect_every_insert_and_delete_their_where_accepts` (3,000 random cases) in `crates/live/tests/constraints.rs`. |
+| Complete | Work | 5B: SQLite comparator | `compare` in `crates/live/src/compare.rs`; `compare_orders_every_pair_as_sqlite_does`, `null_sorts_before_every_other_value`; `a_constant_converts_by_the_column_affinity`. A column whose collation SqLive cannot name gets no constraints. |
+| Complete | Work | 5C: Window bounds | `window_plan` in `crates/live/src/constraints.rs` and `constrain` in `crates/live/src/read.rs`; `a_full_window_bounds_the_rows_at_its_last_sort_key`, `a_window_that_is_not_full_bounds_nothing`, `rows_before_an_offset_window_count`, `a_zero_limit_depends_on_no_rows`, `nulls_sort_first_ascending_and_last_descending_unless_told`, `a_window_orders_text_under_the_sort_collation`, `a_window_needs_its_sort_key_among_the_results`. |
+| Complete | Work | 5D: Fallbacks | `shapes_the_analysis_cannot_model_fall_back_to_whole_tables` (`OR`, functions, subqueries, views, CTEs, compounds, expressions, left joins, grouped windows, aggregates in expressions, subqueries in `FILTER` and `OVER`). Tables the analysis does not name keep `Filter::All`, since `constrain` narrows only tables it names. |
+| Complete | Work | 5E: Simulator query shapes and values | `crates/sim/src/live/queries.rs` (`more_predicate`, `listing`, the comma form); live seeds 0–299: 66,980 queries, 17,627 with constraints, 1,162 with window bounds. |
+| Complete | Test | Live-result and precision properties | Live seeds 0–299: 195,698 subscription checks; re-runs fell from 100,888 at table level to 60,728, and the share that left rows unchanged from 75% to 59%. `an_equality_on_one_key_skips_writes_to_other_keys`. |
+| Complete | Test | Phase 5 planted bugs | `scripts/mutants --layers unit,sim,seeds`: 50 of 50 caught, 14 of them Phase 5; the simulator alone catches the `LIMIT offset, count` misreading. A table the authorizer reports but the analysis leaves out cannot lose its reads, since `constrain` narrows only tables it names, so that planted bug has no code to mutate. |
+| Complete | Gate | 10,000-seed sweep | `cargo run --release -p sqlive-sim -- 0 --seeds 10000` (storage and live): 0 of 10,000 failed, after the review fixes. |
+| Complete | Gate | Code review | `/code-review high` found 9 issues, all resolved: windows need plain columns in the results and `ORDER BY`; calls with `FILTER`, `OVER` or an aggregate `ORDER BY` fall back; an unknown collation keeps constraints off a column; new query shapes draw from their own stream; the `LIMIT` form is computed once per query text and the affinity cast is a cached statement; a stale doc is gone; windows display `NULLS FIRST` and `NULL` boundaries as SQL that selects the same rows; only the row that fills a window is copied; one helper resolves column operands. The regression seeds for ended snapshots changed to 5476 and 5551, and the test now asserts each still ends a snapshot. |
 
 ## Phase 6: Read-Set Index
 

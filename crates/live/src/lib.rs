@@ -7,6 +7,7 @@
 
 mod capture;
 mod compare;
+mod constraints;
 mod db;
 mod deps;
 mod error;
@@ -18,6 +19,7 @@ mod read_set;
 mod schema;
 
 pub use compare::{Affinity, Collation};
+pub use constraints::{Condition, Conjunction, Constraint, Filter};
 pub use db::{LiveDb, Options};
 pub use error::{Error, Result};
 pub use event::{CommitEvent, Op, Row, RowChange, Version};

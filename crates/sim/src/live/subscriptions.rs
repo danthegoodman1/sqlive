@@ -7,7 +7,7 @@ use super::queries::QuerySpec;
 use crate::prng::Prng;
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
-use sqlive::{Changes, CommitEvent, Error, LiveDb, ReadSet, Version};
+use sqlive::{Changes, CommitEvent, Condition, Error, Filter, LiveDb, ReadSet, Version};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -45,7 +45,39 @@ pub struct Tally {
     /// Re-runs whose rows came out the same.
     pub unchanged: u64,
     pub failed_queries: u64,
+    /// Failed queries whose snapshot SQLite had ended.
+    pub ended: u64,
     pub lagged: u64,
+    pub queries: u64,
+    /// Results whose read set narrows some table to the rows it needs.
+    pub constrained: u64,
+    /// Results whose read set bounds a `LIMIT` window.
+    pub windowed: u64,
+}
+
+impl Tally {
+    /// Counts a query an injected fault stopped.
+    pub fn failed(&mut self, error: &Error) {
+        self.failed_queries += 1;
+        self.ended += u64::from(matches!(error, Error::SnapshotEnded));
+    }
+
+    fn count(&mut self, read_set: &ReadSet) {
+        let conditions = || {
+            read_set.tables().flat_map(|table| match table.filter() {
+                Filter::All => &[][..],
+                Filter::AnyOf(conjunctions) => conjunctions.as_slice(),
+            })
+        };
+        self.queries += 1;
+        self.constrained += u64::from(conditions().next().is_some());
+        self.windowed += u64::from(conditions().any(|conjunction| {
+            conjunction
+                .constraints
+                .iter()
+                .any(|c| matches!(c.condition, Condition::Window { .. }))
+        }));
+    }
 }
 
 /// Every column of every row.
@@ -75,8 +107,8 @@ impl Subscription {
         self.buffer.clear();
         let result = match db.query(&self.query.sql, self.query.params.clone(), rows) {
             Ok(result) => result,
-            Err(_) => {
-                tally.failed_queries += 1;
+            Err(e) => {
+                tally.failed(&e);
                 return Ok(false);
             }
         };
@@ -92,6 +124,7 @@ impl Subscription {
                 self.id, result.version
             )
         })?);
+        tally.count(&result.read_set);
         self.held = Some(Held {
             rows: result.rows,
             version: result.version,

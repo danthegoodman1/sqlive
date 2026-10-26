@@ -1,5 +1,8 @@
 //! Random queries: filters, joins, subqueries, aggregates, views and CTEs,
 //! with `ORDER BY`, `LIMIT` and `OFFSET`.
+//!
+//! Shapes added after the first draw from `extra`, their own stream, so
+//! every query an existing seed drew from `prng` stays the same.
 
 use super::schema::{SchemaSpec, TableKind, TableSpec};
 use super::writes::value;
@@ -34,7 +37,54 @@ fn tiebreak(table: &TableSpec, alias: &str) -> Vec<String> {
 }
 
 /// A predicate on one column of `table`, which the query calls `alias`.
-fn predicate(prng: &mut Prng, table: &TableSpec, alias: &str, params: &mut Vec<Value>) -> String {
+fn predicate(
+    prng: &mut Prng,
+    extra: Option<&mut Prng>,
+    table: &TableSpec,
+    alias: &str,
+    params: &mut Vec<Value>,
+) -> String {
+    let mut drawn = Vec::new();
+    let first = first_predicate(prng, table, alias, &mut drawn);
+    if let Some(extra) = extra
+        && extra.chance(0.25)
+    {
+        return more_predicate(extra, table, alias, params);
+    }
+    params.extend(drawn);
+    first
+}
+
+/// Comparisons with the column on the right, explicit collations, and
+/// `NULL` in a list.
+fn more_predicate(
+    prng: &mut Prng,
+    table: &TableSpec,
+    alias: &str,
+    params: &mut Vec<Value>,
+) -> String {
+    let column = &table.columns[prng.index(table.columns.len())];
+    let name = format!("{alias}.{}", column.name);
+    let mut param = |prng: &mut Prng| {
+        params.push(value(prng, column, table.strict));
+        "?".to_owned()
+    };
+    match prng.below(6) {
+        0 => format!("{} = {name}", param(prng)),
+        1 => format!("{} {} {name}", param(prng), *prng.pick(&["<", ">="])),
+        2 => format!("{name} COLLATE RTRIM = {}", param(prng)),
+        3 => format!("{name} = {} COLLATE BINARY", param(prng)),
+        4 => format!("{name} IN ({}, NULL)", param(prng)),
+        _ => format!("{name} <= {}", param(prng)),
+    }
+}
+
+fn first_predicate(
+    prng: &mut Prng,
+    table: &TableSpec,
+    alias: &str,
+    params: &mut Vec<Value>,
+) -> String {
     let column = &table.columns[prng.index(table.columns.len())];
     let name = format!("{alias}.{}", column.name);
     let mut param = |prng: &mut Prng| {
@@ -63,6 +113,7 @@ fn predicate(prng: &mut Prng, table: &TableSpec, alias: &str, params: &mut Vec<V
 
 fn filter(
     prng: &mut Prng,
+    mut extra: Option<&mut Prng>,
     table: &TableSpec,
     alias: &str,
     params: &mut Vec<Value>,
@@ -70,7 +121,7 @@ fn filter(
     let count = prng.below(4);
     (count > 0).then(|| {
         (0..count)
-            .map(|_| predicate(prng, table, alias, params))
+            .map(|_| predicate(prng, extra.as_deref_mut(), table, alias, params))
             .collect::<Vec<_>>()
             .join(" AND ")
     })
@@ -101,6 +152,7 @@ fn columns(prng: &mut Prng, table: &TableSpec, alias: &str) -> String {
 /// is total.
 fn order_and_limit(
     prng: &mut Prng,
+    extra: &mut Prng,
     table: &TableSpec,
     alias: &str,
     params: &mut Vec<Value>,
@@ -109,11 +161,20 @@ fn order_and_limit(
     let mut ordered = false;
     if prng.chance(0.6) {
         let column = &table.columns[prng.index(table.columns.len())];
-        let mut terms = vec![format!(
-            "{alias}.{}{}{}",
-            column.name,
+        let (direction, nulls) = (
             *prng.pick(&["", " ASC", " DESC"]),
-            *prng.pick(&["", "", " NULLS FIRST", " NULLS LAST"])
+            *prng.pick(&["", "", " NULLS FIRST", " NULLS LAST"]),
+        );
+        let collate = *extra.pick(&[
+            "",
+            "",
+            " COLLATE NOCASE",
+            " COLLATE BINARY",
+            " COLLATE RTRIM",
+        ]);
+        let mut terms = vec![format!(
+            "{alias}.{}{collate}{direction}{nulls}",
+            column.name
         )];
         if prng.chance(0.9) {
             terms.extend(tiebreak(table, alias));
@@ -124,20 +185,67 @@ fn order_and_limit(
     // Without a total order, a limit picks rows the planner chooses.
     if ordered && prng.chance(0.5) {
         let limit = prng.range(0..=6) as i64;
-        if prng.chance(0.5) {
+        let count = if prng.chance(0.5) {
             params.push(Value::Integer(limit));
-            clause.push_str(" LIMIT ?");
+            "?".to_owned()
         } else {
-            clause.push_str(&format!(" LIMIT {limit}"));
-        }
+            limit.to_string()
+        };
         if prng.chance(0.3) {
-            clause.push_str(&format!(" OFFSET {}", prng.range(0..=3)));
+            let offset = prng.range(0..=3);
+            if extra.chance(0.4) {
+                clause.push_str(&format!(" LIMIT {offset}, {count}"));
+            } else {
+                clause.push_str(&format!(" LIMIT {count} OFFSET {offset}"));
+            }
+        } else {
+            clause.push_str(&format!(" LIMIT {count}"));
         }
     }
     (clause, ordered)
 }
 
-pub fn query(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
+pub fn query(prng: &mut Prng, extra: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
+    let first = first_query(prng, extra, schema);
+    if extra.chance(1.0 / 6.0) {
+        listing(extra, schema)
+    } else {
+        first
+    }
+}
+
+/// A listing ordered by one column and cut by a `LIMIT`, as a feed shows
+/// its newest rows.
+fn listing(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
+    let table = &schema.tables[prng.index(schema.tables.len())];
+    let mut params = Vec::new();
+    let mut sql = format!("SELECT a.* FROM {} AS a", table.name);
+    if let Some(filter) = filter(prng, None, table, "a", &mut params) {
+        sql.push_str(&format!(" WHERE {filter}"));
+    }
+    let column = &table.columns[prng.index(table.columns.len())];
+    let mut terms = vec![format!(
+        "a.{}{}{}",
+        column.name,
+        *prng.pick(&["", " COLLATE NOCASE", " COLLATE RTRIM"]),
+        *prng.pick(&[" ASC", " DESC", " DESC NULLS FIRST", " NULLS LAST"])
+    )];
+    terms.extend(tiebreak(table, "a"));
+    sql.push_str(&format!(" ORDER BY {}", terms.join(", ")));
+    params.push(Value::Integer(prng.range(1..=8) as i64));
+    if prng.chance(0.3) {
+        sql.push_str(&format!(" LIMIT ? OFFSET {}", prng.range(1..=3)));
+    } else {
+        sql.push_str(" LIMIT ?");
+    }
+    QuerySpec {
+        sql,
+        params,
+        ordered: true,
+    }
+}
+
+fn first_query(prng: &mut Prng, extra: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
     let t = prng.index(schema.tables.len());
     let table = &schema.tables[t];
     let mut params = Vec::new();
@@ -146,14 +254,14 @@ pub fn query(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
         0..=4 => {
             let columns = columns(prng, table, "a");
             let mut sql = format!("SELECT {columns} FROM {} AS a", table.name);
-            if let Some(filter) = filter(prng, table, "a", &mut params) {
+            if let Some(filter) = filter(prng, Some(&mut *extra), table, "a", &mut params) {
                 sql.push_str(&format!(" WHERE {filter}"));
             }
             let aggregate = columns == "count(*)";
             let (clause, ordered) = if aggregate {
                 (String::new(), false)
             } else {
-                order_and_limit(prng, table, "a", &mut params)
+                order_and_limit(prng, extra, table, "a", &mut params)
             };
             sql.push_str(&clause);
             QuerySpec {
@@ -174,11 +282,11 @@ pub fn query(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
                 table.name, other.name
             );
             let mut filters = Vec::new();
-            if let Some(f) = filter(prng, table, "a", &mut params) {
+            if let Some(f) = filter(prng, Some(&mut *extra), table, "a", &mut params) {
                 filters.push(f);
             }
             if prng.chance(0.4) {
-                filters.push(predicate(prng, other, "b", &mut params));
+                filters.push(predicate(prng, Some(&mut *extra), other, "b", &mut params));
             }
             if !filters.is_empty() {
                 sql.push_str(&format!(" WHERE {}", filters.join(" AND ")));
@@ -196,14 +304,14 @@ pub fn query(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
             let left = &table.columns[prng.index(table.columns.len())].name;
             let right = &other.columns[prng.index(other.columns.len())].name;
             let mut inner = format!("SELECT b.{right} FROM {} AS b", other.name);
-            if let Some(f) = filter(prng, other, "b", &mut params) {
+            if let Some(f) = filter(prng, Some(&mut *extra), other, "b", &mut params) {
                 inner.push_str(&format!(" WHERE {f}"));
             }
             let mut sql = format!(
                 "SELECT a.* FROM {} AS a WHERE a.{left} IN ({inner})",
                 table.name
             );
-            if let Some(f) = filter(prng, table, "a", &mut params) {
+            if let Some(f) = filter(prng, Some(&mut *extra), table, "a", &mut params) {
                 sql.push_str(&format!(" AND {f}"));
             }
             QuerySpec {
@@ -216,7 +324,7 @@ pub fn query(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
         8 => {
             let group = &table.columns[prng.index(table.columns.len())].name;
             let mut sql = format!("SELECT a.{group}, count(*) AS n FROM {} AS a", table.name);
-            if let Some(f) = filter(prng, table, "a", &mut params) {
+            if let Some(f) = filter(prng, Some(&mut *extra), table, "a", &mut params) {
                 sql.push_str(&format!(" WHERE {f}"));
             }
             sql.push_str(&format!(" GROUP BY a.{group}"));
@@ -232,7 +340,7 @@ pub fn query(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
                 format!("SELECT * FROM v{}", prng.index(schema.views.len()))
             } else {
                 let mut inner = format!("SELECT * FROM {} AS a", table.name);
-                if let Some(f) = filter(prng, table, "a", &mut params) {
+                if let Some(f) = filter(prng, Some(&mut *extra), table, "a", &mut params) {
                     inner.push_str(&format!(" WHERE {f}"));
                 }
                 format!("WITH q AS ({inner}) SELECT * FROM q")

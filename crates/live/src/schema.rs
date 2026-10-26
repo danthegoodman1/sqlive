@@ -1,7 +1,7 @@
 //! What SqLive knows about each table in the main database: columns,
 //! affinities, collations, and how to address a row.
 
-use crate::compare::Collation;
+use crate::compare::{Affinity, Collation};
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,6 +14,9 @@ pub(crate) struct Column {
     pub name: String,
     /// False for a `VIRTUAL` generated column.
     pub stored: bool,
+    pub affinity: Affinity,
+    /// The collation the column compares with by default.
+    pub collation: Collation,
 }
 
 #[derive(Debug)]
@@ -57,24 +60,29 @@ impl Schema {
     pub fn load(conn: &Connection) -> rusqlite::Result<Schema> {
         let version: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
         let mut list = conn.prepare(
-            "SELECT name, wr FROM pragma_table_list
+            "SELECT name, wr, strict FROM pragma_table_list
              WHERE schema = 'main' AND type IN ('table', 'shadow')
                AND substr(name, 1, 7) <> 'sqlite_'
              ORDER BY name",
         )?;
-        let names: Vec<(String, bool)> = list
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        let names: Vec<(String, bool, bool)> = list
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut tables = BTreeMap::new();
-        for (name, without_rowid) in names {
-            let table = load_table(conn, &name, without_rowid)?;
+        for (name, without_rowid, strict) in names {
+            let table = load_table(conn, &name, without_rowid, strict)?;
             tables.insert(name.to_ascii_lowercase(), Arc::new(table));
         }
         Ok(Schema { version, tables })
     }
 }
 
-fn load_table(conn: &Connection, name: &str, without_rowid: bool) -> rusqlite::Result<Table> {
+fn load_table(
+    conn: &Connection,
+    name: &str,
+    without_rowid: bool,
+    strict: bool,
+) -> rusqlite::Result<Table> {
     let mut info = conn
         .prepare("SELECT cid, name, type, pk, hidden FROM pragma_table_xinfo(?1) ORDER BY cid")?;
     let rows: Vec<(usize, String, String, i64, i64)> = info
@@ -90,11 +98,22 @@ fn load_table(conn: &Connection, name: &str, without_rowid: bool) -> rusqlite::R
         .collect::<rusqlite::Result<_>>()?;
     let mut columns = Vec::new();
     let mut pk = Vec::new();
-    for (cid, column, _declared, pk_position, hidden) in rows {
+    for (cid, column, declared, pk_position, hidden) in rows {
         if pk_position > 0 {
             pk.push((pk_position, cid));
         }
+        let collation = conn
+            .column_metadata(Some("main"), name, column.as_str())
+            .ok()
+            .and_then(|(_, collation, ..)| {
+                collation.map(|c| Collation::from_name(&c.to_string_lossy()))
+            })
+            // A collation SqLive cannot name keeps constraints off the
+            // column.
+            .unwrap_or_else(|| Collation::Other(String::new()));
         columns.push(Column {
+            affinity: Affinity::from_declared(&declared, strict),
+            collation,
             name: column,
             stored: hidden != 2,
         });

@@ -1,15 +1,20 @@
 //! Queries on read-only connections, each inside a snapshot whose version
 //! the read set records.
 
+use crate::capture::owned;
+use crate::constraints::{self, Analysis, Condition, Constraint, Filter, Numbered};
 use crate::db::{LiveDb, open_connection};
 use crate::deps::{self, Reads, Slot};
 use crate::error::{Error, Result};
 use crate::event::Version;
 use crate::params::{ParamValues, QueryParams};
 use crate::read_set::ReadSet;
+use crate::schema::Schema;
+use rusqlite::types::Value;
 use rusqlite::{Connection, Statement};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// A query's rows, the version of the snapshot it read, and what the rows
 /// depend on.
@@ -26,10 +31,20 @@ const CACHED_QUERIES: usize = 256;
 pub(crate) struct Reader {
     conn: Connection,
     slot: Slot,
-    /// The schema cookie the cached reads were recorded under.
-    schema: i64,
-    /// The reads of each query text prepared under `schema`.
-    cache: RefCell<BTreeMap<String, Reads>>,
+    /// The schema cookie `schema` and the cache were loaded under.
+    cookie: i64,
+    schema: Arc<Schema>,
+    /// What each query text reads, recorded under `cookie`.
+    cache: RefCell<BTreeMap<String, Cached>>,
+}
+
+/// What a reader remembers about a query text.
+#[derive(Clone)]
+struct Cached {
+    reads: Reads,
+    /// The text with its parameters numbered, for the constraint analysis;
+    /// `None` when SQLite numbers them differently.
+    numbered: Option<Numbered>,
 }
 
 impl Reader {
@@ -39,7 +54,8 @@ impl Reader {
         Ok(Reader {
             conn,
             slot,
-            schema: -1,
+            cookie: -1,
+            schema: Arc::new(Schema::default()),
             cache: RefCell::new(BTreeMap::new()),
         })
     }
@@ -69,21 +85,23 @@ impl Reader {
         Ok(())
     }
 
-    /// The reads of `sql`, recorded while preparing it the first time this
+    /// What `sql` reads, recorded while preparing it the first time this
     /// reader sees it under the current schema.
-    fn reads(&self, sql: &str) -> Result<(Option<Statement<'_>>, Reads)> {
-        if let Some(reads) = self.cache.borrow().get(sql) {
-            return Ok((None, reads.clone()));
+    fn reads(&self, sql: &str) -> Result<(Option<Statement<'_>>, Cached)> {
+        if let Some(cached) = self.cache.borrow().get(sql) {
+            return Ok((None, cached.clone()));
         }
         let (prepared, mut reads) = deps::collect(&self.slot, || self.conn.prepare(sql));
         let statement = prepared?;
         deps::resolve(&self.conn, &mut reads)?;
+        let numbered = constraints::number_parameters(sql).filter(|n| n.agrees(&statement));
+        let cached = Cached { reads, numbered };
         let mut cache = self.cache.borrow_mut();
         if cache.len() >= CACHED_QUERIES {
             cache.clear();
         }
-        cache.insert(sql.to_owned(), reads.clone());
-        Ok((Some(statement), reads))
+        cache.insert(sql.to_owned(), cached.clone());
+        Ok((Some(statement), cached))
     }
 }
 
@@ -109,9 +127,16 @@ impl LiveDb {
                 // published; a result's version must be one the log has
                 // reached, so `changes_since` can follow it.
                 self.log.catch_up(version);
-                if schema != reader.schema {
+                if schema != reader.cookie {
+                    match Schema::load(&reader.conn) {
+                        Ok(loaded) => reader.schema = Arc::new(loaded),
+                        Err(e) => {
+                            self.release(reader);
+                            return Err(e.into());
+                        }
+                    }
                     reader.cache.get_mut().clear();
-                    reader.schema = schema;
+                    reader.cookie = schema;
                 }
                 Ok(Snapshot {
                     db: self,
@@ -168,27 +193,58 @@ impl Snapshot<'_> {
             .expect("a snapshot holds its reader until it drops");
         reader.still_open()?;
         let values = params.into_values()?;
-        let (fresh, reads) = reader.reads(sql)?;
-        let mut cached;
+        let (fresh, cached) = reader.reads(sql)?;
+        let mut reused;
         let mut fresh = fresh;
         let statement: &mut Statement<'_> = match fresh.as_mut() {
             Some(statement) => statement,
             None => {
-                cached = reader.conn.prepare_cached(sql)?;
-                &mut cached
+                reused = reader.conn.prepare_cached(sql)?;
+                &mut reused
             }
         };
         if !statement.readonly() {
             return Err(Error::Unsupported(format!("a query that writes: {sql}")));
         }
         bind(statement, &values)?;
+        let analysis = match &cached.numbered {
+            Some(numbered) => constraints::analyze(
+                numbered,
+                &numbered.values(&values),
+                &reader.schema,
+                &reader.conn,
+            ),
+            None => Analysis::default(),
+        };
+        // The result column that holds the window's sort key, if any.
+        let boundary_column = analysis.window.as_ref().and_then(|plan| {
+            statement.columns_with_metadata().position(|column| {
+                column.database_name() == Some("main")
+                    && column
+                        .table_name()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(&plan.table))
+                    && column
+                        .origin_name()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(&plan.column))
+            })
+        });
+        // Only the row that fills the window bounds it.
+        let filling = analysis.window.as_ref().map(|plan| plan.limit);
+        let mut boundary = None;
         let mut rows = statement.raw_query();
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
+            if let Some(i) = boundary_column
+                && filling == Some(out.len() as u64 + 1)
+            {
+                boundary = Some(owned(row.get_ref(i)?));
+            }
             out.push(map(row)?);
         }
         drop(rows);
         reader.still_open()?;
+        let mut reads = cached.reads;
+        constrain(&mut reads, analysis, boundary);
         Ok(QueryResult {
             rows: out,
             version: self.version,
@@ -201,6 +257,43 @@ impl Drop for Snapshot<'_> {
     fn drop(&mut self) {
         if let Some(reader) = self.reader.take() {
             self.db.release(reader);
+        }
+    }
+}
+
+/// Narrows each analyzed table to the rows its constraints allow. A `LIMIT`
+/// window also bounds the rows at `boundary`, the sort key of the row that
+/// filled it, if one did; a `LIMIT 0` result depends on no rows at all.
+fn constrain(reads: &mut Reads, analysis: Analysis, boundary: Option<Value>) {
+    let mut tables = analysis.tables;
+    if let Some(plan) = analysis.window
+        && let Some(conjunctions) = tables.get_mut(&plan.table)
+        && let [conjunction] = conjunctions.as_mut_slice()
+    {
+        let condition = match boundary {
+            _ if plan.limit == 0 => Some(Condition::Never),
+            // Text that converted lossily cannot bound the window exactly,
+            // and a last row of `NULL`s that sort last bounds nothing.
+            Some(Value::Text(text)) if text.contains('\u{FFFD}') => None,
+            Some(Value::Null) if !plan.nulls_first => None,
+            Some(boundary) => Some(Condition::Window {
+                boundary,
+                descending: plan.descending,
+                nulls_first: plan.nulls_first,
+            }),
+            None => None,
+        };
+        if let Some(condition) = condition {
+            conjunction.constraints.push(Constraint {
+                column: plan.column,
+                collation: plan.collation,
+                condition,
+            });
+        }
+    }
+    for (name, conjunctions) in tables {
+        if let Some(table) = reads.get_mut(&name) {
+            table.set_filter(Filter::any_of(conjunctions));
         }
     }
 }

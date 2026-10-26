@@ -119,7 +119,7 @@ impl fmt::Display for LiveSummary {
             "{} writes ({} failed), {} statements ({} failed), {} events with {} changes ({} schema), \
              {} lags, {} rebuilds, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
              {} rolled back, \
-             {} subscription checks, {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries, {} snapshot checks, \
+             {} subscription checks, {} queries ({} constrained, {} windowed), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, \
              I/O errors: {} read {} write {} sync {} busy, digest {:016x}",
             self.writes,
             self.failed_writes,
@@ -138,12 +138,16 @@ impl fmt::Display for LiveSummary {
             self.recovered_unpublished,
             self.rolled_back,
             self.subscription_checks,
+            self.subscriptions.queries,
+            self.subscriptions.constrained,
+            self.subscriptions.windowed,
             self.subscriptions.intersected,
             self.subscriptions.tested,
             self.subscriptions.reruns,
             self.subscriptions.unchanged,
             self.subscriptions.lagged,
             self.subscriptions.failed_queries,
+            self.subscriptions.ended,
             self.snapshot_checks,
             self.io.read_errors,
             self.io.write_errors,
@@ -167,6 +171,9 @@ struct Live {
     peeks: Prng,
     restarts: Prng,
     queries: Prng,
+    /// Query shapes added after the first, drawn apart so existing seeds
+    /// keep their queries.
+    query_shapes: Prng,
     trace: Trace,
     serial: u64,
     summary: LiveSummary,
@@ -204,6 +211,7 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         peeks: Prng::stream(seed, "live peeks"),
         restarts: Prng::stream(seed, "live restarts"),
         queries: Prng::stream(seed, "live queries"),
+        query_shapes: Prng::stream(seed, "live query shapes"),
         trace: Trace::new(verbose),
         serial: 0,
         summary: LiveSummary::default(),
@@ -384,7 +392,7 @@ impl Live {
                 subscription
             }
             None => {
-                let query = queries::query(&mut self.queries, &self.schema);
+                let query = queries::query(&mut self.queries, &mut self.query_shapes, &self.schema);
                 let kind = *self.queries.pick(&[Kind::Eager, Kind::Lagging]);
                 Subscription::new(id, query, kind)
             }
@@ -404,10 +412,13 @@ impl Live {
     /// across this step's write. `None` if an injected fault stopped the
     /// snapshot.
     fn hold<'d>(&mut self, db: &'d LiveDb) -> Result<Option<Hold<'d>>, String> {
-        let query = queries::query(&mut self.queries, &self.schema);
-        let Ok(snapshot) = db.snapshot() else {
-            self.summary.subscriptions.failed_queries += 1;
-            return Ok(None);
+        let query = queries::query(&mut self.queries, &mut self.query_shapes, &self.schema);
+        let snapshot = match db.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                self.summary.subscriptions.failed(&e);
+                return Ok(None);
+            }
         };
         let witness = self.witness.as_ref().expect("open");
         let version = self
@@ -440,9 +451,12 @@ impl Live {
             .vfs
             .quietly(|| replica::finish_read(witness, || fresh(witness, &query)))
             .map_err(|e| format!("witness: {e} in {}", query.sql))?;
-        let Ok(held) = held else {
-            self.summary.subscriptions.failed_queries += 1;
-            return Ok(());
+        let held = match held {
+            Ok(held) => held,
+            Err(e) => {
+                self.summary.subscriptions.failed(&e);
+                return Ok(());
+            }
         };
         if held.version != version || !same_rows(&held.rows, &expected, query.ordered) {
             return Err(format!(

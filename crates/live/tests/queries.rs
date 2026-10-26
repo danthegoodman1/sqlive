@@ -40,7 +40,10 @@ fn a_query_returns_rows_its_version_and_what_it_read() {
     assert_eq!(result.rows, ["b", "a"]);
     assert_eq!(result.version, db.version());
     assert_eq!(result.read_set.version(), result.version);
-    assert_eq!(result.read_set.to_string(), "todos[id, list_id, title]");
+    assert_eq!(
+        result.read_set.to_string(),
+        "todos[id, list_id, title] where list_id = 5"
+    );
 }
 
 #[test]
@@ -117,6 +120,7 @@ fn intersects_finds_the_events_that_can_change_a_result() {
         .query("SELECT a FROM t WHERE b = 1", (), |_| Ok(()))
         .unwrap()
         .read_set;
+    assert_eq!(read_set.to_string(), "t[a, b] where b = 1");
     let count = db
         .query("SELECT count(*) FROM t", (), |_| Ok(()))
         .unwrap()
@@ -128,21 +132,8 @@ fn intersects_finds_the_events_that_can_change_a_result() {
         "an update to an unread column"
     );
     assert!(!count.intersects(&unread), "count(*) reads no column");
-    let filtered = commit(&db, "UPDATE t SET b = 2");
-    assert!(
-        read_set.intersects(&filtered),
-        "a column read only in WHERE"
-    );
     let selected = commit(&db, "UPDATE t SET a = 5");
-    assert!(read_set.intersects(&selected));
-    let elsewhere = commit(&db, "INSERT INTO other VALUES (1)");
-    assert!(!read_set.intersects(&elsewhere), "another table");
-    let inserted = commit(&db, "INSERT INTO t VALUES (2, 0, 0, 0)");
-    assert!(read_set.intersects(&inserted));
-    assert!(count.intersects(&inserted));
-    let deleted = commit(&db, "DELETE FROM t WHERE id = 2");
-    assert!(read_set.intersects(&deleted));
-    assert!(count.intersects(&deleted));
+    assert!(read_set.intersects(&selected), "a matching row changed");
     commit(&db, "UPDATE t SET a = 0.0");
     let negative_zero = commit(&db, "UPDATE t SET a = -0.0");
     assert_eq!(negative_zero.changes.len(), 1);
@@ -150,6 +141,26 @@ fn intersects_finds_the_events_that_can_change_a_result() {
         read_set.intersects(&negative_zero),
         "0.0 to -0.0 is a change"
     );
+    let leaving = commit(&db, "UPDATE t SET b = 2");
+    assert!(read_set.intersects(&leaving), "a row left the filter");
+    let outside = commit(&db, "UPDATE t SET a = 6");
+    assert!(!read_set.intersects(&outside), "a row outside the filter");
+    let elsewhere = commit(&db, "INSERT INTO other VALUES (1)");
+    assert!(!read_set.intersects(&elsewhere), "another table");
+    let missing = commit(&db, "INSERT INTO t VALUES (2, 0, 0, 0)");
+    assert!(
+        !read_set.intersects(&missing),
+        "an insert the filter rejects"
+    );
+    assert!(count.intersects(&missing));
+    let entering = commit(&db, "INSERT INTO t VALUES (3, 0, 1, 0)");
+    assert!(
+        read_set.intersects(&entering),
+        "an insert the filter accepts"
+    );
+    let deleted = commit(&db, "DELETE FROM t WHERE id = 3");
+    assert!(read_set.intersects(&deleted), "a matching row deleted");
+    assert!(count.intersects(&deleted));
     let schema = commit(&db, "CREATE TABLE more (y)");
     assert!(read_set.intersects(&schema), "a schema change");
 
@@ -161,7 +172,7 @@ fn intersects_finds_the_events_that_can_change_a_result() {
         !current.intersects(&deleted),
         "an event at or below the read set's version"
     );
-    let next = commit(&db, "UPDATE t SET b = 3");
+    let next = commit(&db, "INSERT INTO t VALUES (4, 0, 1, 0)");
     assert_eq!(next.version, current.version() + 1);
     assert!(
         current.intersects(&next),

@@ -74,7 +74,7 @@ let (todo_id, version) = db.write(|tx| {
 - Run `VACUUM` through `db.vacuum()`, since SQLite runs it outside a transaction.
 - A closure may not touch `_sqlive_meta`, attach databases, or change `journal_mode`,
   `synchronous`, `locking_mode` or `query_only`.
-- `db.version()` is the latest published version.
+- `db.version()` is the latest version the log has reached.
 
 ## Query
 
@@ -92,7 +92,7 @@ let todos = db.query(SQL, [5], to_todo)?;
 
 todos.rows;      // Vec<Todo>
 todos.version;   // commit version of the snapshot the query read
-todos.read_set;  // todos[id, list_id, title, done] where list_id = 5 AND id >= 412
+todos.read_set;  // todos[done, id, list_id, title] where list_id = 5 AND id >= 412
                  //   (412 = id of the 50th row)
 ```
 
@@ -112,6 +112,19 @@ let lists = snapshot.query("SELECT id, name FROM lists", (), to_list)?;
 let todos = snapshot.query(SQL, [5], to_todo)?;
 assert_eq!(lists.version, todos.version);
 ```
+
+A read set narrows each table to the rows the result depends on, when the query
+lets it:
+
+- Top-level `AND`ed `WHERE` terms that compare one column with a constant or bound
+  parameter: `=`, `IN (...)`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS`, `IS NULL`,
+  `IS NOT NULL`. The constant converts by the column's affinity, and text compares
+  under the column's collation, or an explicit `BINARY`, `NOCASE` or `RTRIM`.
+- A `LIMIT` window: when the query orders by a column it returns and fills its
+  `LIMIT`, rows past the last one in that order cannot change the result.
+- Everything else leaves the table whole: `OR`, expressions over columns, subqueries,
+  views, CTEs, compound selects, the nullable side of an outer join, and windows over
+  `GROUP BY` or `DISTINCT`.
 
 A read set names every table and column the query reads, through views, CTEs,
 subqueries and joins. A read of a full-text (FTS5) table covers its shadow tables,
@@ -177,8 +190,10 @@ for event in db.changes()? {
 }
 ```
 
-To build your own index, read the constraints with `ReadSet::constraints()`. Your
-index then owns SQLite's comparison rules (affinity, collation, NULL handling).
+To build your own index, read each table's `filter()` from `ReadSet::tables()`: either
+`Filter::All` or `Filter::AnyOf` conjunctions of `Constraint { column, collation,
+condition }`. `Constraint::matches(row)` applies SQLite's comparison rules (storage
+class, collation, `NULL` handling) for you.
 
 ## Guarantees
 

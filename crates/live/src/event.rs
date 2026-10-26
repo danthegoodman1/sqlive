@@ -76,6 +76,15 @@ impl Row {
     }
 }
 
+/// A value displayed as a SQL literal.
+pub(crate) struct Sql<'a>(pub &'a Value);
+
+impl fmt::Display for Sql<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        literal(self.0, f)
+    }
+}
+
 /// Writes a value as a SQL literal.
 fn literal(value: &Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match value {

@@ -1,6 +1,7 @@
 //! Read sets: what a query result depends on, and whether a commit can
 //! have changed it.
 
+use crate::constraints::Filter;
 use crate::deps::Reads;
 use crate::event::{CommitEvent, Op, RowChange, Version};
 use crate::schema::META_TABLE;
@@ -8,8 +9,8 @@ use rusqlite::types::Value;
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// The tables and columns a query result depends on, as of the snapshot
-/// version the query read.
+/// The tables, columns and rows a query result depends on, as of the
+/// snapshot version the query read.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadSet {
     version: Version,
@@ -28,6 +29,8 @@ pub struct TableRead {
     /// Every change to the table counts, as for a virtual table's shadow
     /// tables.
     every_column: bool,
+    /// The rows the result depends on.
+    filter: Filter,
 }
 
 impl TableRead {
@@ -36,6 +39,7 @@ impl TableRead {
             name: name.to_owned(),
             columns: BTreeSet::new(),
             every_column: false,
+            filter: Filter::All,
         }
     }
 
@@ -64,6 +68,20 @@ impl TableRead {
     /// Whether the query depends on every column, so any change counts.
     pub fn every_column(&self) -> bool {
         self.every_column
+    }
+
+    /// The rows the result depends on: a change counts only when its old or
+    /// new row matches.
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
+    /// Narrows the rows the result depends on; a table every change counts
+    /// for keeps them all.
+    pub(crate) fn set_filter(&mut self, filter: Filter) {
+        if !self.every_column {
+            self.filter = filter;
+        }
     }
 
     /// Whether an update changed a column the query reads. A column the rows
@@ -150,7 +168,13 @@ impl ReadSet {
         let Some(table) = self.tables.get(&change.table.to_ascii_lowercase()) else {
             return false;
         };
-        change.op != Op::Update || table.reads_changed_column(change)
+        if change.op == Op::Update && !table.reads_changed_column(change) {
+            return false;
+        }
+        [&change.old, &change.new]
+            .into_iter()
+            .flatten()
+            .any(|row| table.filter.matches(row))
     }
 }
 
@@ -165,6 +189,9 @@ impl fmt::Display for ReadSet {
             } else {
                 let columns: Vec<&str> = table.columns().collect();
                 write!(f, "{}[{}]", table.name, columns.join(", "))?;
+            }
+            if let Filter::AnyOf(_) = table.filter {
+                write!(f, " where {}", table.filter)?;
             }
         }
         Ok(())

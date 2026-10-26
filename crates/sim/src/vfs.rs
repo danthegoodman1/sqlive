@@ -137,6 +137,8 @@ struct State {
     next_handle: u64,
     /// Syncs still to fail on purpose, for scripted scenarios.
     failing_syncs: u32,
+    /// Reads left before one fails, whatever the fault configuration says.
+    reads_until_failure: Option<u64>,
     files: BTreeMap<String, FileData>,
     temp: BTreeMap<u64, Vec<u8>>,
     locks: BTreeMap<String, FileLock>,
@@ -198,6 +200,7 @@ impl SimVfs {
             frozen: false,
             next_handle: 1,
             failing_syncs: 0,
+            reads_until_failure: None,
             files: BTreeMap::new(),
             temp: BTreeMap::new(),
             locks: BTreeMap::new(),
@@ -276,6 +279,12 @@ impl SimVfs {
     /// configuration says.
     pub fn fail_next_sync(&self) {
         self.state().failing_syncs += 1;
+    }
+
+    /// Makes the read `reads` reads from now fail: `0` fails the next one.
+    /// `None` cancels a failure that has not happened.
+    pub fn fail_read_after(&self, reads: Option<u64>) {
+        self.state().reads_until_failure = reads;
     }
 
     /// Cuts the power: every open handle stops reaching the files. Close
@@ -598,6 +607,15 @@ unsafe extern "C" fn x_read(
         return ffi::SQLITE_IOERR_READ;
     }
     state.stats.reads += 1;
+    match state.reads_until_failure {
+        Some(0) => {
+            state.reads_until_failure = None;
+            state.stats.read_errors += 1;
+            return ffi::SQLITE_IOERR_READ;
+        }
+        Some(n) => state.reads_until_failure = Some(n - 1),
+        None => {}
+    }
     if state.fault(state.faults.read_error) {
         state.stats.read_errors += 1;
         return ffi::SQLITE_IOERR_READ;
