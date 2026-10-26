@@ -57,7 +57,7 @@ Status ledger:
 | Complete | Work | 0C: PRNG and driver CLI | `crates/sim/src/prng.rs`, `crates/sim/src/main.rs`, `crates/sim/src/trace.rs`; `parse_seed` accepts decimal seeds and commit hashes (`seeds_parse_from_decimal_and_commit_hashes`). |
 | Complete | Work | 0D: `scripts/check` and `scripts/mutants` | `scripts/check 200` passes; `scripts/mutants --seeds 100`: 2 of 2 caught. |
 | Complete | Work | 0E: `CLAUDE.md` | `CLAUDE.md`. |
-| In Progress | Work | 0F: CI | `.github/workflows/ci.yml`. Needs: a passing run on `main`. |
+| Complete | Work | 0F: CI | `.github/workflows/ci.yml`; run `40265783138` on `acb6509`: `test` and `simulate` succeeded. |
 | Complete | Test | PRNG fixed-output and stream-independence tests | `a_seed_always_draws_the_same_numbers`, `streams_with_different_purposes_differ`, `drawing_from_one_stream_leaves_another_unchanged`, `below_stays_in_bounds`. |
 | Complete | Test | Planted failing property caught by the sweep | Mutant "a planted failure on every fifth seed": caught by `crates/sim/tests/seeds.rs`; in the mutated copy, `--seeds 10` prints "2 of 10 seeds from 0 failed" with replay lines for seeds 3 and 8 and exits 1. |
 | Complete | Gate | `scripts/check` passes | `scripts/check 200`: fmt, clippy, tests, "0 of 200 seeds from 0 failed". |
@@ -68,9 +68,9 @@ Goal:
 SQLite runs deterministically on an in-memory VFS that fails and crashes like a real disk, in WAL mode with several connections.
 
 Scope:
-- 1A VFS on `libsqlite3-sys` FFI: files, locks shared across connections, `xShm*` regions for the WAL index, `xRandomness` from a seed stream, `xCurrentTime` from a simulated clock, and `xSleep` advancing that clock.
-- 1B Faults: read, write and sync errors; short reads; lock contention. A crash keeps each unsynced sector with a seeded probability, producing lost and torn writes within the device characteristics the VFS reports.
-- 1C Harness: plain-SQLite workloads (random DML, WAL, `synchronous=FULL`) on several connections, with crashes and restarts, checked against a row model with an undo log, as in `../turtlekv-rs/turtlekv/src/sim/vopr.rs`.
+- 1A VFS on the FFI (`rusqlite::ffi`): files, locks shared across connections, `xShm*` regions for the WAL index, `xRandomness` from a seed stream, `xCurrentTime` from a simulated clock, and `xSleep` advancing that clock. Each run reseeds SQLite's own PRNG, which picks WAL salts, from its seed.
+- 1B Faults: read, write and sync errors; spurious `SQLITE_BUSY` on lock requests. A crash keeps each unsynced sector with a seeded probability, producing lost and torn writes within the device characteristics the VFS reports.
+- 1C Storage harness: plain-SQLite workloads (random puts and deletes, WAL, `synchronous=FULL`) on one writer and up to three readers, with checkpoints, crashes and clean reopens, checked against a row model, as in `../turtlekv-rs/turtlekv/src/sim/vopr.rs`. A failed `COMMIT` is read back to learn whether it took effect; one this process cannot see stays a candidate for recovery.
 
 Out of scope:
 - SqLive itself (Phase 2).
@@ -79,22 +79,22 @@ Completion gate:
 All properties hold over a 10,000-seed sweep; `scripts/mutants` catches every Phase 1 planted bug; `/code-review` findings are resolved.
 
 Testing plan:
-- VFS unit tests: shm locks exclude conflicting holders; a crash keeps synced bytes.
-- Properties: same seed, same trace hash. Every commit acknowledged before a crash survives it. Recovery yields the state after some commit between the last acknowledged and the last attempted. `PRAGMA integrity_check` passes after every restart.
-- Planted bugs: `xSync` that persists nothing; shm locks that admit two writers; `xRandomness` drawn from the OS.
+- VFS unit tests: WAL readers keep their snapshot; shm locks exclude a second writer; a crash keeps synced commits and drops unsynced ones.
+- Properties: same seed, same trace digest and summary. Every commit acknowledged before a crash survives it. Recovery yields the last acknowledged commit or a failed commit after it, exactly. Reader snapshots match the model at their version. `PRAGMA integrity_check` passes after every restart.
+- Planted bugs: `xSync` that persists nothing; exclusive shm locks that ignore shared holders; a WAL index per connection; crash decisions that differ between runs of a seed.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Decision | Build the VFS on the FFI directly, because `sqlite-plugin` leaves `xShm*` unset | `../gRPSQLite/sqlite_vfs/src/sqlite-plugin/src/vfs.rs` registers `xShmMap: None` (checked 2026-10-25). |
-| Incomplete | Work | 1A: VFS with shm, randomness and clock | Missing: `crates/sim/src/vfs.rs`; WAL test with one writer and two readers. |
-| Incomplete | Work | 1B: Fault and crash model | Missing: `FaultConfig`, `crash()`; unit tests. |
-| Incomplete | Work | 1C: Plain-SQLite harness with row model | Missing: `crates/sim/src/sqlite_workload.rs`; seed tests. |
-| Incomplete | Test | Determinism, durability, prefix recovery, integrity properties | Missing: property functions and seed tests. |
-| Incomplete | Test | Phase 1 planted bugs | Missing: `scripts/mutants` report, 3 of 3 caught. |
-| Incomplete | Gate | 10,000-seed sweep | Missing: sweep output. |
-| Incomplete | Gate | Code review | Missing: `/code-review` findings and resolutions. |
+| Complete | Work | 1A: VFS with shm, randomness and clock | `crates/sim/src/vfs.rs`; `wal_readers_keep_their_snapshot_while_the_writer_commits`, `shm_locks_exclude_a_second_exclusive_holder`; `Simulator::run` reseeds SQLite's PRNG with `SQLITE_TESTCTRL_PRNG_SEED`. |
+| Complete | Work | 1B: Fault and crash model | `FaultConfig::from_prng`, `SimVfs::begin_crash`/`finish_crash`; `a_crash_keeps_synced_commits`, `a_crash_drops_unsynced_writes`. Over seeds 0 to 400, 124 seeds see failed reads and 13 recover a commit whose `COMMIT` failed. |
+| Complete | Work | 1C: Storage harness with row model | `crates/sim/src/storage.rs`; `storage_seeds_0_to_63_pass_and_replay` in `crates/sim/tests/seeds.rs`. |
+| Complete | Test | Determinism, durability, recovery, snapshot and integrity properties | `Harness::restart` (durability, recovery, integrity) and `Harness::read_with` (snapshots); the seed test compares digests and summaries of two runs. |
+| Complete | Test | Phase 1 planted bugs | `scripts/mutants --seeds 300`: 6 of 6 caught (4 Phase 1, 2 Phase 0), all by `crates/sim/tests/seeds.rs`. |
+| Complete | Gate | 10,000-seed sweep | `cargo run --release -p sqlive-sim -- 0 --seeds 10000`: 0 of 10,000 failed, after the review fixes. |
+| Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved: the harness drops its VFS last, so a failing seed reports instead of aborting (checked with a planted mid-run failure: "50 of 50 seeds from 0 failed" with replay lines); the final close runs without faults; each run reseeds SQLite's PRNG; `configure_sqlite` runs before registration and reports a late call; the trace records each read's verdict; snapshots share rows through `Rc`; the VFS keys locks and WAL indexes without allocating per call; unused VFS methods are gone and I/O counts appear in the summary; this ledger. |
 
 ## Phase 2: Changefeed
 

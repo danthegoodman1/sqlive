@@ -3,54 +3,43 @@
 //! against SQLite itself.
 
 pub mod prng;
+pub mod storage;
 pub mod trace;
+pub mod vfs;
 
-use prng::Prng;
 use std::fmt;
-use trace::Trace;
 
-/// What a seed configures.
-#[derive(Clone, Debug)]
-pub struct Options {
-    pub steps: u64,
-}
-
-impl Options {
-    pub fn from_seed(seed: u64) -> Options {
-        let mut prng = Prng::stream(seed, "options");
-        Options {
-            steps: prng.range(50..=200),
-        }
-    }
+/// Which workload a seed runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Harness {
+    /// Plain SQLite on the simulated VFS, checked against a row model.
+    Storage,
 }
 
 pub struct Simulator {
     seed: u64,
-    options: Options,
+    harness: Harness,
     verbose: bool,
 }
 
 #[derive(Debug)]
 pub struct Summary {
     pub seed: u64,
-    pub steps: u64,
+    pub harness: Harness,
+    pub text: String,
     pub digest: u64,
 }
 
 impl fmt::Display for Summary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "seed {}: {} steps, digest {:016x}",
-            self.seed, self.steps, self.digest
-        )
+        write!(f, "seed {} ({:?}): {}", self.seed, self.harness, self.text)
     }
 }
 
 #[derive(Debug)]
 pub struct Failure {
     pub seed: u64,
-    pub step: u64,
+    pub harness: Harness,
     pub message: String,
 }
 
@@ -58,8 +47,8 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "seed {} failed at step {}: {}",
-            self.seed, self.step, self.message
+            "seed {} ({:?}) failed: {}",
+            self.seed, self.harness, self.message
         )
     }
 }
@@ -68,9 +57,14 @@ impl Simulator {
     pub fn from_seed(seed: u64) -> Simulator {
         Simulator {
             seed,
-            options: Options::from_seed(seed),
+            harness: Harness::Storage,
             verbose: false,
         }
+    }
+
+    pub fn harness(mut self, harness: Harness) -> Simulator {
+        self.harness = harness;
+        self
     }
 
     /// Prints every step of the run.
@@ -79,21 +73,38 @@ impl Simulator {
         self
     }
 
-    pub fn options(&self) -> &Options {
-        &self.options
+    pub fn options(&self) -> String {
+        match self.harness {
+            Harness::Storage => format!("{:?}", storage::StorageOptions::from_seed(self.seed)),
+        }
     }
 
     pub fn run(self) -> Result<Summary, Failure> {
-        let mut trace = Trace::new(self.verbose);
-        let mut prng = Prng::stream(self.seed, "steps");
-        for step in 0..self.options.steps {
-            trace.record(format_args!("step {step}: {}", prng.next_u64()));
+        vfs::configure_sqlite();
+        // SAFETY: reseeds SQLite's PRNG, which picks WAL salts, so the run
+        // replays byte for byte; no connection is passed.
+        unsafe {
+            rusqlite::ffi::sqlite3_test_control(
+                rusqlite::ffi::SQLITE_TESTCTRL_PRNG_SEED,
+                self.seed as std::ffi::c_int,
+                std::ptr::null_mut::<rusqlite::ffi::sqlite3>(),
+            );
         }
-        Ok(Summary {
+        let failure = |message| Failure {
             seed: self.seed,
-            steps: self.options.steps,
-            digest: trace.digest(),
-        })
+            harness: self.harness,
+            message,
+        };
+        match self.harness {
+            Harness::Storage => storage::run(self.seed, self.verbose)
+                .map(|summary| Summary {
+                    seed: self.seed,
+                    harness: self.harness,
+                    text: summary.to_string(),
+                    digest: summary.digest,
+                })
+                .map_err(failure),
+        }
     }
 }
 

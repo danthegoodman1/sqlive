@@ -37,7 +37,7 @@ fn run_one(seed: u64) -> ExitCode {
     if std::env::var_os("SIM_TRACE").is_some() {
         simulator = simulator.trace();
     }
-    println!("seed {seed}: {:?}", simulator.options());
+    println!("seed {seed}: {}", simulator.options());
     match simulator.run() {
         Ok(summary) => {
             println!("{summary}");

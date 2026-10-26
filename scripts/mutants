@@ -26,7 +26,8 @@ import sys
 from pathlib import Path
 
 PRNG = "crates/sim/src/prng.rs"
-SIM = "crates/sim/src/lib.rs"
+VFS = "crates/sim/src/vfs.rs"
+STORAGE = "crates/sim/src/storage.rs"
 STEP_TIMEOUT = 900
 
 MUTANTS = [
@@ -37,9 +38,26 @@ MUTANTS = [
     ),
     (
         "a planted failure on every fifth seed",
-        [(SIM, "for step in 0..self.options.steps {",
-          'if self.seed % 5 == 3 { return Err(Failure { seed: self.seed, step: 0, message: "planted".into() }); }'
-          " for step in 0..self.options.steps {")],
+        [(STORAGE, "harness.create()?;", 'if seed % 5 == 3 { return Err("planted".into()); } harness.create()?;')],
+    ),
+    # Phase 1
+    (
+        "a sync persists nothing",
+        [(VFS, "if let Some(data) = state.files.get_mut(name) { for op in data.pending.drain(..) {",
+          "if let Some(data) = state.files.get_mut(name).filter(|_| false) { for op in data.pending.drain(..) {")],
+    ),
+    (
+        "exclusive shm locks ignore shared holders",
+        [(VFS, "&& (shared || shm.shared[slot].iter().all(|&h| h == me))", "")],
+    ),
+    (
+        "each connection maps its own WAL index",
+        [(VFS, "let indexes = state.shm.entry(file.generation).or_default();",
+          "let indexes = state.shm.entry(file.generation + 1000 * file.handle).or_default();")],
+    ),
+    (
+        "crash decisions differ between runs of a seed",
+        [(VFS, 'crash_prng: Prng::stream(seed, "vfs crashes"),', 'crash_prng: Prng::stream(seed ^ n, "vfs crashes"),')],
     ),
 ]
 
