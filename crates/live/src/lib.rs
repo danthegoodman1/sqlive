@@ -8,9 +8,13 @@
 mod capture;
 mod compare;
 mod db;
+mod deps;
 mod error;
 mod event;
 mod log;
+mod params;
+mod read;
+mod read_set;
 mod schema;
 
 pub use compare::{Affinity, Collation};
@@ -18,6 +22,9 @@ pub use db::{LiveDb, Options};
 pub use error::{Error, Result};
 pub use event::{CommitEvent, Op, Row, RowChange, Version};
 pub use log::Changes;
+pub use params::{ParamValues, QueryParams};
+pub use read::{QueryResult, Snapshot};
+pub use read_set::{ReadSet, TableRead};
 pub use rusqlite;
 pub use rusqlite::types::Value;
 

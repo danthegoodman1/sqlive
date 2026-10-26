@@ -21,9 +21,12 @@ pub enum Error {
         requested: Version,
         latest: Version,
     },
-    /// SQLite rolled the transaction back after an error inside the `write`
-    /// closure, such as an I/O error, so nothing committed.
+    /// SQLite rolled a write's transaction back after an error, such as an
+    /// I/O error, so nothing committed.
     RolledBack,
+    /// SQLite ended a snapshot's read transaction after an error, so its
+    /// queries can no longer read its version. Start a new snapshot.
+    SnapshotEnded,
     /// The database uses something SqLive does not support.
     Unsupported(String),
 }
@@ -43,9 +46,12 @@ impl fmt::Display for Error {
                 f,
                 "version {requested} has not committed; the latest is {latest}"
             ),
-            Error::RolledBack => f.write_str(
-                "SQLite rolled the transaction back after an error inside the write closure",
-            ),
+            Error::RolledBack => {
+                f.write_str("SQLite rolled the write's transaction back after an error")
+            }
+            Error::SnapshotEnded => {
+                f.write_str("SQLite ended the snapshot's read transaction after an error")
+            }
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
         }
     }

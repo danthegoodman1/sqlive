@@ -170,7 +170,7 @@ Status ledger:
 | Complete | Work | 3A: Commit errors and uncertain outcomes | `LiveDb::attempt` in `crates/live/src/db.rs` reads the version back after a failed `COMMIT`; `Live::finish_write` in `crates/sim/src/live/mod.rs` checks versions, and marks the outcome unknown only for a write that reached `COMMIT`. Seeds 0–299: 6,872 failed writes, 1,080 sync errors. |
 | Complete | Work | 3B: Automatic rollbacks | Commit and rollback hooks in `LiveDb::open_with`; `statements_after_an_automatic_rollback_do_not_commit` (a plain statement, and a `SAVEPOINT` after the rollback); the simulator checks `is_autocommit` after every statement. Seeds 0–299: 100 rolled-back writes across 43 seeds. |
 | Complete | Work | 3C: Restart recovery, `Lagged`, and the schema cookie | `a_stream_behind_the_log_lags_and_a_reopen_forgets_the_log`, `a_schema_moved_while_closed_is_published_at_open`; `Live::restart`. Seeds 0–299: 789 restarts, 563 of them crashes. |
-| Complete | Work | 3D: Failed vacuum | `LiveDb::vacuum` and `doubt`; `a_failed_vacuum_lags_every_stream_and_flags_the_next_write` in `crates/sim/tests/scenarios.rs`; `seed_1159_a_vacuum_whose_event_fails_lags_every_stream` in `crates/sim/tests/seeds.rs`. |
+| Complete | Work | 3D: Failed vacuum | `LiveDb::vacuum` and `doubt`; `a_failed_vacuum_lags_every_stream_and_flags_the_next_write` in `crates/sim/tests/scenarios.rs` reproduces the failure live seed 1159 found at 9a1ec13. |
 | Complete | Work | 3E: Live workloads under faults and crashes | `LiveOptions::from_seed` draws fault rates, crash and reopen rates, and peek rates; `SimVfs::quietly` suspends faults for checks. |
 | Complete | Test | Durability, integrity, resume-or-lag, isolation, and rollback properties | `Live::restart` (published versions survive, `integrity_check`), `Replica::resume`, `peek_at`, the rollback check in `Live::write`; `live_seeds_0_to_63_pass_and_replay`. |
 | Complete | Test | Phase 3 planted bugs | `scripts/mutants --layers unit,sim,seeds`: 25 of 25 caught, 9 of them Phase 3. The failed-vacuum mutant needs `a_failed_vacuum_lags_every_stream_and_flags_the_next_write`, since the stored schema cookie flags the next write on its own. |
@@ -183,10 +183,10 @@ Goal:
 Queries return rows, a version and a table- and column-level read set. A subscription that re-runs on `intersects` always holds the fresh result.
 
 Scope:
-- 4A Reader pool of read-only connections. `query(sql, params, map)` and `snapshot()` read the version inside the same read transaction as the query.
-- 4B Authorizer dependencies: each (table, column) a statement reads, through views, subqueries and CTEs, including the empty-column report for `count(*)`. Cached by SQL text and schema version.
-- 4C `ReadSet { version, tables }` with `Display`. `intersects` returns false for events at or below `version` and true for `schema_changed`. It returns true for an insert or delete on a read table, and for an update that changes a read column.
-- 4D Simulator queries and subscriptions. Queries: single-table, joins, views, subqueries, aggregates, `ORDER BY` and `LIMIT`. Eager subscriptions are checked after every commit. Lagged subscriptions receive events delayed and reordered, and are checked once drained. Snapshots are held across writes, and subscriptions resubscribe on `Lagged`.
+- 4A Reader pool of read-only connections. `query(sql, params, map)` and `snapshot()` read the version inside the same read transaction as the query. A snapshot that sees a commit before its publish waits for it, so a result's version is always one the log has reached; one that finds a commit the log lacks catches the log up, and every stream lags. A snapshot whose transaction SQLite ended after an I/O error returns `Error::SnapshotEnded`.
+- 4B Authorizer dependencies: each (table, column) a statement reads, through views, subqueries and CTEs, including the column-less read `count(*)` makes. Views drop out, and a virtual table's read covers its shadow tables and any external content table. Each reader caches reads by SQL text until the schema cookie changes. While recording, the authorizer refuses `PRAGMA`, `ATTACH`, `DETACH` and transaction statements.
+- 4C `ReadSet { version, tables }` with `Display`. `intersects` returns false for events at or below `version` and true for `schema_changed` or a read of `_sqlive_meta` or an internal SQLite table such as `sqlite_sequence`. It returns true for an insert or delete on a read table, and for an update that changes a read column, comparing values bit for bit and treating text that holds U+FFFD as changed.
+- 4D Simulator queries and subscriptions. Queries: single-table filters, joins, views, subqueries, aggregates, CTEs, `ORDER BY` with a total tiebreak, and `LIMIT`/`OFFSET`. Eager subscriptions process events after every step. Lagging subscriptions process them late and shuffled. Snapshots are held across writes beside a witness transaction, and late subscriptions start from a held snapshot's result.
 
 Out of scope:
 - Constraints and window bounds (Phase 5).
@@ -195,22 +195,22 @@ Completion gate:
 All properties hold over a 10,000-seed sweep with faults and crashes enabled; `scripts/mutants` catches every Phase 4 planted bug; `/code-review` findings are resolved.
 
 Testing plan:
-- Unit tests for authorizer dependencies on views, CTEs and `count(*)`.
-- Property: a subscription that has applied every event through version `V` holds the result of a fresh query at `V`. The summary reports re-runs and the share of re-runs that left the result unchanged.
-- Planted bugs: deletes ignored; columns read only in `WHERE` dropped from the dependencies; the version read outside the query's transaction; view base tables missing from the dependencies; `intersects` skipping events at `version + 1`.
+- Unit tests for authorizer dependencies on views, CTEs, joins and `count(*)`, the guard, the read cache, full-text tables, lossy text, and a threaded test that every result's version is published.
+- Property: a subscription that has applied every event through version `V` holds the result of a fresh query at `V`. A held snapshot returns its version's rows. The summary reports re-runs and the share that left the result unchanged.
+- Planted bugs: deletes ignored; a column dropped from the read set; the version read outside the query's transaction; view base tables missing; `intersects` skipping events at `version + 1`; virtual tables without shadow tables; a stale read cache; reals compared by value; readers that skip waiting for a commit in flight; internal-table reads that miss their changes; a snapshot that keeps reading after SQLite ends its transaction.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 4A: Reader pool, `query`, `snapshot` | Missing: `crates/live/src/read.rs`; test that a held snapshot ignores later writes. |
-| Incomplete | Work | 4B: Authorizer dependencies | Missing: `crates/live/src/deps.rs`; unit tests. |
-| Incomplete | Work | 4C: Table-level `ReadSet` and `intersects` | Missing: `crates/live/src/read_set.rs`; unit tests. |
-| Incomplete | Work | 4D: Simulator queries and subscriptions | Missing: `crates/sim/src/queries.rs`, `crates/sim/src/subscriptions.rs`. |
-| Incomplete | Test | Live-result property and precision summary | Missing: property function, seed tests, summary output. |
-| Incomplete | Test | Phase 4 planted bugs | Missing: `scripts/mutants` report, 5 of 5 caught. |
-| Incomplete | Gate | 10,000-seed sweep | Missing: sweep output. |
-| Incomplete | Gate | Code review | Missing: `/code-review` findings and resolutions. |
+| Complete | Work | 4A: Reader pool, `query`, `snapshot`, commits in flight | `crates/live/src/read.rs`, `Log::begin_commit` and `Log::catch_up`; `a_held_snapshot_ignores_later_writes`, `a_result_never_runs_ahead_of_the_log` (four reader threads beside a writer; no result runs ahead and no stream lags) in `crates/live/tests/queries.rs`; `seeds_5476_and_8109_a_snapshot_sqlite_ended_reads_nothing_newer` in `crates/sim/tests/seeds.rs`. |
+| Complete | Work | 4B: Authorizer dependencies | `crates/live/src/deps.rs`; `views_ctes_subqueries_and_joins_report_their_base_tables`, `a_query_may_not_end_its_snapshot_reach_another_database_or_write`, `a_schema_change_refreshes_the_reads_of_a_repeated_query`, `a_full_text_query_depends_on_its_shadow_tables`, `an_external_content_query_depends_on_its_content_table`. |
+| Complete | Work | 4C: Table-level `ReadSet` and `intersects` | `crates/live/src/read_set.rs`; `intersects_finds_the_events_that_can_change_a_result`, `an_update_between_texts_that_are_not_utf8_intersects`, `a_query_of_the_version_table_sees_every_commit`, `a_query_of_an_internal_table_sees_every_commit`. |
+| Complete | Work | 4D: Simulator queries and subscriptions | `crates/sim/src/live/{queries,subscriptions}.rs`; views in `crates/sim/src/live/schema.rs`; `Live::follow`, `Live::hold`, `Live::check_hold`, `Live::settle`. Subscription options draw from their own PRNG stream, and a held snapshot spans the step's own write, so earlier draws stay unchanged. |
+| Complete | Test | Live-result property and precision summary | Live seeds 0–299: 196,039 subscription checks and 2,669 snapshot checks; 101,456 of 229,605 events intersected; 100,888 re-runs, 76,166 (75%) of them unchanged; 3,709 subscription lags. |
+| Complete | Test | Phase 4 planted bugs | `scripts/mutants --layers unit,sim,seeds`: 36 of 36 caught, 11 of them Phase 4. With `--layers sim,seeds`, the simulator alone catches the 5 the plan lists. A snapshot that keeps reading after SQLite ends its transaction is caught by the regression seeds. |
+| Complete | Gate | 10,000-seed sweep | `cargo run --release -p sqlive-sim -- 0 --seeds 10000` (storage and live): 0 of 10,000 failed. |
+| Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved: reads of internal SQLite tables intersect every commit; missing parameters fail as in rusqlite; `params!` and `named_params!` arrays bind, and the README uses them; subscription options draw from their own stream; readers wait for a commit in flight instead of a gate held across `COMMIT`; the `version()` doc is current; external content tables join FTS read sets; parameters convert once; subscription lags show in the summary; one helper runs the simulator's read transactions. The sweep then found snapshots SQLite had silently ended; snapshots now check their transaction, and the writer refuses every commit but its own. |
 
 ## Phase 5: Constraint Read Sets
 

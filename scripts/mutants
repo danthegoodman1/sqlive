@@ -32,6 +32,9 @@ CAPTURE = "crates/live/src/capture.rs"
 LOG = "crates/live/src/log.rs"
 DB = "crates/live/src/db.rs"
 SCHEMA = "crates/live/src/schema.rs"
+DEPS = "crates/live/src/deps.rs"
+READ = "crates/live/src/read.rs"
+READ_SET = "crates/live/src/read_set.rs"
 
 STEP_TIMEOUT = 900
 
@@ -127,16 +130,16 @@ MUTANTS = [
     ),
     (
         "statements after an automatic rollback commit one by one",
-        [(DB, "conn.commit_hook(Some(move || !in_library.load(Ordering::Relaxed)))?;",
-          "let _ = in_library;")],
+        [(DB, "conn.commit_hook(Some(move || !allowed.load(Ordering::Relaxed)))?;",
+          "let _ = allowed;")],
     ),
     (
         "a rolled-back transaction reports success",
-        [(DB, "if rolled_back.load(Ordering::Relaxed) || tx.is_autocommit() { return Err(Error::RolledBack); }", "")],
+        [(DB, "rolled_back.load(Ordering::Relaxed) || tx.is_autocommit() }", "false }")],
     ),
     (
         "a savepoint after an automatic rollback hides it",
-        [(DB, "if rolled_back.load(Ordering::Relaxed) || tx.is_autocommit() {", "if tx.is_autocommit() {")],
+        [(DB, "rolled_back.load(Ordering::Relaxed) || tx.is_autocommit() }", "tx.is_autocommit() }")],
     ),
     (
         "a schema moved while closed goes unpublished",
@@ -149,6 +152,56 @@ MUTANTS = [
     (
         "a stream behind the log does not lag",
         [(LOG, "if state.epoch != self.epoch || self.next <= state.base {", "if state.epoch != self.epoch {")],
+    ),
+    # Phase 4
+    (
+        "deletes do not intersect",
+        [(READ_SET, "change.op != Op::Update || table.reads_changed_column(change)",
+          "change.op == Op::Insert || (change.op == Op::Update && table.reads_changed_column(change))")],
+    ),
+    (
+        "a read set keeps only the first column it reads",
+        [(READ_SET, "if !column.is_empty() {", "if !column.is_empty() && self.columns.is_empty() {")],
+    ),
+    (
+        "a snapshot reads its version before its transaction begins",
+        [(READ, 'self.conn.execute_batch("BEGIN")?; let version: i64 =', "let version: i64 ="),
+         (READ, "self.still_open()?; Ok((version as Version, cookie))",
+          'self.conn.execute_batch("BEGIN")?; self.still_open()?; Ok((version as Version, cookie))')],
+    ),
+    (
+        "reads through views go unrecorded",
+        [(DEPS, 'if matches!(context.database_name, Some("main") | None) {',
+          'if matches!(context.database_name, Some("main") | None) && context.accessor.is_none() {')],
+    ),
+    (
+        "intersects skips the event right after the version",
+        [(READ_SET, "if event.version <= self.version {", "if event.version <= self.version + 1 {")],
+    ),
+    (
+        "virtual tables do not reach their shadow tables",
+        [(DEPS, 'if found != "virtual" {', "if true {")],
+    ),
+    (
+        "a cached query keeps its reads after a schema change",
+        [(READ, "reader.cache.get_mut().clear();", "")],
+    ),
+    (
+        "readers do not wait for a commit under way",
+        [(LOG, "while state.latest < version && state.committing {", "while false && state.committing {")],
+    ),
+    (
+        "reads of internal tables miss their changes",
+        [(READ_SET, "table == META_TABLE || (table.starts_with(\"sqlite_\")", "table == META_TABLE || (false")],
+    ),
+    (
+        "a snapshot keeps reading after SQLite ends its transaction",
+        [(READ, "if self.conn.is_autocommit() { return Err(Error::SnapshotEnded); }", "")],
+    ),
+    (
+        "read sets compare reals by value, so 0.0 equals -0.0",
+        [(READ_SET, "(Value::Real(x), Value::Real(y)) => x.to_bits() == y.to_bits(),",
+          "(Value::Real(x), Value::Real(y)) => x == y,")],
     ),
 ]
 

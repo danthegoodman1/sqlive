@@ -5,6 +5,7 @@ use crate::capture::{self, Capture, Captured, Key, Raw, Touch, same_raws};
 use crate::error::{Error, Result};
 use crate::event::{CommitEvent, Op, Row, RowChange, Version};
 use crate::log::{Changes, Log};
+use crate::read::Reader;
 use crate::schema::{META_TABLE, Schema, Table};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params_from_iter};
@@ -43,7 +44,9 @@ pub struct LiveDb {
     path: String,
     options: Options,
     writer: Mutex<Writer>,
-    log: Arc<Log>,
+    /// Idle read-only connections, at most `options.readers`.
+    pub(crate) readers: Mutex<Vec<Reader>>,
+    pub(crate) log: Arc<Log>,
 }
 
 struct Writer {
@@ -52,7 +55,11 @@ struct Writer {
     /// True while SqLive runs its own statements; false while the caller's
     /// closure runs, when the authorizer guards the transaction.
     internal: Arc<AtomicBool>,
-    /// Set when SQLite rolls the transaction back while the closure runs.
+    /// True only while SqLive runs its own `COMMIT` or `VACUUM`; the commit
+    /// hook refuses every other commit.
+    committing: Arc<AtomicBool>,
+    /// Set whenever SQLite rolls a transaction back; cleared as each write
+    /// begins.
     rolled_back: Arc<AtomicBool>,
     schema: Arc<Schema>,
     /// A failed commit or vacuum left this process unsure of the database's
@@ -102,19 +109,16 @@ impl LiveDb {
         capture::install(&mut conn, capture.clone())?;
         let internal = Arc::new(AtomicBool::new(true));
         install_guard(&mut conn, internal.clone())?;
-        // `internal` is false while the caller's closure runs. A commit then
-        // means SQLite rolled the transaction back after an error and now
-        // commits each statement on its own; refusing those commits keeps
-        // the write atomic, and the rollback hook records the rollback.
-        let in_library = internal.clone();
-        conn.commit_hook(Some(move || !in_library.load(Ordering::Relaxed)))?;
+        // After an error, SQLite can roll a transaction back, sometimes
+        // without failing the statement, and run later statements each in a
+        // transaction of its own. Refusing every commit but SqLive's own
+        // keeps a write atomic, and the rollback hook records the rollback.
+        let committing = Arc::new(AtomicBool::new(false));
+        let allowed = committing.clone();
+        conn.commit_hook(Some(move || !allowed.load(Ordering::Relaxed)))?;
         let rolled_back = Arc::new(AtomicBool::new(false));
-        let (in_library, flag) = (internal.clone(), rolled_back.clone());
-        conn.rollback_hook(Some(move || {
-            if !in_library.load(Ordering::Relaxed) {
-                flag.store(true, Ordering::Relaxed);
-            }
-        }))?;
+        let flag = rolled_back.clone();
+        conn.rollback_hook(Some(move || flag.store(true, Ordering::Relaxed)))?;
         let moved = schema.version != meta.schema;
         let log = Arc::new(Log::new(meta.version, options.log_capacity));
         let db = LiveDb {
@@ -124,10 +128,12 @@ impl LiveDb {
                 conn,
                 capture,
                 internal,
+                committing,
                 rolled_back,
                 schema,
                 unsure: false,
             }),
+            readers: Mutex::new(Vec::new()),
             log,
         };
         if moved {
@@ -149,7 +155,9 @@ impl LiveDb {
         &self.options
     }
 
-    /// The version of the latest commit this process has published.
+    /// The latest version the log has reached: the newest published commit,
+    /// or a newer one a snapshot found the database already held, as after a
+    /// commit whose outcome was uncertain.
     pub fn version(&self) -> Version {
         self.log.latest()
     }
@@ -175,7 +183,11 @@ impl LiveDb {
     /// write, or the next open, publishes `schema_changed`.
     pub fn vacuum(&self) -> Result<Version> {
         let mut writer = crate::lock(&self.writer);
-        let result = match writer.conn.execute_batch("VACUUM") {
+        let vacuumed = {
+            let _allowed = Allowed::enter(&writer.committing);
+            writer.conn.execute_batch("VACUUM")
+        };
+        let result = match vacuumed {
             Ok(()) => self
                 .commit(&mut writer, |_| Ok(()), true)
                 .map(|((), version)| version),
@@ -232,11 +244,13 @@ impl LiveDb {
             conn,
             capture,
             internal,
+            committing,
             rolled_back,
             schema,
             unsure,
         } = writer;
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        rolled_back.store(false, Ordering::Relaxed);
         let meta = read_meta(&tx)?;
         if meta.version != self.log.latest() {
             self.log.reset(meta.version);
@@ -251,15 +265,12 @@ impl LiveDb {
         if before != schema.version {
             *schema = Arc::new(Schema::load(&tx)?);
         }
-        rolled_back.store(false, Ordering::Relaxed);
         let recording = Recording::begin(capture, schema.clone());
         let value = {
             let _caller = CallerScope::enter(internal);
             f(&tx)
         }?;
-        // A `SAVEPOINT` after an automatic rollback opens a new transaction,
-        // so the hook's flag, not the autocommit state, tells.
-        if rolled_back.load(Ordering::Relaxed) || tx.is_autocommit() {
+        if ended(rolled_back, &tx) {
             return Err(Error::RolledBack);
         }
         let after = schema_version(&tx)?;
@@ -279,7 +290,17 @@ impl LiveDb {
             schema_changed,
             changes,
         };
-        match tx.commit() {
+        if ended(rolled_back, &tx) {
+            return Err(Error::RolledBack);
+        }
+        // Readers may see this version before it is published; they wait
+        // until the commit's outcome is settled.
+        let _in_flight = self.log.begin_commit();
+        let committed = {
+            let _allowed = Allowed::enter(committing);
+            tx.commit()
+        };
+        match committed {
             Ok(()) => {
                 if let Some(reloaded) = reloaded {
                     *schema = reloaded;
@@ -312,6 +333,29 @@ impl LiveDb {
                 }
             }
         }
+    }
+}
+
+/// Whether SQLite ended a write's transaction on its own. A `SAVEPOINT`
+/// after an automatic rollback opens a new transaction, so the rollback
+/// hook's flag tells where the autocommit state cannot.
+fn ended(rolled_back: &AtomicBool, tx: &Transaction<'_>) -> bool {
+    rolled_back.load(Ordering::Relaxed) || tx.is_autocommit()
+}
+
+/// Lets SqLive's own commit through the commit hook until it drops.
+struct Allowed<'a>(&'a AtomicBool);
+
+impl<'a> Allowed<'a> {
+    fn enter(committing: &'a AtomicBool) -> Allowed<'a> {
+        committing.store(true, Ordering::Relaxed);
+        Allowed(committing)
+    }
+}
+
+impl Drop for Allowed<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 

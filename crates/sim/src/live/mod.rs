@@ -10,15 +10,23 @@
 //!   whenever they have caught up, whether they follow every event at once
 //!   or fall behind, lag, and rebuild;
 //! - every published commit survives a crash, and after a restart each
-//!   replica either resumes or lags and rebuilds.
+//!   replica either resumes or lags and rebuilds;
+//! - a subscription that re-runs its query whenever its read set intersects
+//!   an event holds the same rows as the query run fresh, once it has
+//!   processed every event, whether it processes them at once or late and
+//!   out of order, and whether it started from a snapshot held across
+//!   writes;
+//! - a snapshot held across writes returns the rows of its version.
 //!
 //! The oracle, a plain read-only connection, reads with fault injection
 //! suspended, so the checks themselves never fail on an injected error.
 //! Peeks and restarts draw from their own PRNG streams, so tuning them leaves
 //! the workload unchanged.
 
+mod queries;
 mod replica;
 mod schema;
+mod subscriptions;
 mod writes;
 
 use crate::prng::Prng;
@@ -29,7 +37,9 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use schema::SchemaSpec;
 use sqlive::{LiveDb, Options, Version};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
+use subscriptions::{Held, Kind, Subscription, Tally, fresh, same_rows};
 
 const DB: &str = "live.db";
 
@@ -46,6 +56,10 @@ pub struct LiveOptions {
     pub reopen: f64,
     /// How often a write's closure checks that its changes stay invisible.
     pub peek: f64,
+    /// Subscriptions created at the start.
+    pub subscriptions: u64,
+    /// How often a step holds a snapshot across its writes.
+    pub snapshot: f64,
     pub faults: FaultConfig,
     pub schema: SchemaSpec,
 }
@@ -53,6 +67,7 @@ pub struct LiveOptions {
 impl LiveOptions {
     pub fn from_seed(seed: u64) -> LiveOptions {
         let mut prng = Prng::stream(seed, "live options");
+        let mut subscriptions = Prng::stream(seed, "live subscriptions");
         LiveOptions {
             steps: prng.range(50..=250),
             log_capacity: *prng.pick(&[1, 4, 32, 4096]),
@@ -65,6 +80,8 @@ impl LiveOptions {
             peek: *prng.pick(&[0.05, 0.3]),
             faults: FaultConfig::from_prng(&mut prng),
             schema: schema::generate(&mut Prng::stream(seed, "live schema")),
+            subscriptions: subscriptions.range(1..=8),
+            snapshot: *subscriptions.pick(&[0.02, 0.1]),
         }
     }
 }
@@ -88,6 +105,9 @@ pub struct LiveSummary {
     pub rolled_back: u64,
     /// Restarts that recovered a commit this process never published.
     pub recovered_unpublished: u64,
+    pub subscriptions: Tally,
+    pub subscription_checks: u64,
+    pub snapshot_checks: u64,
     pub io: IoStats,
     pub digest: u64,
 }
@@ -99,6 +119,7 @@ impl fmt::Display for LiveSummary {
             "{} writes ({} failed), {} statements ({} failed), {} events with {} changes ({} schema), \
              {} lags, {} rebuilds, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
              {} rolled back, \
+             {} subscription checks, {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries, {} snapshot checks, \
              I/O errors: {} read {} write {} sync {} busy, digest {:016x}",
             self.writes,
             self.failed_writes,
@@ -116,6 +137,14 @@ impl fmt::Display for LiveSummary {
             self.io.crashes,
             self.recovered_unpublished,
             self.rolled_back,
+            self.subscription_checks,
+            self.subscriptions.intersected,
+            self.subscriptions.tested,
+            self.subscriptions.reruns,
+            self.subscriptions.unchanged,
+            self.subscriptions.lagged,
+            self.subscriptions.failed_queries,
+            self.snapshot_checks,
             self.io.read_errors,
             self.io.write_errors,
             self.io.sync_errors,
@@ -125,12 +154,19 @@ impl fmt::Display for LiveSummary {
     }
 }
 
+/// A snapshot held across a step's write, with the query it will run.
+struct Hold<'d> {
+    snapshot: sqlive::Snapshot<'d>,
+    query: queries::QuerySpec,
+}
+
 struct Live {
     options: LiveOptions,
     schema: SchemaSpec,
     prng: Prng,
     peeks: Prng,
     restarts: Prng,
+    queries: Prng,
     trace: Trace,
     serial: u64,
     summary: LiveSummary,
@@ -140,8 +176,13 @@ struct Live {
     /// The newest version this process published.
     published: Version,
     replicas: Vec<Replica>,
+    subscriptions: Vec<Subscription>,
+    next_subscription: u64,
     oracle: Option<Connection>,
-    db: Option<LiveDb>,
+    /// A second read-only connection, which holds a read transaction beside
+    /// a snapshot.
+    witness: Option<Connection>,
+    db: Option<Arc<LiveDb>>,
     /// Declared last so it drops last: every connection closes before the
     /// VFS unregisters.
     vfs: SimVfs,
@@ -162,13 +203,17 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         prng: Prng::stream(seed, "live steps"),
         peeks: Prng::stream(seed, "live peeks"),
         restarts: Prng::stream(seed, "live restarts"),
+        queries: Prng::stream(seed, "live queries"),
         trace: Trace::new(verbose),
         serial: 0,
         summary: LiveSummary::default(),
         unknown: false,
         published: 0,
         replicas: vec![Replica::new("eager"), Replica::new("lazy")],
+        subscriptions: Vec::new(),
+        next_subscription: 0,
         oracle: None,
+        witness: None,
         db: None,
         vfs,
     };
@@ -183,6 +228,8 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         live.catch_up(i)
             .map_err(|message| format!("final check: {message}"))?;
     }
+    live.settle()
+        .map_err(|message| format!("final check: {message}"))?;
     live.summary.io = live.vfs.stats();
     live.summary.digest = live.trace.digest();
     Ok(live.summary)
@@ -190,7 +237,7 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
 
 impl Live {
     fn db(&self) -> &LiveDb {
-        self.db.as_ref().expect("the database is open")
+        self.db.as_deref().expect("the database is open")
     }
 
     fn oracle(&self) -> &Connection {
@@ -208,20 +255,23 @@ impl Live {
     fn open(&mut self) -> Result<(), String> {
         let options = Options {
             vfs: Some(self.vfs.name().to_owned()),
-            readers: 1,
+            readers: 2,
             log_capacity: self.options.log_capacity,
             busy_timeout: Duration::from_secs(5),
             checkpoint_pages: self.options.checkpoint_pages,
         };
         let db = LiveDb::open_with(DB, options).map_err(|e| format!("open: {e}"))?;
-        let oracle = Connection::open_with_flags_and_vfs(
-            DB,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            self.vfs.name(),
-        )
-        .map_err(|e| format!("oracle: {e}"))?;
-        self.db = Some(db);
-        self.oracle = Some(oracle);
+        let reader = || {
+            Connection::open_with_flags_and_vfs(
+                DB,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                self.vfs.name(),
+            )
+            .map_err(|e| format!("oracle: {e}"))
+        };
+        self.oracle = Some(reader()?);
+        self.witness = Some(reader()?);
+        self.db = Some(Arc::new(db));
         Ok(())
     }
 
@@ -235,6 +285,9 @@ impl Live {
         self.published = version;
         for i in 0..self.replicas.len() {
             self.rebuild(i)?;
+        }
+        for _ in 0..self.options.subscriptions {
+            self.subscribe(None)?;
         }
         Ok(())
     }
@@ -250,6 +303,7 @@ impl Live {
             self.vfs.begin_crash();
         }
         self.oracle = None;
+        self.witness = None;
         self.db = None;
         if crash {
             self.vfs.finish_crash();
@@ -278,9 +332,12 @@ impl Live {
             self.summary.recovered_unpublished += 1;
         }
         self.unknown = false;
-        let db = self.db.as_ref().expect("just opened");
+        let db = self.db.as_deref().expect("just opened");
         for replica in &mut self.replicas {
             replica.resume(db)?;
+        }
+        for subscription in &mut self.subscriptions {
+            subscription.resume(db)?;
         }
         self.vfs.set_faults(faults);
         Ok(())
@@ -292,6 +349,12 @@ impl Live {
         } else if self.restarts.chance(self.options.reopen) {
             self.restart(false)?;
         }
+        let db = self.db.clone().expect("open");
+        let hold = if self.queries.chance(self.options.snapshot) {
+            self.hold(&db)?
+        } else {
+            None
+        };
         if self.prng.chance(self.options.schema_change) {
             self.change_schema()?;
         } else if self.prng.chance(self.options.vacuum) {
@@ -299,11 +362,185 @@ impl Live {
         } else {
             self.write()?;
         }
+        if let Some(hold) = hold {
+            self.check_hold(hold)?;
+        }
         self.catch_up(0)?;
         if self.prng.chance(self.options.lazy_drain) {
             self.catch_up(1)?;
         }
+        self.follow(false)
+    }
+
+    /// Adds a subscription to a random query, which queries on its first
+    /// advance, or one that starts from a result read earlier.
+    fn subscribe(&mut self, held: Option<(Kind, queries::QuerySpec, Held)>) -> Result<(), String> {
+        self.next_subscription += 1;
+        let id = self.next_subscription;
+        let subscription = match held {
+            Some((kind, query, held)) => {
+                let mut subscription = Subscription::new(id, query, kind);
+                subscription.adopt(self.db(), held)?;
+                subscription
+            }
+            None => {
+                let query = queries::query(&mut self.queries, &self.schema);
+                let kind = *self.queries.pick(&[Kind::Eager, Kind::Lagging]);
+                Subscription::new(id, query, kind)
+            }
+        };
+        self.trace.record(format_args!(
+            "subscription {id} ({:?}): {} {:?}",
+            subscription.kind, subscription.query.sql, subscription.query.params
+        ));
+        self.subscriptions.push(subscription);
+        if self.subscriptions.len() > 12 {
+            self.subscriptions.remove(0);
+        }
         Ok(())
+    }
+
+    /// Starts a snapshot, and a witness transaction beside it, to hold
+    /// across this step's write. `None` if an injected fault stopped the
+    /// snapshot.
+    fn hold<'d>(&mut self, db: &'d LiveDb) -> Result<Option<Hold<'d>>, String> {
+        let query = queries::query(&mut self.queries, &self.schema);
+        let Ok(snapshot) = db.snapshot() else {
+            self.summary.subscriptions.failed_queries += 1;
+            return Ok(None);
+        };
+        let witness = self.witness.as_ref().expect("open");
+        let version = self
+            .vfs
+            .quietly(|| replica::begin_read(witness))
+            .map_err(|e| format!("witness: {e}"))?;
+        if version != snapshot.version() {
+            return Err(format!(
+                "a snapshot reports version {}, but began at version {version}",
+                snapshot.version()
+            ));
+        }
+        self.trace.record(format_args!(
+            "snapshot at {version}: {} {:?}",
+            query.sql, query.params
+        ));
+        Ok(Some(Hold { snapshot, query }))
+    }
+
+    /// Checks that a held snapshot returns its version's rows, as the
+    /// witness reads them. A subscription may start from the result; it must
+    /// then catch up on the commits made since.
+    fn check_hold(&mut self, hold: Hold<'_>) -> Result<(), String> {
+        let Hold { snapshot, query } = hold;
+        let version = snapshot.version();
+        let held = snapshot.query(&query.sql, query.params.clone(), subscriptions::rows);
+        drop(snapshot);
+        let witness = self.witness.as_ref().expect("open");
+        let expected = self
+            .vfs
+            .quietly(|| replica::finish_read(witness, || fresh(witness, &query)))
+            .map_err(|e| format!("witness: {e} in {}", query.sql))?;
+        let Ok(held) = held else {
+            self.summary.subscriptions.failed_queries += 1;
+            return Ok(());
+        };
+        if held.version != version || !same_rows(&held.rows, &expected, query.ordered) {
+            return Err(format!(
+                "a snapshot at version {version} returned version {} and rows {:?} for {} {:?}; \
+                 the witness read {expected:?}",
+                held.version, held.rows, query.sql, query.params
+            ));
+        }
+        self.summary.snapshot_checks += 1;
+        if self.queries.chance(0.5) {
+            let kind = *self.queries.pick(&[Kind::Eager, Kind::Lagging]);
+            let held = Held {
+                rows: held.rows,
+                version: held.version,
+                read_set: held.read_set,
+            };
+            self.subscribe(Some((kind, query, held)))?;
+        }
+        Ok(())
+    }
+
+    /// Advances every subscription, then checks each one that has processed
+    /// every event against its query run fresh. With `settle`, every
+    /// subscription processes everything and must catch up.
+    fn follow(&mut self, settle: bool) -> Result<(), String> {
+        let db = self.db.clone().expect("open");
+        for subscription in &mut self.subscriptions {
+            let process = settle
+                || subscription.kind == Kind::Eager
+                || self.queries.chance(self.options.lazy_drain);
+            subscription.advance(
+                &db,
+                &mut self.queries,
+                process,
+                &mut self.summary.subscriptions,
+            )?;
+        }
+        let latest = db.version();
+        let oracle = self.oracle.as_ref().expect("open");
+        let subscriptions = &self.subscriptions;
+        let read = self.vfs.quietly(|| {
+            replica::read_at(oracle, |version| {
+                if version != latest {
+                    return Ok(None);
+                }
+                let mut found = Vec::new();
+                for (i, subscription) in subscriptions.iter().enumerate() {
+                    if subscription.caught_up(latest) {
+                        found.push((i, fresh(oracle, &subscription.query)?));
+                    }
+                }
+                Ok(Some(found))
+            })
+        });
+        let read = read.map_err(|e| format!("oracle: {e}"))?;
+        let Some(found) = read else {
+            if self.unknown {
+                return Ok(());
+            }
+            return Err(format!(
+                "the oracle and the log disagree on version {latest}"
+            ));
+        };
+        if settle && found.len() != self.subscriptions.len() {
+            return Err(format!(
+                "{} of {} subscriptions caught up with faults off",
+                found.len(),
+                self.subscriptions.len()
+            ));
+        }
+        for (i, expected) in found {
+            let subscription = &self.subscriptions[i];
+            let held = subscription.held.as_ref().expect("caught up");
+            if !same_rows(&held.rows, &expected, subscription.query.ordered) {
+                return Err(format!(
+                    "subscription {} ({:?}) at version {latest} holds {:?} from version {}, \
+                     but {} {:?} returns {expected:?}; read set {}",
+                    subscription.id,
+                    subscription.kind,
+                    held.rows,
+                    held.version,
+                    subscription.query.sql,
+                    subscription.query.params,
+                    held.read_set
+                ));
+            }
+            self.summary.subscription_checks += 1;
+        }
+        Ok(())
+    }
+
+    /// With faults off, brings every subscription up to date and checks it.
+    fn settle(&mut self) -> Result<(), String> {
+        // A subscription that lags or re-runs mid-batch needs another pass.
+        for _ in 0..3 {
+            self.follow(false)?;
+        }
+        self.follow(true)
     }
 
     fn write(&mut self) -> Result<(), String> {

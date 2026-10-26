@@ -64,7 +64,8 @@ let (todo_id, version) = db.write(|tx| {
 - `write` owns `BEGIN` and `COMMIT`. Use `SAVEPOINT` for nested work.
 - Return `Err` to roll back. A rolled-back transaction emits no event.
 - SQLite can roll a transaction back on its own, after an I/O error or an
-  `OR ROLLBACK` conflict. `write` then returns `Error::RolledBack` and publishes
+  `OR ROLLBACK` conflict, and run later statements each in a transaction of its own.
+  SqLive refuses those commits, so `write` returns `Error::RolledBack` and publishes
   nothing, even when the closure returns `Ok`.
 - If `COMMIT` reports an error, `write` checks whether the transaction took effect. If
   it did, `write` publishes the event and succeeds; otherwise it returns the error.
@@ -96,7 +97,27 @@ todos.read_set;  // todos[id, list_id, title, done] where list_id = 5 AND id >= 
 ```
 
 Queries run on read-only connections, concurrently with writes (WAL mode).
-`db.snapshot()` runs several queries against one version.
+`params` takes what rusqlite's do: arrays, tuples, vectors, `params![...]`, or
+`named_params! { ":list": 5 }`, and must bind every parameter. A query may not run
+`PRAGMA`, `ATTACH`, `DETACH` or transaction statements; pragma functions such as
+`pragma_table_info('todos')` work.
+
+`db.snapshot()` runs several queries against one version. If an I/O error ends the
+snapshot's read transaction, its queries return `Error::SnapshotEnded`; start a new
+snapshot.
+
+```rust
+let snapshot = db.snapshot()?;
+let lists = snapshot.query("SELECT id, name FROM lists", (), to_list)?;
+let todos = snapshot.query(SQL, [5], to_todo)?;
+assert_eq!(lists.version, todos.version);
+```
+
+A read set names every table and column the query reads, through views, CTEs,
+subqueries and joins. A read of a full-text (FTS5) table covers its shadow tables,
+which carry its changes, and its external content table, if it has one. A read of
+`_sqlive_meta` or of SQLite's internal tables, such as `sqlite_sequence`, intersects
+every commit.
 
 ## React to changes
 
@@ -190,8 +211,11 @@ index then owns SQLite's comparison rules (affinity, collation, NULL handling).
 - The **preupdate hook** on the writer connection records each touched row. Before
   `COMMIT`, `write` reads those rows back to compute net changes, then publishes the
   event once the commit succeeds.
+- A snapshot can see a commit a moment before its event is published. It then waits
+  for the publish, so `changes_since(result.version)` always succeeds.
 - The **authorizer** reports every table and column a query reads, through views,
-  subqueries, and CTEs. A SQL parser adds constraints from the `WHERE` clause with
+  subqueries, and CTEs. Each reader caches these reads by SQL text until the schema
+  changes. A SQL parser adds constraints from the `WHERE` clause with
   bound parameter values, and a bound from the last row of a `LIMIT` query.
 - `intersects` checks whether an event's old or new row satisfies a read set's
   constraints, using SQLite's comparison rules.

@@ -40,11 +40,13 @@ fn live_seeds_0_to_63_pass_and_replay() {
     }
 }
 
-/// A `VACUUM` renumbered rowids and the event announcing it failed to
-/// commit; replicas kept the old rowids. Found at 9a1ec13 with the Phase 3
-/// harness.
+/// After an injected WAL read error, SQLite ended a snapshot's read
+/// transaction while the statement that read its version succeeded; later
+/// queries read rows past the snapshot's version. Found at dafd444 with the
+/// Phase 4 harness.
 #[test]
-fn seed_1159_a_vacuum_whose_event_fails_lags_every_stream() {
+fn seeds_5476_and_8109_a_snapshot_sqlite_ended_reads_nothing_newer() {
     let _serial = SQLITE_PRNG.lock().unwrap_or_else(|e| e.into_inner());
-    replays(Harness::Live, 1159);
+    replays(Harness::Live, 5476);
+    replays(Harness::Live, 8109);
 }

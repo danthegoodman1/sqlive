@@ -19,6 +19,9 @@ struct LogState {
     /// Bumped when the log loses track of the database; every stream opened
     /// before then lags.
     epoch: u64,
+    /// A commit is under way: its version may be visible to readers before
+    /// it is published.
+    committing: bool,
     closed: bool,
 }
 
@@ -31,6 +34,7 @@ impl Log {
                 latest,
                 capacity: capacity.max(1),
                 epoch: 0,
+                committing: false,
                 closed: false,
             }),
             published: Condvar::new(),
@@ -69,6 +73,35 @@ impl Log {
         state.epoch += 1;
         drop(state);
         self.published.notify_all();
+    }
+
+    /// Marks a commit under way until the guard drops, after the commit's
+    /// event is published or abandoned.
+    pub fn begin_commit(&self) -> Committing<'_> {
+        crate::lock(&self.state).committing = true;
+        Committing { log: self }
+    }
+
+    /// Brings the log up to `version`, which a reader saw in the database:
+    /// waits for a commit under way to publish, then, if the database is
+    /// still ahead, as after a commit that took effect without an event,
+    /// moves the log to `version`. Every open stream then lags.
+    pub fn catch_up(&self, version: Version) {
+        let mut state = crate::lock(&self.state);
+        while state.latest < version && state.committing {
+            state = self
+                .published
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if version > state.latest {
+            state.events.clear();
+            state.base = version;
+            state.latest = version;
+            state.epoch += 1;
+            drop(state);
+            self.published.notify_all();
+        }
     }
 
     pub fn close(&self) {
@@ -123,6 +156,18 @@ enum Poll {
     Ready(Result<Arc<CommitEvent>>),
     Pending,
     Closed,
+}
+
+/// A commit under way; see [`Log::begin_commit`].
+pub(crate) struct Committing<'a> {
+    log: &'a Log,
+}
+
+impl Drop for Committing<'_> {
+    fn drop(&mut self) {
+        crate::lock(&self.log.state).committing = false;
+        self.log.published.notify_all();
+    }
 }
 
 impl Changes {

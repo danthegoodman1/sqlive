@@ -139,13 +139,17 @@ impl TableSpec {
 #[derive(Clone, Debug)]
 pub struct SchemaSpec {
     pub tables: Vec<TableSpec>,
+    /// Indexes and triggers.
     pub extra: Vec<String>,
+    /// `CREATE VIEW` statements; view `i` is named `v{i}`.
+    pub views: Vec<String>,
 }
 
 impl SchemaSpec {
     pub fn ddl(&self) -> String {
         let mut ddl: Vec<String> = self.tables.iter().map(TableSpec::ddl).collect();
         ddl.extend(self.extra.iter().cloned());
+        ddl.extend(self.views.iter().cloned());
         ddl.join("\n")
     }
 }
@@ -307,5 +311,32 @@ pub fn generate(prng: &mut Prng) -> SchemaSpec {
              DELETE FROM t{target} WHERE {to} = old.{from}; END;"
         ));
     }
-    SchemaSpec { tables, extra }
+    let views = (0..prng.below(3)).map(|v| view(prng, &tables, v)).collect();
+    SchemaSpec {
+        tables,
+        extra,
+        views,
+    }
+}
+
+/// A view: a filter, a left join, or a grouped count.
+fn view(prng: &mut Prng, tables: &[TableSpec], v: u64) -> String {
+    let table = &tables[prng.index(tables.len())];
+    let column = &table.columns[prng.index(table.columns.len())].name;
+    let body = match prng.below(3) {
+        0 => format!("SELECT * FROM {} WHERE {column} IS NOT NULL", table.name),
+        1 => {
+            let other = &tables[prng.index(tables.len())];
+            let right = &other.columns[prng.index(other.columns.len())].name;
+            format!(
+                "SELECT a.{column} AS x, b.{right} AS y FROM {} AS a LEFT JOIN {} AS b ON a.{column} = b.{right}",
+                table.name, other.name
+            )
+        }
+        _ => format!(
+            "SELECT {column}, count(*) AS n FROM {} GROUP BY {column}",
+            table.name
+        ),
+    };
+    format!("CREATE VIEW v{v} AS {body};")
 }

@@ -172,23 +172,47 @@ pub fn difference(expected: &Dump, actual: &Dump) -> Option<String> {
         .map(|t| format!("table {t} should not exist"))
 }
 
-/// The database's version, tables and rows, read in one transaction.
-pub fn read(conn: &Connection) -> rusqlite::Result<(Version, Vec<Shape>, Dump)> {
-    let read = (|| {
-        conn.execute_batch("BEGIN")?;
-        let version: i64 =
-            conn.query_row("SELECT version FROM _sqlive_meta WHERE id = 0", [], |r| {
-                r.get(0)
-            })?;
-        let shapes = shapes(conn)?;
-        let dump = dump(conn, &shapes, "rowid")?;
-        conn.execute_batch("COMMIT")?;
-        Ok((version as Version, shapes, dump))
-    })();
-    if read.is_err() && !conn.is_autocommit() {
+/// Starts a read transaction on `conn` and returns the version it reads,
+/// ending the transaction if the read fails.
+pub fn begin_read(conn: &Connection) -> rusqlite::Result<Version> {
+    conn.execute_batch("BEGIN")?;
+    let version = conn.query_row("SELECT version FROM _sqlive_meta WHERE id = 0", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    if version.is_err() && !conn.is_autocommit() {
         let _ = conn.execute_batch("ROLLBACK");
     }
-    read
+    version.map(|v| v as Version)
+}
+
+/// Runs `read` in the transaction [`begin_read`] started, then ends it.
+pub fn finish_read<R>(
+    conn: &Connection,
+    read: impl FnOnce() -> rusqlite::Result<R>,
+) -> rusqlite::Result<R> {
+    let result = read().and_then(|value| conn.execute_batch("COMMIT").map(|()| value));
+    if !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
+}
+
+/// Runs `read` in a read transaction, with the version it sees.
+pub fn read_at<R>(
+    conn: &Connection,
+    read: impl FnOnce(Version) -> rusqlite::Result<R>,
+) -> rusqlite::Result<R> {
+    let version = begin_read(conn)?;
+    finish_read(conn, || read(version))
+}
+
+/// The database's version, tables and rows, read in one transaction.
+pub fn read(conn: &Connection) -> rusqlite::Result<(Version, Vec<Shape>, Dump)> {
+    read_at(conn, |version| {
+        let shapes = shapes(conn)?;
+        let dump = dump(conn, &shapes, "rowid")?;
+        Ok((version, shapes, dump))
+    })
 }
 
 pub struct Replica {
