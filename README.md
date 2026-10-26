@@ -165,11 +165,11 @@ A read set carries its snapshot version, and `intersects` returns false for even
 or below it, since the result already reflects them.
 
 `intersects` can report a commit that leaves the rows the same, so `rerun` checks.
-It runs the query again and compares the result's hash with the one you pass in. When
-they match, the result is `unchanged` and carries no rows, so you have nothing to
-push. Its read set and hash still replace the old ones, because its version is newer.
-Between runs you keep only the read set and the 32-byte hash. `rerun` maps rows as it
-reads them and drops them if they are unchanged.
+It runs the full query, as `query` does, and compares the result's hash with the one
+you pass in. When they match, the result is `unchanged` and carries no rows, so you
+have nothing to push. Its read set and hash still replace the old ones, because its
+version is newer. Between runs you keep only the read set and the 32-byte hash.
+`rerun` maps rows as it reads them and drops them if they are unchanged.
 
 An event prints as:
 
@@ -263,9 +263,10 @@ collation, `NULL` handling) for you.
   generated columns are left out. Text that is not valid UTF-8 appears lossily
   converted, though changes to it are still detected exactly.
 - **Restarts:** the retained log lives in memory. After a restart, `changes_since(v)`
-  for any `v` below the current version yields `Lagged`, so re-run each live query. A
-  `rerun` against the hash a client holds sends that client no rows when nothing
-  changed.
+  for any `v` below the current version yields `Lagged`, and no read set survives, so
+  every live query runs from scratch. `rerun` is that same full query plus a hash
+  comparison: pass it the hash a client holds, and an unchanged result sends that
+  client no rows.
 - **Scope:** SqLive sees writes made through `write` on this `LiveDb`. Route every
   write through it. During a blue/green deploy, move writes to the new process in one
   step: each process learns of the other's commits only at its own next write or
@@ -288,6 +289,36 @@ collation, `NULL` handling) for you.
 - BLAKE3 hashes each result's column names and rows as the rows stream out of
   SQLite, in buffered blocks so it can hash several chunks at once.
 
+## Performance
+
+On an Intel Core Ultra 9 285 with an NVMe drive; [`BENCHMARKS.md`](BENCHMARKS.md) has
+the method and every table.
+
+- **Writes:** every commit waits for fsync, so single-row commits run at the drive's
+  pace, 231 a second here, the same as plain rusqlite. In 1,000-row transactions,
+  capturing changes costs 8–25%: 131,000 inserted rows a second against 145,000.
+- **Queries:** the chat query takes 12.7 µs, against 6.6 µs in plain rusqlite; the
+  snapshot checks, read set and hash make up the difference. A full scan returns about
+  5 million rows a second.
+- **Concurrent queries:** SQLite's memory statistics take a global lock on every
+  allocation. Turn them off before opening a database, and eight threads run 422,000
+  chat queries a second instead of 53,000:
+
+  ```rust
+  // SAFETY: before any connection opens.
+  unsafe {
+      sqlive::rusqlite::ffi::sqlite3_config(sqlive::rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0);
+  }
+  ```
+
+- **Subscriptions:** `ReadSetIndex` finds the subscriptions an event affects among
+  100,000 at 100,000 events a second. A chat-query read set takes 2.2 KB of heap, 2.8
+  KB inside the index.
+- **Chat server:** with 10,000 live viewers across 1,000 rooms and 100 posts a second,
+  every chat reached every viewer of its room in 4.7 ms at the median and 32 ms at
+  p99. The server held 238 MB and used 38% of one core. Posts top out at 223 a second,
+  the drive's fsync rate.
+
 ## Example: live chat
 
 ```console
@@ -304,8 +335,8 @@ SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10
 ```
 
 so the page lists only the ten newest chats, and each new chat pushes the oldest off.
-Below the list, the page shows the query's read set and three counters: re-runs,
-unchanged re-runs and skips. Post in one room while another room is open in a second
+Below the list, the page shows the query's read set and three counters, updated at
+most twice a second: re-runs, unchanged re-runs and skips. Post in one room while another room is open in a second
 tab: the posting room's list updates and its re-runs count rises, while the other
 room's list stays put and its skips count rises.
 
@@ -330,6 +361,7 @@ so browsers reconnect at once, and then exits.
 cargo test --workspace
 cargo run --release -p sqlive-sim [-- SEED] [--seeds N]
 scripts/mutants
+cargo run --release -p sqlive-bench [writes|queries|index|memory]
 ```
 
 The simulator runs SQLite on a deterministic in-memory VFS with injected faults and

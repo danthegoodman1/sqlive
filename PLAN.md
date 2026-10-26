@@ -15,7 +15,7 @@ Non-goals until a phase names them: writers in other processes, ATTACHed databas
 - The library starts no threads, reads no clocks and iterates only ordered collections. Events list changes in first-touch order. `clippy.toml` in `crates/live` and `crates/sim` enforces this, so a seed replays exactly.
 - Every feature ships with simulator coverage, a property that fails on a wrong answer, and a planted bug the simulator catches.
 - Build the smallest implementation that meets the phase gate.
-- Execution order: Phase 0 through Phase 8.
+- Execution order: Phase 0 through Phase 9.
 
 ## Testing Strategy
 
@@ -360,3 +360,38 @@ Status ledger:
 | Complete | Test | Phase 8 planted bugs | `scripts/mutants` holds 81 bugs, 20 of them Phase 8. On the final tree, the 4 reconnect and shutdown bugs are caught by the chat tests across every layer, and all 13 chat bugs are caught by the chat tests. The 13 library bugs of Phase 8 were caught on 6c3b3e5, and the 55 bugs of Phases 0–6 in the full run on 1997262; the code they target has not changed since. On 1997262, `--layers sim,seeds` alone caught the 4 that break `rerun`'s comparison or the final flush; the encoding collisions, large values and the statement flush need values and schema changes only the unit tests build. |
 | Complete | Test | Browser check | `examples/chat/screenshot.png`: headless Firefox with `lobby` and `kitchen` open while a chat posts to `lobby`. Lobby shows version 16 with 1 re-run, 0 unchanged and 0 skips; kitchen keeps version 15 with 0 re-runs, 0 unchanged and 1 skip. |
 | Complete | Gate | Code review | `/code-review high`, 9 findings, all resolved: per-viewer queues that dropped slow viewers became latest-wins mailboxes; skip counts moved outside the hub lock; a changed re-run applies when a viewer joined during its query, and only an unchanged one against a replaced hash runs again; the display string is built only when pushing; the room's version travels in `RoomStats` (monotonic, since counters update outside the lock), so tabs agree after an unchanged re-run; each reader reuses one hash buffer; `ResultHash::from_hex` reads back the hex `Display` writes, and the README documents it with `as_bytes` and `from_bytes`; doc phrasing; the constant mutant reads `let unchanged = false`. |
+
+## Phase 9: Performance and Scale
+
+Goal:
+Measure what SqLive costs and how the chat server scales, publish the numbers in `BENCHMARKS.md` and the README, and fix what the measurements expose.
+
+Scope:
+- 9A `sqlive-bench` subcommands: `writes` (single-row and 1,000-row commits through `LiveDb::write` against plain rusqlite with the same settings), `queries` (chat-query latency on one thread and eight, `rerun` unchanged, full scans), `index`, and `memory` (a counting allocator, run in its own process, for read sets alone and in a `ReadSetIndex`, and retained events). Databases live on disk in `target/bench`.
+- 9B `chat-load`: starts the release server, opens live streams across rooms, posts at a fixed rate, and reports per-chat delivery latency, the post ceiling, and the server's RSS and CPU.
+- 9C Fixes: each viewer's counters arrive at most every `STATS_EVERY` (500 ms); the chat server turns off SQLite's memory statistics before opening the database.
+- 9D A browser reconnect across a real restart.
+- 9E `BENCHMARKS.md` and the README's Performance section.
+
+Out of scope:
+- Shrinking read sets, whose B-tree nodes are mostly empty capacity.
+- Batching posts into shared commits.
+
+Completion gate:
+Every benchmark runs from one command and its numbers are in `BENCHMARKS.md`; the chat load test delivers every chat; the throttle has a test and a planted bug.
+
+Testing plan:
+- Run `sqlive-bench` with memory statistics on and off, and `chat-load` spread across rooms, fanned out within rooms, and past the fsync ceiling.
+- `a_viewers_counters_arrive_at_most_twice_a_second`, on a multi-threaded runtime so the stream runs while the posts block.
+- Headless Firefox through a logging proxy, with the server sent SIGTERM and restarted on the same database.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 9A: Benchmark suite | `crates/bench/src/{main,writes,queries,index,memory}.rs`; `cargo run --release -p sqlive-bench`. |
+| Complete | Work | 9B: Chat load test | `examples/chat/src/bin/chat-load.rs`. 1,000 rooms × 10 viewers at 100 posts/s: 30,000 of 30,000 delivered, p50 4.7 ms, p99 31.9 ms, 238 MB, 38% of a core. 10 rooms × 1,000 viewers at 50 posts/s: 1,500,000 of 1,500,000, p50 6.2 ms, p99 18.9 ms. Ceiling: 223 posts/s, the drive's fsync rate. |
+| Complete | Work | 9C: Counter throttle and memory statistics | Before the throttle, 10,000 viewers at 100 posts/s took 8.5 cores; after, 0.38. With memory statistics off, eight threads ran 421,577 chat queries/s against 52,732. `a_viewers_counters_arrive_at_most_twice_a_second` catches the planted bug "every counter change reaches every viewer"; on the single-threaded test runtime it missed it, so the test runs on two worker threads. |
+| Complete | Test | 9D: Browser reconnect | Headless Firefox through a proxy logging each connection: SIGTERM ended the first stream 3 ms later; the browser reconnected 1.0 s later with `Last-Event-ID` equal to the last result's id; the new server sent only the result for a chat posted after the restart, and the page showed it. |
+| Complete | Doc | 9E: Published numbers | `BENCHMARKS.md`; README "Performance". |
+| Complete | Gate | Full gate | `scripts/check 10000`: fmt, clippy and every test pass, 0 of 10,000 seeds failed. On the final tree, all 14 chat planted bugs are caught by the chat tests; `scripts/mutants` now holds 82. |

@@ -155,6 +155,7 @@ dependencies = [
  "axum",
  "futures-util",
  "serde",
+ "serde_json",
  "sqlive",
  "tokio",
 ]

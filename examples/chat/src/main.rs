@@ -11,6 +11,12 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SQLite's memory statistics take a global lock on every allocation,
+    // which serializes the readers; they must go before SQLite starts.
+    // SAFETY: no SQLite connection exists yet.
+    unsafe {
+        sqlive::rusqlite::ffi::sqlite3_config(sqlive::rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0);
+    }
     let path = std::env::var("CHAT_DB").unwrap_or_else(|_| "chat.db".to_owned());
     let addr = std::env::var("CHAT_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
     let chat = Arc::new(Chat::open(&path)?);

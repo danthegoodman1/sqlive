@@ -1,93 +1,142 @@
-//! Times `ReadSetIndex::affected` against testing every read set, for
-//! 100,000 subscriptions to the chat query over 10,000 rooms.
+//! SqLive's benchmarks: write throughput, query latency, the read-set
+//! index, and memory per subscription and per retained event.
 //!
-//!     cargo run --release -p sqlive-bench
+//!     cargo run --release -p sqlive-bench [writes|queries|index|memory]
+//!
+//! With no argument, every benchmark runs. Databases live in
+//! `target/bench`, on disk, since every commit waits for fsync;
+//! `SQLIVE_BENCH_DIR` moves them.
 
-use sqlive::{CommitEvent, LiveDb, ReadSet, ReadSetIndex};
-use std::time::{Duration, Instant};
+mod index;
+mod memory;
+mod queries;
+mod writes;
 
-const ROOMS: i64 = 10_000;
-const SUBSCRIPTIONS: u32 = 100_000;
-const EVENTS: i64 = 2_000;
-const QUERY: &str = "SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10";
+use sqlive::rusqlite::Transaction;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
-fn per_second(count: usize, elapsed: Duration) -> f64 {
+/// Counts the bytes the Rust heap holds, for the memory benchmark. The
+/// counter is one contended atomic, so it counts only in a process that
+/// runs that benchmark alone.
+struct Counting;
+
+static COUNTING: AtomicBool = AtomicBool::new(false);
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let block = unsafe { System.alloc(layout) };
+        if !block.is_null() && COUNTING.load(Ordering::Relaxed) {
+            HELD.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        block
+    }
+
+    unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(block, layout) };
+        if COUNTING.load(Ordering::Relaxed) {
+            HELD.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+    }
+
+    unsafe fn realloc(&self, block: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let moved = unsafe { System.realloc(block, layout, size) };
+        if !moved.is_null() && COUNTING.load(Ordering::Relaxed) {
+            HELD.fetch_add(size, Ordering::Relaxed);
+            HELD.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        moved
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// Bytes the Rust heap holds.
+pub fn heap() -> usize {
+    HELD.load(Ordering::Relaxed)
+}
+
+/// Bytes SQLite's own allocator holds, page caches included.
+pub fn sqlite_heap() -> i64 {
+    // SAFETY: reads a counter SQLite keeps for the process.
+    unsafe { sqlive::rusqlite::ffi::sqlite3_memory_used() }
+}
+
+pub fn per_second(count: usize, elapsed: Duration) -> f64 {
     count as f64 / elapsed.as_secs_f64()
 }
 
-fn main() -> sqlive::Result<()> {
-    let dir = std::env::temp_dir().join(format!("sqlive-bench-{}", std::process::id()));
+/// A fresh directory for one benchmark's databases.
+pub fn fresh_dir(name: &str) -> PathBuf {
+    let root = std::env::var_os("SQLIVE_BENCH_DIR")
+        .map_or_else(|| PathBuf::from("target/bench"), PathBuf::from);
+    let dir = root.join(name);
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a temporary directory");
-    let db = LiveDb::open(dir.join("bench.db").to_string_lossy())?;
-    db.write(|tx| {
-        tx.execute_batch(
-            "CREATE TABLE chats (id INTEGER PRIMARY KEY, room INTEGER, created_at INTEGER, body TEXT);
-             CREATE INDEX chats_by_room ON chats (room, created_at);",
-        )?;
-        // Twelve chats per room, so each room's window of ten is full.
-        let mut insert =
-            tx.prepare("INSERT INTO chats (room, created_at, body) VALUES (?1, ?2, 'hello')")?;
-        for room in 0..ROOMS {
-            for created_at in 0..12 {
-                insert.execute((room, created_at))?;
-            }
+    std::fs::create_dir_all(&dir).expect("a benchmark directory");
+    dir
+}
+
+/// The chat example's table, with integer rooms.
+pub const CHATS: &str =
+    "CREATE TABLE chats (id INTEGER PRIMARY KEY, room INTEGER, created_at INTEGER, body TEXT);
+     CREATE INDEX chats_by_room ON chats (room, created_at);";
+
+/// The chat example's live query.
+pub const QUERY: &str = "SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10";
+
+/// A chat of typical length, 60 bytes.
+pub const BODY: &str = "a chat message of typical length, sixty bytes long, give or ";
+
+/// Fills `rooms` rooms with twelve chats each, so each room's window of ten
+/// is full.
+pub fn fill(tx: &Transaction<'_>, rooms: i64) -> sqlive::rusqlite::Result<()> {
+    let mut insert =
+        tx.prepare("INSERT INTO chats (room, created_at, body) VALUES (?1, ?2, ?3)")?;
+    for room in 0..rooms {
+        for created_at in 0..12 {
+            insert.execute((room, created_at, BODY))?;
         }
-        Ok(())
-    })?;
-
-    let started = Instant::now();
-    let mut index = ReadSetIndex::new();
-    let mut read_sets: Vec<ReadSet> = Vec::new();
-    for subscription in 0..SUBSCRIPTIONS {
-        let room = i64::from(subscription) % ROOMS;
-        let read_set = db.query(QUERY, [room], |_| Ok(()))?.read_set;
-        index.insert(subscription, read_set.clone());
-        read_sets.push(read_set);
     }
-    let built = started.elapsed();
+    Ok(())
+}
 
-    let mut events: Vec<CommitEvent> = Vec::new();
-    for i in 0..EVENTS {
-        let room = (i * 7919) % ROOMS;
-        let ((), version) = db.write(|tx| {
-            tx.execute(
-                "INSERT INTO chats (room, created_at, body) VALUES (?1, ?2, 'new')",
-                (room, 100 + i),
-            )
-            .map(|_| ())
-        })?;
-        let event = db
-            .changes_since(version - 1)?
-            .try_next()
-            .expect("committed")?;
-        events.push(event.as_ref().clone());
+fn main() -> sqlive::Result<()> {
+    let which = std::env::args().nth(1);
+    if which.as_deref() == Some("memory") {
+        // Before any allocation, so every block is counted both ways.
+        COUNTING.store(true, Ordering::Relaxed);
+        return memory::run();
     }
-
-    let started = Instant::now();
-    let indexed: usize = events
-        .iter()
-        .map(|event| index.affected(event).count())
-        .sum();
-    let with_index = started.elapsed();
-    let started = Instant::now();
-    let tested: usize = events
-        .iter()
-        .map(|event| read_sets.iter().filter(|r| r.intersects(event)).count())
-        .sum();
-    let without_index = started.elapsed();
-    assert_eq!(indexed, tested, "the index and brute force disagree");
-
-    println!("{SUBSCRIPTIONS} subscriptions over {ROOMS} rooms, built in {built:.2?}");
-    println!(
-        "index:       {:>10.0} events/s ({} affected per event)",
-        per_second(events.len(), with_index),
-        indexed / events.len()
-    );
-    println!(
-        "brute force: {:>10.0} events/s",
-        per_second(events.len(), without_index)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
+    if std::env::var_os("SQLIVE_BENCH_MEMSTATUS").is_some_and(|value| value == "0") {
+        // SAFETY: runs before SQLite initializes.
+        unsafe {
+            sqlive::rusqlite::ffi::sqlite3_config(
+                sqlive::rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS,
+                0,
+            );
+        }
+    }
+    let runs = |name: &str| which.as_deref().is_none_or(|which| which == name);
+    if runs("writes") {
+        writes::run()?;
+    }
+    if runs("queries") {
+        queries::run()?;
+    }
+    if runs("index") {
+        index::run()?;
+    }
+    if which.is_none() {
+        // The memory benchmark counts every allocation, so it runs alone.
+        let status = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .arg("memory")
+            .status()
+            .expect("the memory benchmark runs");
+        assert!(status.success(), "the memory benchmark failed");
+    }
     Ok(())
 }

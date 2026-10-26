@@ -423,6 +423,24 @@ async fn a_reconnecting_browser_gets_rows_only_when_they_changed() {
     );
 }
 
+/// Every commit changes every room's counters, so a viewer gets the latest
+/// counts at most twice a second instead of once per commit. The server
+/// runs on its own threads while the posts block this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewers_counters_arrive_at_most_twice_a_second() {
+    let chat = Arc::new(Chat::open(&temp_db("counters")).unwrap());
+    let port = serve(&chat).await;
+    let mut live = request(port, "GET /rooms/quiet/live HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    live.until("event: result").await;
+    for i in 0..20 {
+        chat.post("busy", "ann", &format!("chat {i}")).unwrap();
+    }
+    // Each post adds a skip to the quiet room; the latest counts arrive.
+    live.until("\"skips\":20").await;
+    let events = live.text.matches("event: stats").count();
+    assert!(events <= 3, "{events} stats events: {}", live.text);
+}
+
 #[tokio::test]
 async fn closing_the_chat_ends_every_live_stream() {
     let chat = Arc::new(Chat::open(&temp_db("closing")).unwrap());

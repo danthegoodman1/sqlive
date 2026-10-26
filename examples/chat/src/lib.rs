@@ -61,6 +61,11 @@ impl ChatRow {
 /// How soon a browser reconnects after its stream ends, as at shutdown.
 const RECONNECT: Duration = Duration::from_secs(1);
 
+/// The least time between a viewer's counter updates. Every commit changes
+/// every room's counters, so each viewer gets the latest counts at this pace
+/// instead of one event per commit.
+const STATS_EVERY: Duration = Duration::from_millis(500);
+
 /// A room's live query result.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RoomResult {
@@ -555,20 +560,35 @@ async fn live(
     Ok(Sse::new(updates(first, viewer)).keep_alive(KeepAlive::default()))
 }
 
-/// The room's stats, then each result and each change to the stats, until
-/// the chat closes or the client leaves and drops the viewer.
+/// The room's stats, then each result and the latest stats at most every
+/// `STATS_EVERY`, until the chat closes or the client leaves and drops the
+/// viewer.
 fn updates(first: Event, viewer: Viewer) -> impl Stream<Item = Result<Event, Infallible>> {
     use futures_util::StreamExt;
-    let later = futures_util::stream::unfold(viewer, |mut viewer| async move {
-        let event = tokio::select! {
-            _ = viewer.closing.wait_for(|closing| *closing) => return None,
-            result = viewer.mailbox.next() => result_event(&result),
-            changed = viewer.stats.changed() => {
-                changed.ok()?;
-                stats_event(&viewer.stats.borrow_and_update())
-            }
-        };
-        Some((event, viewer))
-    });
+    let next_stats = tokio::time::Instant::now() + STATS_EVERY;
+    let later = futures_util::stream::unfold(
+        (viewer, next_stats),
+        |(mut viewer, mut next_stats)| async move {
+            let Viewer {
+                stats,
+                mailbox,
+                closing,
+                ..
+            } = &mut viewer;
+            let event = tokio::select! {
+                _ = closing.wait_for(|closing| *closing) => return None,
+                result = mailbox.next() => result_event(&result),
+                changed = async {
+                    tokio::time::sleep_until(next_stats).await;
+                    stats.changed().await
+                } => {
+                    changed.ok()?;
+                    next_stats = tokio::time::Instant::now() + STATS_EVERY;
+                    stats_event(&stats.borrow_and_update())
+                }
+            };
+            Some((event, (viewer, next_stats)))
+        },
+    );
     futures_util::stream::iter([first]).chain(later).map(Ok)
 }

@@ -402,6 +402,11 @@ MUTANTS = [
         "closing the chat leaves live streams open",
         [(CHAT, "self.closing.send_replace(true);", "")],
     ),
+    # Phase 9
+    (
+        "every counter change reaches every viewer",
+        [(CHAT, "tokio::time::sleep_until(next_stats).await;", "")],
+    ),
 ]
 
 
