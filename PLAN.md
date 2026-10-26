@@ -2,7 +2,7 @@
 
 ## Overarching Goal
 
-Build `sqlite-live`, the Rust library `README.md` describes. Queries return rows with a versioned read set. Each committed write publishes a versioned commit event with net row changes. `ReadSet::intersects` and `ReadSetIndex` tell an app which queries to re-run. A subscription that re-runs on every intersecting event always holds the result a fresh query would return. A deterministic simulator proves this under random schemas, queries, faults and crashes before each phase closes. A live chat web page demonstrates the library end to end.
+Build SqLive (crate `sqlive`), the Rust library `README.md` describes. Queries return rows with a versioned read set. Each committed write publishes a versioned commit event with net row changes. `ReadSet::intersects` and `ReadSetIndex` tell an app which queries to re-run. A subscription that re-runs on every intersecting event always holds the result a fresh query would return. A deterministic simulator proves this under random schemas, queries, faults and crashes before each phase closes. A live chat web page demonstrates the library end to end.
 
 Non-goals until a phase names them: writers in other processes, ATTACHed databases, virtual tables as change sources, read sets from instrumented b-tree cursors (a patched SQLite), an async API, and client transport, which belongs to the app.
 
@@ -34,7 +34,7 @@ Goal:
 A workspace with the library crate, a simulator with seed tooling, and a local check gate.
 
 Scope:
-- 0A Git repository and Cargo workspace: `crates/live` (`sqlite-live`), `crates/sim` (`sqlite-live-sim`), `examples/chat` (`chat-example`). rusqlite with `bundled`, `hooks` and `preupdate_hook`.
+- 0A Git repository and Cargo workspace: `crates/live` (`sqlive`), `crates/sim` (`sqlive-sim`), `examples/chat` (`chat-example`). rusqlite with `bundled`, `hooks` and `preupdate_hook`.
 - 0B `clippy.toml` in `crates/live` and `crates/sim` banning `HashMap`, `HashSet`, `std::time` and `std::thread`. The sweep runner opts out with `#[expect]`.
 - 0C Simulator PRNG (xoshiro256** seeded through SplitMix64, with `Prng::stream(seed, purpose)`), plus the driver CLI: `[SEED | COMMIT] [--seeds N]`, a parallel sweep, `SIM_TRACE`, a replay line on failure, and a trace hash.
 - 0D `scripts/check` (fmt, clippy `-D warnings`, tests, 1,000-seed sweep) and `scripts/mutants`.
@@ -74,7 +74,7 @@ Scope:
 - 1C Harness: plain-SQLite workloads (random DML, WAL, `synchronous=FULL`) on several connections, with crashes and restarts, checked against a row model with an undo log, as in `../turtlekv-rs/turtlekv/src/sim/vopr.rs`.
 
 Out of scope:
-- sqlite-live itself (Phase 2).
+- SqLive itself (Phase 2).
 
 Completion gate:
 All properties hold over a 10,000-seed sweep; `scripts/mutants` catches every Phase 1 planted bug; `/code-review` findings are resolved.

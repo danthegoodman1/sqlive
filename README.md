@@ -1,11 +1,11 @@
-# sqlite-live
+# SqLive
 
 Live queries for SQLite. Every query returns its rows plus a **read set**: the tables,
 columns, and key ranges the result depends on. Every committed write emits a
 **commit event** listing the rows it changed, with old and new values.
 `read_set.intersects(&event)` tells you which queries to re-run.
 
-sqlite-live reports what changed and what each query depends on. Your app tracks
+SqLive reports what changed and what each query depends on. Your app tracks
 subscriptions and pushes updates to clients.
 
 Status: design stage. [`PLAN.md`](PLAN.md) tracks the build.
@@ -14,7 +14,7 @@ Status: design stage. [`PLAN.md`](PLAN.md) tracks the build.
 
 ```toml
 [dependencies]
-sqlite-live = "0.1"
+sqlive = "0.1"
 ```
 
 The crate bundles SQLite built with `SQLITE_ENABLE_PREUPDATE_HOOK`.
@@ -22,7 +22,7 @@ The crate bundles SQLite built with `SQLITE_ENABLE_PREUPDATE_HOOK`.
 ## Open a database
 
 ```rust
-use sqlite_live::LiveDb;
+use sqlive::LiveDb;
 
 let db = LiveDb::open("app.db")?;
 
@@ -157,7 +157,7 @@ index then owns SQLite's comparison rules (affinity, collation, NULL handling).
   for every read set.
 - **Restarts:** the retained log lives in memory. After a restart, `changes_since(v)`
   for any `v` below the current version yields `Lagged`.
-- **Scope:** sqlite-live sees writes made through `write` on this `LiveDb`. Route every
+- **Scope:** SqLive sees writes made through `write` on this `LiveDb`. Route every
   write through it.
 
 ## How it works
@@ -185,7 +185,7 @@ rooms leave it untouched.
 
 ```console
 cargo test --workspace
-cargo run --release -p sqlite-live-sim [-- SEED] [--seeds N]
+cargo run --release -p sqlive-sim [-- SEED] [--seeds N]
 scripts/mutants
 ```
 
