@@ -429,3 +429,56 @@ fn writes_to_virtual_table_shadow_tables_are_row_changes() {
         "{event:?}"
     );
 }
+
+#[test]
+fn a_schema_moved_while_closed_is_published_at_open() {
+    let path = temp_db("moved-closed");
+    let db = LiveDb::open(&path).unwrap();
+    db.write(|tx| tx.execute_batch("CREATE TABLE t (n)"))
+        .unwrap();
+    let before = db.version();
+    drop(db);
+    // A VACUUM whose event never committed leaves the schema cookie moved.
+    sqlive::rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("VACUUM")
+        .unwrap();
+    let db = LiveDb::open(&path).unwrap();
+    assert_eq!(db.version(), before + 1, "opening publishes the move");
+    let event = next(&mut db.changes_since(before).unwrap());
+    assert!(event.schema_changed);
+}
+
+#[test]
+fn statements_after_an_automatic_rollback_do_not_commit() {
+    let db = open(
+        "auto-rollback",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);",
+    );
+    for after in [
+        "INSERT INTO t VALUES (3)",
+        "SAVEPOINT s; INSERT INTO t VALUES (3);",
+    ] {
+        let before = db.version();
+        let result = db.write(|tx| {
+            tx.execute_batch("INSERT INTO t VALUES (2)")?;
+            // OR ROLLBACK ends the whole transaction on a conflict.
+            assert!(
+                tx.execute_batch("INSERT OR ROLLBACK INTO t VALUES (1)")
+                    .is_err()
+            );
+            let _ = tx.execute_batch(after);
+            Ok(())
+        });
+        assert!(
+            matches!(result, Err(Error::RolledBack)),
+            "{after}: {result:?}"
+        );
+        assert_eq!(db.version(), before);
+        let rows: i64 = db
+            .write(|tx| tx.query_row("SELECT count(*) FROM t", [], |r| r.get(0)))
+            .unwrap()
+            .0;
+        assert_eq!(rows, 1, "{after}: neither 2 nor 3 committed");
+    }
+}

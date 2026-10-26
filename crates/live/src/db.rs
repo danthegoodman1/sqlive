@@ -52,9 +52,12 @@ struct Writer {
     /// True while SqLive runs its own statements; false while the caller's
     /// closure runs, when the authorizer guards the transaction.
     internal: Arc<AtomicBool>,
+    /// Set when SQLite rolls the transaction back while the closure runs.
+    rolled_back: Arc<AtomicBool>,
     schema: Arc<Schema>,
-    /// A failed commit left this process unsure of the version; the next
-    /// write reads it back and resets the log.
+    /// A failed commit or vacuum left this process unsure of the database's
+    /// state; the next write reads the version back, resets the log, and
+    /// sets `schema_changed`.
     unsure: bool,
 }
 
@@ -80,34 +83,61 @@ impl LiveDb {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "wal_autocheckpoint", options.checkpoint_pages)?;
+        // `schema` holds the schema cookie as of the last commit, so a cookie
+        // that moves without a commit, as `VACUUM` moves it, shows.
         conn.execute_batch(&format!(
             "BEGIN IMMEDIATE;
              CREATE TABLE IF NOT EXISTS {META_TABLE} (
                  id INTEGER PRIMARY KEY CHECK (id = 0),
-                 version INTEGER NOT NULL
+                 version INTEGER NOT NULL,
+                 schema INTEGER NOT NULL
              );
-             INSERT OR IGNORE INTO {META_TABLE} VALUES (0, 0);
+             INSERT OR IGNORE INTO {META_TABLE}
+                 VALUES (0, 0, (SELECT schema_version FROM pragma_schema_version));
              COMMIT;"
         ))?;
-        let version = read_version(&conn)?;
+        let meta = read_meta(&conn)?;
         let schema = Arc::new(Schema::load(&conn)?);
         let capture = Arc::new(Mutex::new(Capture::default()));
         capture::install(&mut conn, capture.clone())?;
         let internal = Arc::new(AtomicBool::new(true));
         install_guard(&mut conn, internal.clone())?;
-        let log = Arc::new(Log::new(version, options.log_capacity));
-        Ok(LiveDb {
+        // `internal` is false while the caller's closure runs. A commit then
+        // means SQLite rolled the transaction back after an error and now
+        // commits each statement on its own; refusing those commits keeps
+        // the write atomic, and the rollback hook records the rollback.
+        let in_library = internal.clone();
+        conn.commit_hook(Some(move || !in_library.load(Ordering::Relaxed)))?;
+        let rolled_back = Arc::new(AtomicBool::new(false));
+        let (in_library, flag) = (internal.clone(), rolled_back.clone());
+        conn.rollback_hook(Some(move || {
+            if !in_library.load(Ordering::Relaxed) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }))?;
+        let moved = schema.version != meta.schema;
+        let log = Arc::new(Log::new(meta.version, options.log_capacity));
+        let db = LiveDb {
             path,
             options,
             writer: Mutex::new(Writer {
                 conn,
                 capture,
                 internal,
+                rolled_back,
                 schema,
                 unsure: false,
             }),
             log,
-        })
+        };
+        if moved {
+            // The schema moved after the last commit, as when a `VACUUM`
+            // ran and its event never committed: publish the change now, so
+            // a consumer that resumes from before it reloads.
+            let mut writer = crate::lock(&db.writer);
+            db.commit(&mut writer, |_| Ok(()), true)?;
+        }
+        Ok(db)
     }
 
     /// The path the database was opened with.
@@ -140,12 +170,28 @@ impl LiveDb {
     }
 
     /// Runs `VACUUM`, then publishes an event with `schema_changed` set,
-    /// since vacuuming can renumber rowids.
+    /// since vacuuming can renumber rowids. If either step fails, `VACUUM`
+    /// may still have taken effect, so every open stream lags, and the next
+    /// write, or the next open, publishes `schema_changed`.
     pub fn vacuum(&self) -> Result<Version> {
         let mut writer = crate::lock(&self.writer);
-        writer.conn.execute_batch("VACUUM")?;
-        self.commit(&mut writer, |_| Ok(()), true)
-            .map(|((), version)| version)
+        let result = match writer.conn.execute_batch("VACUUM") {
+            Ok(()) => self
+                .commit(&mut writer, |_| Ok(()), true)
+                .map(|((), version)| version),
+            Err(error) => Err(error.into()),
+        };
+        if result.is_err() {
+            self.doubt(&mut writer);
+        }
+        result
+    }
+
+    /// Records that the database may have changed without an event: every
+    /// open stream lags, and the next write sets `schema_changed`.
+    fn doubt(&self, writer: &mut Writer) {
+        writer.unsure = true;
+        self.log.reset(self.log.latest());
     }
 
     /// A stream of the events committed after now.
@@ -171,7 +217,7 @@ impl LiveDb {
             && writer.conn.execute_batch("ROLLBACK").is_err()
             && !writer.conn.is_autocommit()
         {
-            writer.unsure = true;
+            self.doubt(writer);
         }
         result
     }
@@ -186,32 +232,41 @@ impl LiveDb {
             conn,
             capture,
             internal,
+            rolled_back,
             schema,
             unsure,
         } = writer;
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        let stored = read_version(&tx)?;
-        if *unsure || stored != self.log.latest() {
-            self.log.reset(stored);
-            *unsure = false;
+        let meta = read_meta(&tx)?;
+        if meta.version != self.log.latest() {
+            self.log.reset(meta.version);
         }
+        // A failed write may have changed the database without an event, so
+        // this one tells every consumer to reload.
+        let suspect = *unsure;
         let before = schema_version(&tx)?;
-        // A schema that moved since the last write moved outside any write,
-        // as a `VACUUM` whose event failed to commit does.
-        let moved_outside = before != schema.version;
-        if moved_outside {
+        // A schema that moved since the last commit moved outside any write,
+        // as it does when a `VACUUM` runs and its event fails to commit.
+        let moved_outside = before != meta.schema;
+        if before != schema.version {
             *schema = Arc::new(Schema::load(&tx)?);
         }
+        rolled_back.store(false, Ordering::Relaxed);
         let recording = Recording::begin(capture, schema.clone());
         let value = {
             let _caller = CallerScope::enter(internal);
             f(&tx)
         }?;
-        let schema_changed =
-            force_schema_changed || moved_outside || schema_version(&tx)? != before;
+        // A `SAVEPOINT` after an automatic rollback opens a new transaction,
+        // so the hook's flag, not the autocommit state, tells.
+        if rolled_back.load(Ordering::Relaxed) || tx.is_autocommit() {
+            return Err(Error::RolledBack);
+        }
+        let after = schema_version(&tx)?;
+        let schema_changed = force_schema_changed || suspect || moved_outside || after != before;
         // Recording continues through the version bump, so nothing a write
         // sets off goes unrecorded.
-        let version = bump_version(&tx)?;
+        let version = bump_version(&tx, after)?;
         let captured = recording.finish();
         let schema_changed = schema_changed || captured.unaccounted;
         let (changes, reloaded) = if schema_changed {
@@ -229,6 +284,7 @@ impl LiveDb {
                 if let Some(reloaded) = reloaded {
                     *schema = reloaded;
                 }
+                *unsure = false;
                 self.log.publish(event);
                 Ok((value, version))
             }
@@ -243,12 +299,14 @@ impl LiveDb {
                         if let Some(reloaded) = reloaded {
                             *schema = reloaded;
                         }
+                        *unsure = false;
                         self.log.publish(event);
                         Ok((value, version))
                     }
                     Ok(seen) if seen + 1 == version => Err(error.into()),
                     _ => {
                         *unsure = true;
+                        self.log.reset(self.log.latest());
                         Err(error.into())
                     }
                 }
@@ -360,17 +418,37 @@ fn install_guard(conn: &mut Connection, internal: Arc<AtomicBool>) -> rusqlite::
     }))
 }
 
-fn read_version(conn: &Connection) -> rusqlite::Result<Version> {
+pub(crate) fn read_version(conn: &Connection) -> rusqlite::Result<Version> {
     conn.prepare_cached(&format!("SELECT version FROM {META_TABLE} WHERE id = 0"))?
         .query_row([], |r| r.get::<_, i64>(0))
         .map(|v| v as Version)
 }
 
-fn bump_version(conn: &Connection) -> rusqlite::Result<Version> {
+/// What `_sqlive_meta` records about the last commit.
+struct Meta {
+    version: Version,
+    /// The schema cookie the last commit left.
+    schema: i64,
+}
+
+fn read_meta(conn: &Connection) -> rusqlite::Result<Meta> {
     conn.prepare_cached(&format!(
-        "UPDATE {META_TABLE} SET version = version + 1 WHERE id = 0 RETURNING version"
+        "SELECT version, schema FROM {META_TABLE} WHERE id = 0"
     ))?
-    .query_row([], |r| r.get::<_, i64>(0))
+    .query_row([], |r| {
+        Ok(Meta {
+            version: r.get::<_, i64>(0)? as Version,
+            schema: r.get(1)?,
+        })
+    })
+}
+
+/// Advances the version, recording the schema cookie the commit leaves.
+fn bump_version(conn: &Connection, schema: i64) -> rusqlite::Result<Version> {
+    conn.prepare_cached(&format!(
+        "UPDATE {META_TABLE} SET version = version + 1, schema = ?1 WHERE id = 0 RETURNING version"
+    ))?
+    .query_row([schema], |r| r.get::<_, i64>(0))
     .map(|v| v as Version)
 }
 

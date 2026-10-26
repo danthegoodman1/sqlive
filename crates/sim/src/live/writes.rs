@@ -197,8 +197,14 @@ pub fn transaction(prng: &mut Prng, schema: &SchemaSpec) -> Transaction {
     }
 }
 
-/// A schema change: a new column, a new index, or `ANALYZE`.
-pub fn schema_change(prng: &mut Prng, schema: &mut SchemaSpec, serial: u64) -> Statement {
+/// A schema change: a new column, a new index, or `ANALYZE`. A new column
+/// joins `schema` at once and comes back as `(table, column)`, so the
+/// caller can drop it again if the change did not take effect.
+pub fn schema_change(
+    prng: &mut Prng,
+    schema: &mut SchemaSpec,
+    serial: u64,
+) -> (Statement, Option<(usize, String)>) {
     let t = prng.index(schema.tables.len());
     match prng.below(3) {
         0 => {
@@ -213,19 +219,25 @@ pub fn schema_change(prng: &mut Prng, schema: &mut SchemaSpec, serial: u64) -> S
                 not_null: false,
                 references: None,
             });
-            Statement::plain(format!(
-                "ALTER TABLE {} ADD COLUMN {name} {declared}",
-                table.name
-            ))
+            (
+                Statement::plain(format!(
+                    "ALTER TABLE {} ADD COLUMN {name} {declared}",
+                    table.name
+                )),
+                Some((t, name)),
+            )
         }
         1 => {
             let table = &schema.tables[t];
             let column = &table.columns[*prng.pick(&table.writable())].name;
-            Statement::plain(format!(
-                "CREATE INDEX IF NOT EXISTS x{serial} ON {} ({column})",
-                table.name
-            ))
+            (
+                Statement::plain(format!(
+                    "CREATE INDEX IF NOT EXISTS x{serial} ON {} ({column})",
+                    table.name
+                )),
+                None,
+            )
         }
-        _ => Statement::plain("ANALYZE"),
+        _ => (Statement::plain("ANALYZE"), None),
     }
 }

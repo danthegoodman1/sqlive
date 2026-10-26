@@ -172,6 +172,25 @@ pub fn difference(expected: &Dump, actual: &Dump) -> Option<String> {
         .map(|t| format!("table {t} should not exist"))
 }
 
+/// The database's version, tables and rows, read in one transaction.
+pub fn read(conn: &Connection) -> rusqlite::Result<(Version, Vec<Shape>, Dump)> {
+    let read = (|| {
+        conn.execute_batch("BEGIN")?;
+        let version: i64 =
+            conn.query_row("SELECT version FROM _sqlive_meta WHERE id = 0", [], |r| {
+                r.get(0)
+            })?;
+        let shapes = shapes(conn)?;
+        let dump = dump(conn, &shapes, "rowid")?;
+        conn.execute_batch("COMMIT")?;
+        Ok((version as Version, shapes, dump))
+    })();
+    if read.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    read
+}
+
 pub struct Replica {
     pub name: &'static str,
     conn: Connection,
@@ -205,27 +224,8 @@ impl Replica {
     /// Reloads every table from `oracle` and follows `db` from the
     /// version it read.
     pub fn rebuild(&mut self, oracle: &Connection, db: &LiveDb) -> Result<(), String> {
-        let read = (|| -> rusqlite::Result<(Version, Vec<Shape>, Dump)> {
-            oracle.execute_batch("BEGIN")?;
-            let version: i64 =
-                oracle.query_row("SELECT version FROM _sqlive_meta WHERE id = 0", [], |r| {
-                    r.get(0)
-                })?;
-            let shapes = shapes(oracle)?;
-            let dump = dump(oracle, &shapes, "rowid")?;
-            oracle.execute_batch("COMMIT")?;
-            Ok((version as Version, shapes, dump))
-        })();
-        let (version, shapes, dump) = match read {
-            Ok(read) => read,
-            Err(e) => {
-                let _ = oracle.execute_batch("ROLLBACK");
-                return Err(format!(
-                    "{} replica could not read the database: {e}",
-                    self.name
-                ));
-            }
-        };
+        let (version, shapes, dump) = read(oracle)
+            .map_err(|e| format!("{} replica could not read the database: {e}", self.name))?;
         self.load(&shapes, &dump)
             .map_err(|e| format!("{} replica could not load: {e}", self.name))?;
         self.shapes = shapes;
@@ -274,6 +274,23 @@ impl Replica {
                 insert.execute(params_from_iter(row))?;
             }
         }
+        Ok(())
+    }
+
+    /// Follows a reopened database from this replica's version. A replica
+    /// behind the reopened log lags on its next drain and rebuilds; one
+    /// ahead of the database fails, since it saw a commit the restart lost.
+    pub fn resume(&mut self, db: &LiveDb) -> Result<(), String> {
+        if self.stale {
+            self.stream = None;
+            return Ok(());
+        }
+        self.stream = Some(db.changes_since(self.version).map_err(|e| {
+            format!(
+                "{} replica at version {} cannot follow the reopened database: {e}",
+                self.name, self.version
+            )
+        })?);
         Ok(())
     }
 

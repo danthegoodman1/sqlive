@@ -142,12 +142,14 @@ Status ledger:
 ## Phase 3: Crashes and Faults
 
 Goal:
-The changefeed stays correct through I/O errors, commits with unknown outcomes, and restarts.
+The changefeed stays correct through I/O errors, commits with unknown outcomes, automatic rollbacks, and restarts.
 
 Scope:
-- 3A Commit errors: `write` returns the error, rolls back if the transaction is still open, publishes nothing, and keeps the in-memory version equal to `_live_meta`.
-- 3B Restart: `open` reads the version from `_live_meta` and starts an empty log. `changes_since(v)` yields `Lagged` for `v` below the current version and resumes for `v` equal to it.
-- 3C Simulator: Phase 1 faults and crashes enabled for live workloads. Replicas keep their version across restarts, resubscribe, and rebuild from a dump on `Lagged`.
+- 3A Commit errors: `write` returns the error and rolls back if the transaction is still open. It reads the version back: a commit that took effect is published and `write` succeeds; one that did not publishes nothing; an unreadable version leaves the writer unsure, so the next write resets the log and sets `schema_changed`.
+- 3B Automatic rollbacks: a commit hook refuses every commit while the closure runs, so statements SQLite runs one by one after rolling the transaction back on an I/O error fail instead of committing. A rollback hook records the rollback, even when a later `SAVEPOINT` opens a new transaction, and `write` returns `Error::RolledBack`.
+- 3C Restart: `open` reads the version from `_sqlive_meta` and starts an empty log. `changes_since(v)` yields `Lagged` for `v` below the current version and resumes for `v` equal to it. `_sqlive_meta` also stores the schema cookie as of the last commit; if it differs at open, `open` publishes a `schema_changed` event.
+- 3D Vacuum: if `VACUUM` or its event fails, every open stream lags and the next write sets `schema_changed`, since rowids may have moved.
+- 3E Simulator: Phase 1 faults and crashes enabled for live workloads. Replicas keep their version across restarts, resume or lag and rebuild. The oracle reads with faults suspended. Peeks and restarts draw from their own PRNG streams.
 
 Out of scope:
 - Queries (Phase 4).
@@ -156,22 +158,24 @@ Completion gate:
 All properties hold over a 10,000-seed sweep with faults and crashes enabled; `scripts/mutants` catches every Phase 3 planted bug; `/code-review` findings are resolved.
 
 Testing plan:
-- Scenario: a sync error on a commit's WAL write, followed by a crash, recovers that transaction without an event. Replicas then receive `Lagged`.
-- Properties: every published event's transaction survives a crash. After a restart, each replica either resumes with no gaps or receives `Lagged`, and it equals a dump once caught up. `PRAGMA integrity_check` passes.
-- Planted bugs: `synchronous=NORMAL`; publishing when `COMMIT` returns an error; a version bumped in memory before `COMMIT` and kept after a failure; resuming `changes_since(v)` for `v` below the version after a restart.
+- Scenario: a sync error on a commit's WAL write, followed by a crash, recovers that transaction without an event; a follower at the last published version lags.
+- Properties: every published event's transaction survives a crash, and `PRAGMA integrity_check` passes after every restart. After a restart, each replica either resumes or receives `Lagged`, and it equals a dump once caught up. Nothing a write does is visible to another connection before it commits. `write` never reports success for a transaction SQLite rolled back.
+- Planted bugs: `synchronous=NORMAL`; publishing when `COMMIT` failed and the version did not move; a reopened log resuming streams from before the restart; no commit hook; no rollback check; a rollback hidden by a later `SAVEPOINT`; a failed vacuum leaving streams following; a schema moved while closed going unpublished.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Risk | A commit that fails after its WAL frames reach disk can reappear after a crash without an event; `Lagged` after restart must cover it | Missing: the scenario test above. |
-| Incomplete | Work | 3A: Commit-error handling | Missing: tests with injected sync and write errors. |
-| Incomplete | Work | 3B: Restart recovery and `Lagged` | Missing: restart tests. |
-| Incomplete | Work | 3C: Live workloads under faults and crashes | Missing: simulator options drawing fault rates and crash points. |
-| Incomplete | Test | Durability, resume-or-lag, and integrity properties | Missing: property functions and seed tests. |
-| Incomplete | Test | Phase 3 planted bugs | Missing: `scripts/mutants` report, 4 of 4 caught. |
-| Incomplete | Gate | 10,000-seed sweep with faults | Missing: sweep output. |
-| Incomplete | Gate | Code review | Missing: `/code-review` findings and resolutions. |
+| Complete | Risk | A commit that fails after its WAL frames reach disk can reappear after a crash without an event | `crates/sim/tests/scenarios.rs`, `a_commit_that_failed_to_sync_can_come_back_after_a_crash_and_streams_lag`; over live seeds 0–299, 2 restarts recovered an unpublished commit and every replica lagged and rebuilt. |
+| Complete | Work | 3A: Commit errors and uncertain outcomes | `LiveDb::attempt` in `crates/live/src/db.rs` reads the version back after a failed `COMMIT`; `Live::finish_write` in `crates/sim/src/live/mod.rs` checks versions, and marks the outcome unknown only for a write that reached `COMMIT`. Seeds 0–299: 6,872 failed writes, 1,080 sync errors. |
+| Complete | Work | 3B: Automatic rollbacks | Commit and rollback hooks in `LiveDb::open_with`; `statements_after_an_automatic_rollback_do_not_commit` (a plain statement, and a `SAVEPOINT` after the rollback); the simulator checks `is_autocommit` after every statement. Seeds 0–299: 100 rolled-back writes across 43 seeds. |
+| Complete | Work | 3C: Restart recovery, `Lagged`, and the schema cookie | `a_stream_behind_the_log_lags_and_a_reopen_forgets_the_log`, `a_schema_moved_while_closed_is_published_at_open`; `Live::restart`. Seeds 0–299: 789 restarts, 563 of them crashes. |
+| Complete | Work | 3D: Failed vacuum | `LiveDb::vacuum` and `doubt`; `a_failed_vacuum_lags_every_stream_and_flags_the_next_write` in `crates/sim/tests/scenarios.rs`; `seed_1159_a_vacuum_whose_event_fails_lags_every_stream` in `crates/sim/tests/seeds.rs`. |
+| Complete | Work | 3E: Live workloads under faults and crashes | `LiveOptions::from_seed` draws fault rates, crash and reopen rates, and peek rates; `SimVfs::quietly` suspends faults for checks. |
+| Complete | Test | Durability, integrity, resume-or-lag, isolation, and rollback properties | `Live::restart` (published versions survive, `integrity_check`), `Replica::resume`, `peek_at`, the rollback check in `Live::write`; `live_seeds_0_to_63_pass_and_replay`. |
+| Complete | Test | Phase 3 planted bugs | `scripts/mutants --layers unit,sim,seeds`: 25 of 25 caught, 9 of them Phase 3. The failed-vacuum mutant needs `a_failed_vacuum_lags_every_stream_and_flags_the_next_write`, since the stored schema cookie flags the next write on its own. |
+| Complete | Gate | 10,000-seed sweep with faults | `cargo run --release -p sqlive-sim -- 0 --seeds 10000` (storage and live): 0 of 10,000 failed, after the review fixes. |
+| Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved: a rollback hook catches a `SAVEPOINT` that reopens a rolled-back transaction; the writer stays unsure until a publish succeeds; `_sqlive_meta` stores the schema cookie and `open` reconciles it; the simulator marks outcomes unknown only for writes that reached `COMMIT`, draws peeks and restarts from their own streams, runs `integrity_check` after restarts, shares one database read between the harness and replicas, takes its isolation baseline from the eager replica, and documents `Replica::resume`; the README documents `RolledBack`, commit errors and failed vacuums. |
 
 ## Phase 4: Live Queries
 

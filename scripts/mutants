@@ -86,7 +86,7 @@ MUTANTS = [
     ),
     (
         "a schema moved outside a write goes unflagged",
-        [(DB, "force_schema_changed || moved_outside ||", "force_schema_changed ||")],
+        [(DB, "suspect || moved_outside ||", "suspect ||")],
     ),
     (
         "the version table accepts triggers",
@@ -99,8 +99,8 @@ MUTANTS = [
     ),
     (
         "a schema change goes unflagged",
-        [(DB, "force_schema_changed || moved_outside || schema_version(&tx)? != before;",
-          "force_schema_changed || moved_outside;")],
+        [(DB, "force_schema_changed || suspect || moved_outside || after != before;",
+          "force_schema_changed || suspect || moved_outside;")],
     ),
     (
         "net changes compare reals by value, so 0.0 equals -0.0",
@@ -110,6 +110,41 @@ MUTANTS = [
     (
         "changes_since resumes one event late",
         [(LOG, "next: since + 1,", "next: since + 2,")],
+    ),
+    # Phase 3
+    (
+        "commits wait for the WAL only at checkpoints",
+        [(DB, 'conn.pragma_update(None, "synchronous", "FULL")?;', 'conn.pragma_update(None, "synchronous", "NORMAL")?;')],
+    ),
+    (
+        "a commit that failed is published anyway",
+        [(DB, "Ok(seen) if seen + 1 == version => Err(error.into()),",
+          "Ok(seen) if seen + 1 == version => { self.log.publish(event); Ok((value, version)) }")],
+    ),
+    (
+        "a reopened log resumes streams from before the restart",
+        [(LOG, "base: latest,", "base: 0,")],
+    ),
+    (
+        "statements after an automatic rollback commit one by one",
+        [(DB, "conn.commit_hook(Some(move || !in_library.load(Ordering::Relaxed)))?;",
+          "let _ = in_library;")],
+    ),
+    (
+        "a rolled-back transaction reports success",
+        [(DB, "if rolled_back.load(Ordering::Relaxed) || tx.is_autocommit() { return Err(Error::RolledBack); }", "")],
+    ),
+    (
+        "a savepoint after an automatic rollback hides it",
+        [(DB, "if rolled_back.load(Ordering::Relaxed) || tx.is_autocommit() {", "if tx.is_autocommit() {")],
+    ),
+    (
+        "a schema moved while closed goes unpublished",
+        [(DB, "if moved {", "if false && moved {")],
+    ),
+    (
+        "a failed vacuum leaves streams following",
+        [(DB, "writer.unsure = true; self.log.reset(self.log.latest());", "writer.unsure = true;")],
     ),
     (
         "a stream behind the log does not lag",

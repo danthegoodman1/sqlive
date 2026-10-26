@@ -63,6 +63,11 @@ let (todo_id, version) = db.write(|tx| {
   triggers and foreign-key cascades appear in the commit event.
 - `write` owns `BEGIN` and `COMMIT`. Use `SAVEPOINT` for nested work.
 - Return `Err` to roll back. A rolled-back transaction emits no event.
+- SQLite can roll a transaction back on its own, after an I/O error or an
+  `OR ROLLBACK` conflict. `write` then returns `Error::RolledBack` and publishes
+  nothing, even when the closure returns `Ok`.
+- If `COMMIT` reports an error, `write` checks whether the transaction took effect. If
+  it did, `write` publishes the event and succeeds; otherwise it returns the error.
 - Writes serialize on one writer connection. Keep closures short; they hold the write
   lock.
 - Run `VACUUM` through `db.vacuum()`, since SQLite runs it outside a transaction.
@@ -162,9 +167,15 @@ index then owns SQLite's comparison rules (affinity, collation, NULL handling).
   value.
 - **Conservative:** `intersects` returns false only when a change cannot affect the
   result. It may return true for a change that leaves the result the same.
-- **Durable:** a published event's transaction survives a crash.
+- **Durable:** a published event's transaction survives a crash. A commit that
+  reported an error can still reappear after a crash, without an event; streams from
+  before it lag.
+- **Uncertain outcomes:** when SqLive cannot tell whether a transaction took effect,
+  every open stream lags and the next event sets `schema_changed`.
 - **Schema:** DDL and `db.vacuum()` set `schema_changed` and leave `changes` empty;
-  reload what you hold. `intersects` returns true for every read set.
+  reload what you hold. `intersects` returns true for every read set. If `vacuum`
+  fails, it may still have renumbered rowids, so every open stream lags and the next
+  write, or the next open, sets `schema_changed`.
 - **Rows:** a `RowChange` carries the row's stored columns, before and after, plus its
   rowid (`None` for a `WITHOUT ROWID` table, whose key identifies it). `VIRTUAL`
   generated columns are left out. Text that is not valid UTF-8 appears lossily

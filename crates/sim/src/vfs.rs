@@ -135,6 +135,8 @@ struct State {
     /// Between `begin_crash` and `finish_crash`, nothing reaches the files.
     frozen: bool,
     next_handle: u64,
+    /// Syncs still to fail on purpose, for scripted scenarios.
+    failing_syncs: u32,
     files: BTreeMap<String, FileData>,
     temp: BTreeMap<u64, Vec<u8>>,
     locks: BTreeMap<String, FileLock>,
@@ -195,6 +197,7 @@ impl SimVfs {
             generation: 0,
             frozen: false,
             next_handle: 1,
+            failing_syncs: 0,
             files: BTreeMap::new(),
             temp: BTreeMap::new(),
             locks: BTreeMap::new(),
@@ -251,8 +254,28 @@ impl SimVfs {
         self.state().faults_enabled = enabled;
     }
 
+    pub fn faults(&self) -> bool {
+        self.state().faults_enabled
+    }
+
+    /// Runs `check` with fault injection suspended, so checks never fail on
+    /// an injected error.
+    pub fn quietly<R>(&self, check: impl FnOnce() -> R) -> R {
+        let enabled = self.faults();
+        self.set_faults(false);
+        let result = check();
+        self.set_faults(enabled);
+        result
+    }
+
     pub fn stats(&self) -> IoStats {
         self.state().stats.clone()
+    }
+
+    /// Makes the next sync of a database file fail, whatever the fault
+    /// configuration says.
+    pub fn fail_next_sync(&self) {
+        self.state().failing_syncs += 1;
     }
 
     /// Cuts the power: every open handle stops reaching the files. Close
@@ -677,6 +700,11 @@ unsafe extern "C" fn x_sync(p: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
         return ffi::SQLITE_OK;
     };
     state.stats.syncs += 1;
+    if state.failing_syncs > 0 {
+        state.failing_syncs -= 1;
+        state.stats.sync_errors += 1;
+        return ffi::SQLITE_IOERR_FSYNC;
+    }
     if state.fault(state.faults.sync_error) {
         state.stats.sync_errors += 1;
         return ffi::SQLITE_IOERR_FSYNC;

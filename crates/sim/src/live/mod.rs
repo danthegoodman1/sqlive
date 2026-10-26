@@ -3,10 +3,19 @@
 //!
 //! What it checks:
 //! - each successful write returns the next version, and a failed write
-//!   leaves the version where it was;
+//!   leaves the version where it was, unless an earlier failure left the
+//!   outcome unknown;
+//! - nothing a write does is visible to other connections before it commits;
 //! - replicas built only from commit events match a dump of the database
 //!   whenever they have caught up, whether they follow every event at once
-//!   or fall behind, lag, and rebuild.
+//!   or fall behind, lag, and rebuild;
+//! - every published commit survives a crash, and after a restart each
+//!   replica either resumes or lags and rebuilds.
+//!
+//! The oracle, a plain read-only connection, reads with fault injection
+//! suspended, so the checks themselves never fail on an injected error.
+//! Peeks and restarts draw from their own PRNG streams, so tuning them leaves
+//! the workload unchanged.
 
 mod replica;
 mod schema;
@@ -15,7 +24,7 @@ mod writes;
 use crate::prng::Prng;
 use crate::trace::Trace;
 use crate::vfs::{FaultConfig, IoStats, SimVfs};
-use replica::{Replica, difference, dump, shapes};
+use replica::{Dump, Replica, difference};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use schema::SchemaSpec;
 use sqlive::{LiveDb, Options, Version};
@@ -33,6 +42,11 @@ pub struct LiveOptions {
     pub lazy_drain: f64,
     pub schema_change: f64,
     pub vacuum: f64,
+    pub crash: f64,
+    pub reopen: f64,
+    /// How often a write's closure checks that its changes stay invisible.
+    pub peek: f64,
+    pub faults: FaultConfig,
     pub schema: SchemaSpec,
 }
 
@@ -46,6 +60,10 @@ impl LiveOptions {
             lazy_drain: *prng.pick(&[0.02, 0.1, 0.5]),
             schema_change: *prng.pick(&[0.0, 0.01, 0.03]),
             vacuum: *prng.pick(&[0.0, 0.01]),
+            crash: *prng.pick(&[0.0, 0.01, 0.03]),
+            reopen: *prng.pick(&[0.0, 0.01]),
+            peek: *prng.pick(&[0.05, 0.3]),
+            faults: FaultConfig::from_prng(&mut prng),
             schema: schema::generate(&mut Prng::stream(seed, "live schema")),
         }
     }
@@ -63,6 +81,13 @@ pub struct LiveSummary {
     pub lagged: u64,
     pub rebuilds: u64,
     pub checks: u64,
+    pub skipped_checks: u64,
+    pub peeks: u64,
+    pub restarts: u64,
+    /// Writes whose transaction SQLite rolled back after an error.
+    pub rolled_back: u64,
+    /// Restarts that recovered a commit this process never published.
+    pub recovered_unpublished: u64,
     pub io: IoStats,
     pub digest: u64,
 }
@@ -72,7 +97,9 @@ impl fmt::Display for LiveSummary {
         write!(
             f,
             "{} writes ({} failed), {} statements ({} failed), {} events with {} changes ({} schema), \
-             {} lags, {} rebuilds, {} replica checks, digest {:016x}",
+             {} lags, {} rebuilds, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
+             {} rolled back, \
+             I/O errors: {} read {} write {} sync {} busy, digest {:016x}",
             self.writes,
             self.failed_writes,
             self.statements,
@@ -83,6 +110,16 @@ impl fmt::Display for LiveSummary {
             self.lagged,
             self.rebuilds,
             self.checks,
+            self.skipped_checks,
+            self.peeks,
+            self.restarts,
+            self.io.crashes,
+            self.recovered_unpublished,
+            self.rolled_back,
+            self.io.read_errors,
+            self.io.write_errors,
+            self.io.sync_errors,
+            self.io.busy,
             self.digest
         )
     }
@@ -92,9 +129,16 @@ struct Live {
     options: LiveOptions,
     schema: SchemaSpec,
     prng: Prng,
+    peeks: Prng,
+    restarts: Prng,
     trace: Trace,
     serial: u64,
     summary: LiveSummary,
+    /// A write failed in a way that may have committed: the next write may
+    /// skip versions, and the database may hold a commit the log lacks.
+    unknown: bool,
+    /// The newest version this process published.
+    published: Version,
     replicas: Vec<Replica>,
     oracle: Option<Connection>,
     db: Option<LiveDb>,
@@ -111,24 +155,30 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
             options.schema.ddl()
         );
     }
-    let vfs = SimVfs::new(seed, FaultConfig::none());
+    let vfs = SimVfs::new(seed, options.faults.clone());
     let mut live = Live {
         schema: options.schema.clone(),
         options,
         prng: Prng::stream(seed, "live steps"),
+        peeks: Prng::stream(seed, "live peeks"),
+        restarts: Prng::stream(seed, "live restarts"),
         trace: Trace::new(verbose),
         serial: 0,
         summary: LiveSummary::default(),
+        unknown: false,
+        published: 0,
         replicas: vec![Replica::new("eager"), Replica::new("lazy")],
         oracle: None,
         db: None,
         vfs,
     };
     live.start()?;
+    live.vfs.set_faults(true);
     for step in 0..live.options.steps {
         live.step()
             .map_err(|message| format!("step {step}: {message}"))?;
     }
+    live.vfs.set_faults(false);
     for i in 0..live.replicas.len() {
         live.catch_up(i)
             .map_err(|message| format!("final check: {message}"))?;
@@ -147,7 +197,15 @@ impl Live {
         self.oracle.as_ref().expect("the oracle is open")
     }
 
-    fn start(&mut self) -> Result<(), String> {
+    /// The database's version and rows, read on the oracle.
+    fn read(&self) -> Result<(Version, Dump), String> {
+        self.vfs
+            .quietly(|| replica::read(self.oracle()))
+            .map(|(version, _, dump)| (version, dump))
+            .map_err(|e| format!("oracle read: {e}"))
+    }
+
+    fn open(&mut self) -> Result<(), String> {
         let options = Options {
             vfs: Some(self.vfs.name().to_owned()),
             readers: 1,
@@ -156,9 +214,6 @@ impl Live {
             checkpoint_pages: self.options.checkpoint_pages,
         };
         let db = LiveDb::open_with(DB, options).map_err(|e| format!("open: {e}"))?;
-        let ddl = self.schema.ddl();
-        db.write(|tx| tx.execute_batch(&ddl))
-            .map_err(|e| format!("schema: {e}\n{ddl}"))?;
         let oracle = Connection::open_with_flags_and_vfs(
             DB,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -167,13 +222,76 @@ impl Live {
         .map_err(|e| format!("oracle: {e}"))?;
         self.db = Some(db);
         self.oracle = Some(oracle);
+        Ok(())
+    }
+
+    fn start(&mut self) -> Result<(), String> {
+        self.open()?;
+        let ddl = self.schema.ddl();
+        let ((), version) = self
+            .db()
+            .write(|tx| tx.execute_batch(&ddl))
+            .map_err(|e| format!("schema: {e}\n{ddl}"))?;
+        self.published = version;
         for i in 0..self.replicas.len() {
             self.rebuild(i)?;
         }
         Ok(())
     }
 
+    /// Closes the database, cleanly or by crashing, reopens it, and checks
+    /// that it is intact and that every published commit survived. Replicas
+    /// keep their state and follow the reopened database from their version.
+    fn restart(&mut self, crash: bool) -> Result<(), String> {
+        self.summary.restarts += 1;
+        let faults = self.vfs.faults();
+        self.vfs.set_faults(false);
+        if crash {
+            self.vfs.begin_crash();
+        }
+        self.oracle = None;
+        self.db = None;
+        if crash {
+            self.vfs.finish_crash();
+        }
+        self.open()?;
+        let integrity: String = self
+            .oracle()
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| format!("integrity check: {e}"))?;
+        if integrity != "ok" {
+            return Err(format!(
+                "restart (crash {crash}) left the database corrupt: {integrity}"
+            ));
+        }
+        let recovered = self.db().version();
+        self.trace.record(format_args!(
+            "restart (crash {crash}) recovered {recovered}"
+        ));
+        if recovered < self.published {
+            return Err(format!(
+                "restart (crash {crash}) recovered version {recovered}, but version {} was published",
+                self.published
+            ));
+        }
+        if recovered > self.published {
+            self.summary.recovered_unpublished += 1;
+        }
+        self.unknown = false;
+        let db = self.db.as_ref().expect("just opened");
+        for replica in &mut self.replicas {
+            replica.resume(db)?;
+        }
+        self.vfs.set_faults(faults);
+        Ok(())
+    }
+
     fn step(&mut self) -> Result<(), String> {
+        if self.restarts.chance(self.options.crash) {
+            self.restart(true)?;
+        } else if self.restarts.chance(self.options.reopen) {
+            self.restart(false)?;
+        }
         if self.prng.chance(self.options.schema_change) {
             self.change_schema()?;
         } else if self.prng.chance(self.options.vacuum) {
@@ -191,10 +309,35 @@ impl Live {
     fn write(&mut self) -> Result<(), String> {
         let txn = writes::transaction(&mut self.prng, &self.schema);
         let before = self.db().version();
+        let peeks: Vec<bool> = txn
+            .statements
+            .iter()
+            .map(|_| self.peeks.chance(self.options.peek))
+            .collect();
+        // A caught-up eager replica holds the committed rows, so the first
+        // peek dumps it; otherwise the oracle reads them before the write.
+        let eager = &self.replicas[0];
+        let mut baseline = if eager.version == before && !eager.stale && !self.unknown {
+            None
+        } else {
+            Some(self.read()?)
+        };
         let mut outcomes = Vec::new();
+        let mut problem = None;
+        let mut rolled_back = false;
+        let mut finished = false;
+        let (oracle, vfs) = (self.oracle(), &self.vfs);
         let result = self.db().write(|tx| {
-            for statement in &txn.statements {
-                match tx.execute(&statement.sql, params_from_iter(&statement.params)) {
+            for (statement, peek) in txn.statements.iter().zip(&peeks) {
+                let outcome = tx.execute(&statement.sql, params_from_iter(&statement.params));
+                let failed = outcome.is_err();
+                // Checked after each statement, before a later `SAVEPOINT`
+                // can open a new transaction.
+                rolled_back |= tx.is_autocommit();
+                if (*peek || failed) && problem.is_none() {
+                    problem = peek_at(oracle, vfs, eager, before, &mut baseline, &statement.sql);
+                }
+                match outcome {
                     Ok(n) => outcomes.push(format!("{n}")),
                     Err(e) => {
                         outcomes.push(format!("error {:?}", e.sqlite_error_code()));
@@ -207,8 +350,18 @@ impl Live {
             if txn.fail_at_end {
                 return Err(rusqlite::Error::InvalidQuery);
             }
+            finished = true;
             Ok(())
         });
+        self.summary.peeks += peeks.iter().filter(|p| **p).count() as u64;
+        if rolled_back && result.is_ok() {
+            return Err("SQLite rolled the transaction back, but write reported success".into());
+        }
+        let rolled_back = matches!(result, Err(sqlive::Error::RolledBack));
+        self.summary.rolled_back += u64::from(rolled_back);
+        if let Some(problem) = problem {
+            return Err(problem);
+        }
         self.summary.statements += outcomes.len() as u64;
         self.summary.statement_errors +=
             outcomes.iter().filter(|o| o.starts_with("error")).count() as u64;
@@ -223,14 +376,17 @@ impl Live {
             result
                 .map(|((), version)| version)
                 .map_err(|e| e.to_string()),
+            finished && !rolled_back,
         )
     }
 
-    /// Checks a write's version against the one before it.
+    /// Checks a write's version against the one before it. A failed write
+    /// that got as far as committing leaves the outcome unknown.
     fn finish_write(
         &mut self,
         before: Version,
         result: Result<Version, String>,
+        reached_commit: bool,
     ) -> Result<(), String> {
         let now = self.db().version();
         match result {
@@ -238,20 +394,28 @@ impl Live {
                 self.trace
                     .record(format_args!("write -> version {version}"));
                 self.summary.writes += 1;
-                if version != before + 1 || now != version {
+                let next = if self.unknown {
+                    version > before
+                } else {
+                    version == before + 1
+                };
+                if !next || now != version {
                     return Err(format!(
-                        "a write after version {before} returned {version}; the database reports {now}"
+                        "a write after version {before} returned {version}; the log reports {now}"
                     ));
                 }
+                self.unknown = false;
+                self.published = version;
             }
             Err(e) => {
                 self.trace.record(format_args!("write failed: {e}"));
                 self.summary.failed_writes += 1;
-                if now != before {
+                if now != before && !self.unknown {
                     return Err(format!(
                         "a failed write moved the version from {before} to {now}"
                     ));
                 }
+                self.unknown |= reached_commit;
             }
         }
         Ok(())
@@ -259,23 +423,43 @@ impl Live {
 
     fn change_schema(&mut self) -> Result<(), String> {
         self.serial += 1;
-        let statement = writes::schema_change(&mut self.prng, &mut self.schema, self.serial);
+        let (statement, added) =
+            writes::schema_change(&mut self.prng, &mut self.schema, self.serial);
         self.trace
             .record(format_args!("schema change: {}", statement.sql));
         let before = self.db().version();
+        let mut finished = false;
         let result = self
             .db()
-            .write(|tx| tx.execute_batch(&statement.sql))
+            .write(|tx| {
+                tx.execute_batch(&statement.sql)?;
+                finished = true;
+                Ok(())
+            })
             .map(|((), version)| version)
             .map_err(|e| e.to_string());
-        self.finish_write(before, result)
+        if let Some((table, column)) = added {
+            // A failed `ALTER TABLE` may or may not have taken effect.
+            let name = self.schema.tables[table].name.clone();
+            let exists = self.vfs.quietly(|| {
+                self.oracle().query_row(
+                    "SELECT count(*) FROM pragma_table_xinfo(?1) WHERE name = ?2",
+                    [&name, &column],
+                    |r| r.get::<_, i64>(0),
+                )
+            });
+            if exists.map_err(|e| format!("oracle read: {e}"))? == 0 {
+                self.schema.tables[table].columns.pop();
+            }
+        }
+        self.finish_write(before, result, finished)
     }
 
     fn vacuum(&mut self) -> Result<(), String> {
         self.trace.record("vacuum");
         let before = self.db().version();
         let result = self.db().vacuum().map_err(|e| e.to_string());
-        self.finish_write(before, result)
+        self.finish_write(before, result, true)
     }
 
     fn rebuild(&mut self, i: usize) -> Result<(), String> {
@@ -283,7 +467,7 @@ impl Live {
             self.db.as_ref().expect("open"),
             self.oracle.as_ref().expect("open"),
         );
-        self.replicas[i].rebuild(oracle, db)?;
+        self.vfs.quietly(|| self.replicas[i].rebuild(oracle, db))?;
         self.summary.rebuilds += 1;
         self.trace.record(format_args!(
             "{} replica rebuilt at {}",
@@ -324,20 +508,14 @@ impl Live {
                 replica.name, replica.version
             ));
         }
-        let oracle = self.oracle();
-        let read = (|| -> rusqlite::Result<(i64, replica::Dump)> {
-            oracle.execute_batch("BEGIN")?;
-            let version: i64 =
-                oracle.query_row("SELECT version FROM _sqlive_meta WHERE id = 0", [], |r| {
-                    r.get(0)
-                })?;
-            let shapes = shapes(oracle)?;
-            let dump = dump(oracle, &shapes, "rowid")?;
-            oracle.execute_batch("COMMIT")?;
-            Ok((version, dump))
-        })();
-        let (version, expected) = read.map_err(|e| format!("oracle read: {e}"))?;
-        if version as Version != latest {
+        let (version, expected) = self.read()?;
+        if version != latest {
+            if self.unknown {
+                // A failed write took effect without reaching the log; the
+                // next write resets the log and the replicas rebuild.
+                self.summary.skipped_checks += 1;
+                return Ok(());
+            }
             return Err(format!(
                 "the oracle read version {version}, the log reports {latest}"
             ));
@@ -351,5 +529,37 @@ impl Live {
         }
         self.summary.checks += 1;
         Ok(())
+    }
+}
+
+/// Checks, mid-write, that another connection still sees the rows as they
+/// were before the write, and describes any difference.
+fn peek_at(
+    oracle: &Connection,
+    vfs: &SimVfs,
+    eager: &Replica,
+    before: Version,
+    baseline: &mut Option<(Version, Dump)>,
+    after: &str,
+) -> Option<String> {
+    if baseline.is_none() {
+        match eager.dump() {
+            Ok(dump) => *baseline = Some((before, dump)),
+            Err(e) => return Some(format!("the eager replica's dump failed: {e}")),
+        }
+    }
+    let (version, rows) = baseline.as_ref().expect("just set");
+    match vfs.quietly(|| replica::read(oracle)) {
+        Ok((seen, _, dump)) => {
+            let changed = difference(rows, &dump);
+            (seen != *version || changed.is_some()).then(|| {
+                format!(
+                    "a write's changes showed before it committed: after {after}, another \
+                     connection sees version {seen} and {}",
+                    changed.unwrap_or_else(|| "the same rows".into())
+                )
+            })
+        }
+        Err(e) => Some(format!("the oracle failed mid-write: {e}")),
     }
 }
