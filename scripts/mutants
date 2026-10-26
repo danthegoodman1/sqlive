@@ -102,8 +102,8 @@ MUTANTS = [
     ),
     (
         "every touch is recorded, not only the first",
-        [(CAPTURE, "if self.seen.insert((table.name.to_ascii_lowercase(), identity)) {",
-          "if { self.seen.insert((table.name.to_ascii_lowercase(), identity)); true } {")],
+        [(CAPTURE, "if first_touch {",
+          "if { let _ = first_touch; true } {")],
     ),
     (
         "a schema change goes unflagged",
@@ -112,8 +112,8 @@ MUTANTS = [
     ),
     (
         "net changes compare reals by value, so 0.0 equals -0.0",
-        [(CAPTURE, "(Raw::Real(a), Raw::Real(b)) => a.to_bits() == b.to_bits(),",
-          "(Raw::Real(a), Raw::Real(b)) => a == b,")],
+        [(CAPTURE, "(Raw::Real(a), ValueRef::Real(b)) => a.to_bits() == b.to_bits(),",
+          "(Raw::Real(a), ValueRef::Real(b)) => *a == b,")],
     ),
     (
         "changes_since resumes one event late",
@@ -170,9 +170,9 @@ MUTANTS = [
     ),
     (
         "a snapshot reads its version before its transaction begins",
-        [(READ, 'self.conn.execute_batch("BEGIN")?; let version: i64 =', "let version: i64 ="),
+        [(READ, 'self.conn().prepare_cached("BEGIN")?.execute([])?; let (version, cookie) =', "let (version, cookie) ="),
          (READ, "self.still_open()?; Ok((version as Version, cookie))",
-          'self.conn.execute_batch("BEGIN")?; self.still_open()?; Ok((version as Version, cookie))')],
+          'self.conn().prepare_cached("BEGIN")?.execute([])?; self.still_open()?; Ok((version as Version, cookie))')],
     ),
     (
         "reads through views go unrecorded",
@@ -189,7 +189,7 @@ MUTANTS = [
     ),
     (
         "a cached query keeps its reads after a schema change",
-        [(READ, "reader.cache.get_mut().clear();", "")],
+        [(READ, "self.cache.get_mut().clear();", "")],
     ),
     (
         "readers do not wait for a commit under way",
@@ -201,7 +201,7 @@ MUTANTS = [
     ),
     (
         "a snapshot keeps reading after SQLite ends its transaction",
-        [(READ, "if self.conn.is_autocommit() { return Err(Error::SnapshotEnded); }", "")],
+        [(READ, "if self.conn().is_autocommit() { return Err(Error::SnapshotEnded); }", "")],
     ),
     (
         "read sets compare reals by value, so 0.0 equals -0.0",
@@ -211,7 +211,8 @@ MUTANTS = [
     # Phase 5
     (
         "constants skip the column's affinity",
-        [(CONSTRAINTS, "let value = apply_affinity(self.conn, value, info.affinity)?;", "let value = Some(value)?;")],
+        [(CONSTRAINTS, "let constant = |term: &Term| apply_affinity(conn, term.value(params)?, self.affinity);",
+          "let constant = |term: &Term| term.value(params);")],
     ),
     (
         "NOCASE folds nothing",
@@ -251,7 +252,7 @@ MUTANTS = [
     ),
     (
         "the nullable side of a left join keeps its constraints",
-        [(CONSTRAINTS, "&& !context.occurrences[occurrence].nullable", "")],
+        [(CONSTRAINTS, "&& !context.occurrences[constraint.occurrence].nullable", "")],
     ),
     (
         "OR splits like AND",
@@ -368,7 +369,10 @@ MUTANTS = [
     ),
     (
         "a schema change keeps statements prepared under the old one",
-        [(READ, "reader.conn.flush_prepared_statement_cache();", "")],
+        [(READ, "self.statements.get_mut().clear();", ""),
+         (READ, "let statement = prepared?;",
+          "let statement = match self.statements.borrow_mut().get_mut(sql).and_then(Option::take) "
+          "{ Some(kept) => { drop(prepared?); kept } None => prepared?, };")],
     ),
     (
         "hex digits pair in the wrong order",
@@ -406,6 +410,43 @@ MUTANTS = [
     (
         "every counter change reaches every viewer",
         [(CHAT, "tokio::time::sleep_until(next_stats).await;", "")],
+    ),
+    # Phase 10
+    (
+        "a kept statement keeps its last run's bindings",
+        [(READ, "let released = (1..=statement.parameter_count()).all(|i| statement.raw_bind_parameter(i, Value::Null).is_ok());",
+          "let released = true;")],
+    ),
+    (
+        "a snapshot ahead of the log skips catching up",
+        [(LOG, "if version <= self.reached.load(Ordering::Acquire) {", "if true {")],
+    ),
+    (
+        "a plan binds each parameter to the next one's value",
+        [(CONSTRAINTS, "Term::Param(index) => params.get(index.checked_sub(1)?)?.clone(),",
+          "Term::Param(index) => params.get(*index)?.clone(),")],
+    ),
+    (
+        "read sets find tables only in their own case",
+        [(READ_SET, ".binary_search_by(|table| cmp_ignoring_case(&table.columns.key, name))",
+          ".binary_search_by(|table| table.columns.key.as_str().cmp(name))")],
+    ),
+    (
+        "an update that moves its rowid touches only the old row",
+        [(CAPTURE, "if !info.without_rowid && old.get_old_row_id() == new.get_new_row_id() =>",
+          "if !info.without_rowid =>")],
+    ),
+    (
+        "a range read-back misses the run's last row",
+        [(DB, "statement.query([*first, *last])?", "statement.query([*first, *last - 1])?")],
+    ),
+    (
+        "rowid runs join rows of different tables",
+        [(DB, "&& next.table.index == touched[start].table.index", "")],
+    ),
+    (
+        "every table reads back with the first table's statement",
+        [(DB, "Ok(match statements.entry(table.index) {", "Ok(match statements.entry(0) {")],
     ),
 ]
 

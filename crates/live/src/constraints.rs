@@ -298,7 +298,7 @@ pub(crate) struct WindowPlan {
     pub limit: u64,
 }
 
-/// What the analysis found, before the query runs.
+/// What the analysis found, with the query's parameters bound.
 #[derive(Debug, Default)]
 pub(crate) struct Analysis {
     /// Per lowercase table name, a conjunction for each occurrence; tables
@@ -307,27 +307,246 @@ pub(crate) struct Analysis {
     pub window: Option<WindowPlan>,
 }
 
+/// What a query's SQL says about the rows it depends on, with its
+/// parameters unbound. A reader plans each query text once per schema and
+/// binds the plan each time the query runs.
+#[derive(Debug, Default)]
+pub(crate) struct Plan {
+    /// Each table occurrence's lowercase name.
+    occurrences: Vec<String>,
+    /// The conditions on the occurrences, in `WHERE` clause order.
+    pending: Vec<Pending>,
+    window: Option<PendingWindow>,
+}
+
+impl Plan {
+    /// The lowercase table and column whose value at the window's last row
+    /// bounds the window, if the query has one.
+    pub fn window_column(&self) -> Option<(&str, &str)> {
+        self.window
+            .as_ref()
+            .map(|window| (window.table.as_str(), window.column.as_str()))
+    }
+
+    /// The constraints for one run. `params` holds each parameter's value
+    /// by index.
+    pub fn bind(&self, params: &[Option<Value>], conn: &Connection) -> Analysis {
+        let mut conjunctions = vec![Conjunction::default(); self.occurrences.len()];
+        for pending in &self.pending {
+            if let Some(constraint) = pending.bind(params, conn) {
+                conjunctions[pending.occurrence]
+                    .constraints
+                    .push(constraint);
+            }
+        }
+        let mut tables: BTreeMap<String, Vec<Conjunction>> = BTreeMap::new();
+        for (name, conjunction) in self.occurrences.iter().zip(conjunctions) {
+            tables.entry(name.clone()).or_default().push(conjunction);
+        }
+        Analysis {
+            tables,
+            window: self.window.as_ref().and_then(|window| window.bind(params)),
+        }
+    }
+}
+
+/// A constraint on one occurrence's column whose constants are bound when
+/// the query runs.
+#[derive(Debug)]
+struct Pending {
+    occurrence: usize,
+    /// The column's name, in lowercase.
+    column: String,
+    collation: Collation,
+    /// The column's affinity, which converts each constant.
+    affinity: Affinity,
+    test: Test,
+}
+
+#[derive(Debug)]
+enum Test {
+    /// The column, then the operator, then the constant.
+    Compare(Operator, Term),
+    /// `IN` a list of constants.
+    OneOf(Vec<Term>),
+    /// `BETWEEN` two constants.
+    Between(Term, Term),
+    /// A condition without constants.
+    Fixed(Condition),
+}
+
+impl Pending {
+    /// The constraint with its constants bound and converted by the
+    /// column's affinity, or `None` when a conversion is not modeled.
+    fn bind(&self, params: &[Option<Value>], conn: &Connection) -> Option<Constraint> {
+        let constant = |term: &Term| apply_affinity(conn, term.value(params)?, self.affinity);
+        let condition = match &self.test {
+            Test::Fixed(condition) => condition.clone(),
+            Test::Compare(op, term) => {
+                let value = constant(term)?;
+                let null = matches!(value, Value::Null);
+                match op {
+                    Operator::Equals if null => Condition::Never,
+                    Operator::Equals => Condition::OneOf(vec![value]),
+                    Operator::Is if null => Condition::IsNull,
+                    Operator::Is => Condition::Is(value),
+                    Operator::Less
+                    | Operator::LessEquals
+                    | Operator::Greater
+                    | Operator::GreaterEquals
+                        if null =>
+                    {
+                        Condition::Never
+                    }
+                    Operator::Less => Condition::Range {
+                        low: None,
+                        high: Some((value, false)),
+                    },
+                    Operator::LessEquals => Condition::Range {
+                        low: None,
+                        high: Some((value, true)),
+                    },
+                    Operator::Greater => Condition::Range {
+                        low: Some((value, false)),
+                        high: None,
+                    },
+                    Operator::GreaterEquals => Condition::Range {
+                        low: Some((value, true)),
+                        high: None,
+                    },
+                    _ => return None,
+                }
+            }
+            Test::OneOf(terms) => {
+                let mut values = Vec::new();
+                for term in terms {
+                    let value = constant(term)?;
+                    if !matches!(value, Value::Null) {
+                        values.push(value);
+                    }
+                }
+                if values.is_empty() {
+                    Condition::Never
+                } else {
+                    Condition::OneOf(values)
+                }
+            }
+            Test::Between(low, high) => {
+                let (low, high) = (constant(low)?, constant(high)?);
+                if matches!(low, Value::Null) || matches!(high, Value::Null) {
+                    Condition::Never
+                } else {
+                    Condition::Range {
+                        low: Some((low, true)),
+                        high: Some((high, true)),
+                    }
+                }
+            }
+        };
+        Some(Constraint {
+            column: self.column.clone(),
+            collation: self.collation.clone(),
+            condition,
+        })
+    }
+}
+
+/// A window plan whose `LIMIT` and `OFFSET` are bound when the query runs.
+#[derive(Debug)]
+struct PendingWindow {
+    table: String,
+    column: String,
+    collation: Collation,
+    descending: bool,
+    nulls_first: bool,
+    count: Term,
+    offset: Option<Term>,
+}
+
+impl PendingWindow {
+    /// The window, if its count and offset are non-negative integers.
+    fn bind(&self, params: &[Option<Value>]) -> Option<WindowPlan> {
+        let limit = match self.count.value(params)? {
+            Value::Integer(n) if n >= 0 => n as u64,
+            _ => return None,
+        };
+        if let Some(offset) = &self.offset {
+            match offset.value(params)? {
+                Value::Integer(n) if n >= 0 => {}
+                _ => return None,
+            }
+        }
+        Some(WindowPlan {
+            table: self.table.clone(),
+            column: self.column.clone(),
+            collation: self.collation.clone(),
+            descending: self.descending,
+            nulls_first: self.nulls_first,
+            limit,
+        })
+    }
+}
+
+/// A literal or a parameter, with any signs applied to it.
+#[derive(Debug)]
+enum Term {
+    Value(Value),
+    /// The parameter `?N`.
+    Param(usize),
+    Plus(Box<Term>),
+    Minus(Box<Term>),
+}
+
+impl Term {
+    /// The term's value with `params` bound, or `None` when it has none,
+    /// as for a sign applied to text.
+    fn value(&self, params: &[Option<Value>]) -> Option<Value> {
+        match self {
+            Term::Value(value) => Some(value.clone()),
+            Term::Param(index) => params.get(index.checked_sub(1)?)?.clone(),
+            Term::Plus(inner) => match inner.value(params)? {
+                value @ (Value::Integer(_) | Value::Real(_)) => Some(value),
+                _ => None,
+            },
+            Term::Minus(inner) => match inner.value(params)? {
+                Value::Integer(i) => i.checked_neg().map(Value::Integer),
+                Value::Real(r) => Some(Value::Real(-r)),
+                _ => None,
+            },
+        }
+    }
+}
+
 /// A query text with every parameter written as an explicit `?N`.
 #[derive(Clone, Debug)]
 pub(crate) struct Numbered {
     pub sql: String,
+    pub parameters: Parameters,
+    /// The outermost `LIMIT` reads `LIMIT offset, count`.
+    limit_comma: bool,
+}
+
+/// How a query text numbers its parameters.
+#[derive(Clone, Debug)]
+pub(crate) struct Parameters {
     /// The index of each named parameter, by its name with its prefix.
     named: BTreeMap<String, usize>,
     count: usize,
-    /// The outermost `LIMIT` reads `LIMIT offset, count`.
-    limit_comma: bool,
 }
 
 impl Numbered {
     /// Whether SQLite numbered the statement's parameters the same way.
     pub fn agrees(&self, statement: &Statement<'_>) -> bool {
-        statement.parameter_count() == self.count
+        statement.parameter_count() == self.parameters.count
             && self
+                .parameters
                 .named
                 .iter()
                 .all(|(name, &index)| statement.parameter_index(name).ok().flatten() == Some(index))
     }
+}
 
+impl Parameters {
     /// Each parameter's value by index, as bound: `NULL` where unbound.
     pub fn values(&self, bound: &ParamValues) -> Vec<Option<Value>> {
         let mut values = vec![Some(Value::Null); self.count];
@@ -381,8 +600,7 @@ pub(crate) fn number_parameters(sql: &str) -> Option<Numbered> {
     out.push_str(&sql[copied..]);
     Some(Numbered {
         sql: out,
-        named,
-        count,
+        parameters: Parameters { named, count },
         limit_comma: limit_uses_comma(sql)?,
     })
 }
@@ -524,20 +742,18 @@ enum Operand {
         collation: Option<Collation>,
     },
     Constant {
-        value: Value,
+        term: Term,
         collation: Option<Collation>,
     },
 }
 
-struct Context<'s, 'c> {
+struct Context<'s> {
     occurrences: Vec<Occurrence<'s>>,
-    params: &'c [Option<Value>],
-    conn: &'c Connection,
     /// The outermost `LIMIT` reads `LIMIT offset, count`.
     limit_comma: bool,
 }
 
-impl Context<'_, '_> {
+impl Context<'_> {
     fn column(&self, qualifier: Option<&str>, name: &str) -> Option<(usize, usize)> {
         let name = unquote(name)?;
         let mut found = None;
@@ -587,10 +803,10 @@ impl Context<'_, '_> {
                         collation: Some(collation),
                     }),
                     Operand::Constant {
-                        value,
+                        term,
                         collation: None,
                     } => Some(Operand::Constant {
-                        value,
+                        term,
                         collation: Some(collation),
                     }),
                     _ => None,
@@ -608,24 +824,25 @@ impl Context<'_, '_> {
                 self.column_operand(Some(&unquote(table.0)?), column.0)
             }
             Expr::Parenthesized(inner) if inner.len() == 1 => self.operand(&inner[0]),
-            _ => constant(expr, self.params).map(|value| Operand::Constant {
-                value,
+            _ => term(expr).map(|term| Operand::Constant {
+                term,
                 collation: None,
             }),
         }
     }
 
-    /// A column compared with a constant, with the collation SQLite would use
-    /// and the constant converted by the column's affinity.
-    fn comparison(
-        &self,
-        left: &Expr<'_>,
-        right: &Expr<'_>,
-    ) -> Option<(usize, Constraint, Value, bool)> {
+    /// A column compared with a constant: a constraint on the column under
+    /// the collation SQLite would use, whose test the caller fills in, and
+    /// the constant, which the column's affinity converts once bound.
+    fn comparison(&self, left: &Expr<'_>, right: &Expr<'_>) -> Option<(Pending, Term, bool)> {
         let (left, right) = (self.operand(left)?, self.operand(right)?);
-        let (column_side, constant_side, flipped) = match (&left, &right) {
-            (Operand::Column { .. }, Operand::Constant { .. }) => (left, right, false),
-            (Operand::Constant { .. }, Operand::Column { .. }) => (right, left, true),
+        let (column_side, constant_side, flipped) = match (left, right) {
+            (left @ Operand::Column { .. }, right @ Operand::Constant { .. }) => {
+                (left, right, false)
+            }
+            (left @ Operand::Constant { .. }, right @ Operand::Column { .. }) => {
+                (right, left, true)
+            }
             _ => return None,
         };
         let (
@@ -635,7 +852,7 @@ impl Context<'_, '_> {
                 collation: column_collation,
             },
             Operand::Constant {
-                value,
+                term,
                 collation: constant_collation,
             },
         ) = (column_side, constant_side)
@@ -655,58 +872,55 @@ impl Context<'_, '_> {
         if !collation.is_builtin() {
             return None;
         }
-        let value = apply_affinity(self.conn, value, info.affinity)?;
         Some((
-            occurrence,
-            Constraint {
+            Pending {
+                occurrence,
                 column: info.name.to_ascii_lowercase(),
                 collation,
-                condition: Condition::Never,
+                affinity: info.affinity,
+                test: Test::Fixed(Condition::Never),
             },
-            value,
+            term,
             flipped,
         ))
     }
 
-    fn constraint(&self, expr: &Expr<'_>) -> Option<(usize, Constraint)> {
+    /// A condition on a column alone, under the binary collation.
+    fn fixed(&self, expr: &Expr<'_>, condition: Condition) -> Option<Pending> {
+        let Operand::Column {
+            occurrence, column, ..
+        } = self.operand(expr)?
+        else {
+            return None;
+        };
+        let info = &self.occurrences[occurrence].table.columns[column];
+        Some(Pending {
+            occurrence,
+            column: info.name.to_ascii_lowercase(),
+            collation: Collation::Binary,
+            affinity: info.affinity,
+            test: Test::Fixed(condition),
+        })
+    }
+
+    fn constraint(&self, expr: &Expr<'_>) -> Option<Pending> {
         match expr {
             Expr::Parenthesized(inner) if inner.len() == 1 => self.constraint(&inner[0]),
             Expr::Binary(left, op, right) => {
-                let (occurrence, mut constraint, value, flipped) = self.comparison(left, right)?;
+                let (mut pending, term, flipped) = self.comparison(left, right)?;
                 let op = if flipped { flip(*op)? } else { *op };
-                let null = matches!(value, Value::Null);
-                constraint.condition = match op {
-                    Operator::Equals if null => Condition::Never,
-                    Operator::Equals => Condition::OneOf(vec![value]),
-                    Operator::Is if null => Condition::IsNull,
-                    Operator::Is => Condition::Is(value),
-                    Operator::Less
-                    | Operator::LessEquals
-                    | Operator::Greater
-                    | Operator::GreaterEquals
-                        if null =>
-                    {
-                        Condition::Never
-                    }
-                    Operator::Less => Condition::Range {
-                        low: None,
-                        high: Some((value, false)),
-                    },
-                    Operator::LessEquals => Condition::Range {
-                        low: None,
-                        high: Some((value, true)),
-                    },
-                    Operator::Greater => Condition::Range {
-                        low: Some((value, false)),
-                        high: None,
-                    },
-                    Operator::GreaterEquals => Condition::Range {
-                        low: Some((value, true)),
-                        high: None,
-                    },
-                    _ => return None,
-                };
-                Some((occurrence, constraint))
+                matches!(
+                    op,
+                    Operator::Equals
+                        | Operator::Is
+                        | Operator::Less
+                        | Operator::LessEquals
+                        | Operator::Greater
+                        | Operator::GreaterEquals
+                )
+                .then_some(())?;
+                pending.test = Test::Compare(op, term);
+                Some(pending)
             }
             Expr::InList {
                 lhs,
@@ -714,48 +928,26 @@ impl Context<'_, '_> {
                 rhs,
             } => {
                 let list = rhs.map_or(&[][..], |list| list);
-                let mut values = Vec::new();
+                let mut terms = Vec::new();
                 let mut target = None;
                 for item in list {
                     if matches!(item, Expr::Collate(..)) {
                         return None;
                     }
-                    let (occurrence, constraint, value, flipped) = self.comparison(lhs, item)?;
+                    let (pending, term, flipped) = self.comparison(lhs, item)?;
                     if flipped {
                         return None;
                     }
-                    target = Some((occurrence, constraint));
-                    if !matches!(value, Value::Null) {
-                        values.push(value);
-                    }
+                    target = Some(pending);
+                    terms.push(term);
                 }
                 match target {
-                    Some((occurrence, mut constraint)) => {
-                        constraint.condition = if values.is_empty() {
-                            Condition::Never
-                        } else {
-                            Condition::OneOf(values)
-                        };
-                        Some((occurrence, constraint))
+                    Some(mut pending) => {
+                        pending.test = Test::OneOf(terms);
+                        Some(pending)
                     }
-                    None => {
-                        // `x IN ()` matches nothing.
-                        let Operand::Column {
-                            occurrence, column, ..
-                        } = self.operand(lhs)?
-                        else {
-                            return None;
-                        };
-                        let info = &self.occurrences[occurrence].table.columns[column];
-                        Some((
-                            occurrence,
-                            Constraint {
-                                column: info.name.to_ascii_lowercase(),
-                                collation: Collation::Binary,
-                                condition: Condition::Never,
-                            },
-                        ))
-                    }
+                    // `x IN ()` matches nothing.
+                    None => self.fixed(lhs, Condition::Never),
                 }
             }
             Expr::Between {
@@ -764,44 +956,16 @@ impl Context<'_, '_> {
                 start,
                 end,
             } => {
-                let (occurrence, mut constraint, low, flipped_low) = self.comparison(lhs, start)?;
-                let (_, high_constraint, high, flipped_high) = self.comparison(lhs, end)?;
-                if flipped_low || flipped_high || high_constraint.collation != constraint.collation
-                {
+                let (mut pending, low, flipped_low) = self.comparison(lhs, start)?;
+                let (high_pending, high, flipped_high) = self.comparison(lhs, end)?;
+                if flipped_low || flipped_high || high_pending.collation != pending.collation {
                     return None;
                 }
-                constraint.condition = if matches!(low, Value::Null) || matches!(high, Value::Null)
-                {
-                    Condition::Never
-                } else {
-                    Condition::Range {
-                        low: Some((low, true)),
-                        high: Some((high, true)),
-                    }
-                };
-                Some((occurrence, constraint))
+                pending.test = Test::Between(low, high);
+                Some(pending)
             }
-            Expr::IsNull(inner) | Expr::NotNull(inner) => {
-                let Operand::Column {
-                    occurrence, column, ..
-                } = self.operand(inner)?
-                else {
-                    return None;
-                };
-                let info = &self.occurrences[occurrence].table.columns[column];
-                Some((
-                    occurrence,
-                    Constraint {
-                        column: info.name.to_ascii_lowercase(),
-                        collation: Collation::Binary,
-                        condition: if matches!(expr, Expr::IsNull(_)) {
-                            Condition::IsNull
-                        } else {
-                            Condition::NotNull
-                        },
-                    },
-                ))
-            }
+            Expr::IsNull(inner) => self.fixed(inner, Condition::IsNull),
+            Expr::NotNull(inner) => self.fixed(inner, Condition::NotNull),
             _ => None,
         }
     }
@@ -819,13 +983,13 @@ fn flip(op: Operator) -> Option<Operator> {
     })
 }
 
-/// A literal or bound parameter's value.
-fn constant(expr: &Expr<'_>, params: &[Option<Value>]) -> Option<Value> {
+/// A literal or parameter, with any signs applied to it.
+fn term(expr: &Expr<'_>) -> Option<Term> {
     match expr {
-        Expr::Literal(Literal::Numeric(text)) => number(text),
+        Expr::Literal(Literal::Numeric(text)) => number(text).map(Term::Value),
         Expr::Literal(Literal::String(text)) => {
             let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
-            Some(Value::Text(inner.replace("''", "'")))
+            Some(Term::Value(Value::Text(inner.replace("''", "'"))))
         }
         Expr::Literal(Literal::Blob(hex)) => {
             let bytes = hex.as_bytes();
@@ -834,22 +998,12 @@ fn constant(expr: &Expr<'_>, params: &[Option<Value>]) -> Option<Value> {
                 .chunks(2)
                 .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
                 .collect::<Option<Vec<u8>>>()
-                .map(Value::Blob)
+                .map(|blob| Term::Value(Value::Blob(blob)))
         }
-        Expr::Literal(Literal::Null) => Some(Value::Null),
-        Expr::Unary(UnaryOperator::Positive, inner) => match constant(inner, params)? {
-            value @ (Value::Integer(_) | Value::Real(_)) => Some(value),
-            _ => None,
-        },
-        Expr::Unary(UnaryOperator::Negative, inner) => match constant(inner, params)? {
-            Value::Integer(i) => i.checked_neg().map(Value::Integer),
-            Value::Real(r) => Some(Value::Real(-r)),
-            _ => None,
-        },
-        Expr::Variable(index) => {
-            let index: usize = index.parse().ok()?;
-            params.get(index.checked_sub(1)?)?.clone()
-        }
+        Expr::Literal(Literal::Null) => Some(Term::Value(Value::Null)),
+        Expr::Unary(UnaryOperator::Positive, inner) => Some(Term::Plus(Box::new(term(inner)?))),
+        Expr::Unary(UnaryOperator::Negative, inner) => Some(Term::Minus(Box::new(term(inner)?))),
+        Expr::Variable(index) => index.parse().ok().map(Term::Param),
         _ => None,
     }
 }
@@ -1012,33 +1166,20 @@ fn result_alias_named(columns: &[ResultColumn<'_>], name: &str) -> bool {
     })
 }
 
-/// Analyzes a statement for the constraints of the tables it reads.
-/// `params` holds each parameter's value by index.
-pub(crate) fn analyze(
-    numbered: &Numbered,
-    params: &[Option<Value>],
-    schema: &Schema,
-    conn: &Connection,
-) -> Analysis {
-    let limit_comma = numbered.limit_comma;
+/// Plans the constraints of the tables a statement reads.
+pub(crate) fn plan(numbered: &Numbered, schema: &Schema) -> Plan {
     let bump = Bump::new();
     let mut parser = Parser::new(&bump, numbered.sql.as_bytes());
     let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) = parser.next() else {
-        return Analysis::default();
+        return Plan::default();
     };
     if !matches!(parser.next(), Ok(None)) {
-        return Analysis::default();
+        return Plan::default();
     }
-    analyze_select(select, params, schema, conn, limit_comma).unwrap_or_default()
+    plan_select(select, schema, numbered.limit_comma).unwrap_or_default()
 }
 
-fn analyze_select(
-    select: &Select<'_>,
-    params: &[Option<Value>],
-    schema: &Schema,
-    conn: &Connection,
-    limit_comma: bool,
-) -> Option<Analysis> {
+fn plan_select(select: &Select<'_>, schema: &Schema, limit_comma: bool) -> Option<Plan> {
     if select.with.is_some() || select.body.compounds.is_some() {
         return None;
     }
@@ -1072,21 +1213,17 @@ fn analyze_select(
     }
     let context = Context {
         occurrences: occurrences(from, schema)?,
-        params,
-        conn,
         limit_comma,
     };
-    let mut conjunctions: Vec<Conjunction> = (0..context.occurrences.len())
-        .map(|_| Conjunction::default())
-        .collect();
+    let mut pending = Vec::new();
     if let Some(filter) = where_clause {
         let mut terms = Vec::new();
         conjuncts(filter, &mut terms);
         for term in terms {
-            if let Some((occurrence, constraint)) = context.constraint(term)
-                && !context.occurrences[occurrence].nullable
+            if let Some(constraint) = context.constraint(term)
+                && !context.occurrences[constraint.occurrence].nullable
             {
-                conjunctions[occurrence].constraints.push(constraint);
+                pending.push(constraint);
             }
         }
     }
@@ -1106,21 +1243,22 @@ fn analyze_select(
             .is_some_and(|terms| terms.iter().all(|term| is_plain_column(&term.expr))))
     .then(|| window_plan(select, columns, &context))
     .flatten();
-    let mut tables: BTreeMap<String, Vec<Conjunction>> = BTreeMap::new();
-    for (occurrence, conjunction) in context.occurrences.iter().zip(conjunctions) {
-        tables
-            .entry(occurrence.table.name.to_ascii_lowercase())
-            .or_default()
-            .push(conjunction);
-    }
-    Some(Analysis { tables, window })
+    Some(Plan {
+        occurrences: context
+            .occurrences
+            .iter()
+            .map(|occurrence| occurrence.table.name.to_ascii_lowercase())
+            .collect(),
+        pending,
+        window,
+    })
 }
 
 fn window_plan(
     select: &Select<'_>,
     columns: &[ResultColumn<'_>],
-    context: &Context<'_, '_>,
-) -> Option<WindowPlan> {
+    context: &Context<'_>,
+) -> Option<PendingWindow> {
     let first = select.order_by?.first()?;
     let clause = select.limit?;
     let (count, offset) = if context.limit_comma {
@@ -1128,16 +1266,11 @@ fn window_plan(
     } else {
         (&clause.expr, clause.offset.as_ref())
     };
-    let limit = match constant(count, context.params)? {
-        Value::Integer(n) if n >= 0 => n as u64,
-        _ => return None,
+    let count = term(count)?;
+    let offset = match offset {
+        Some(offset) => Some(term(offset)?),
+        None => None,
     };
-    if let Some(offset) = offset {
-        match constant(offset, context.params)? {
-            Value::Integer(n) if n >= 0 => {}
-            _ => return None,
-        }
-    }
     let (inner, collation) = match &first.expr {
         Expr::Collate(inner, name) => (&**inner, Some(Collation::from_name(&unquote(name)?))),
         expr => (expr, None),
@@ -1168,12 +1301,13 @@ fn window_plan(
         Some(NullsOrder::Last) => false,
         None => !descending,
     };
-    Some(WindowPlan {
+    Some(PendingWindow {
         table: table.name.to_ascii_lowercase(),
         column: info.name.to_ascii_lowercase(),
         collation,
         descending,
         nulls_first,
-        limit,
+        count,
+        offset,
     })
 }

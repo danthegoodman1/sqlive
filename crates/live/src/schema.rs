@@ -3,6 +3,7 @@
 
 use crate::compare::{Affinity, Collation};
 use rusqlite::Connection;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -22,6 +23,9 @@ pub(crate) struct Column {
 #[derive(Debug)]
 pub(crate) struct Table {
     pub name: String,
+    /// The table's position in its schema, which tells it apart from the
+    /// schema's other tables.
+    pub index: usize,
     /// Every column, in `cid` order.
     pub columns: Vec<Column>,
     /// Names of the stored columns: the layout of a [`crate::Row`].
@@ -38,6 +42,9 @@ pub(crate) struct Table {
     pub rowid_name: Option<&'static str>,
     /// Reads a row's stored columns by rowid or primary key.
     pub select_by_key: String,
+    /// Reads the stored columns and rowid of the rows whose rowids fall in
+    /// a range, in rowid order; empty for a `WITHOUT ROWID` table.
+    pub select_range: String,
 }
 
 #[derive(Debug, Default)]
@@ -52,9 +59,18 @@ pub(crate) fn quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// `name` in ASCII lowercase, borrowed when it already is.
+pub(crate) fn lowercase(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
 impl Schema {
     pub fn table(&self, name: &str) -> Option<&Arc<Table>> {
-        self.tables.get(&name.to_ascii_lowercase())
+        self.tables.get(lowercase(name).as_ref())
     }
 
     pub fn load(conn: &Connection) -> rusqlite::Result<Schema> {
@@ -69,8 +85,8 @@ impl Schema {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut tables = BTreeMap::new();
-        for (name, without_rowid, strict) in names {
-            let table = load_table(conn, &name, without_rowid, strict)?;
+        for (index, (name, without_rowid, strict)) in names.into_iter().enumerate() {
+            let table = load_table(conn, &name, index, without_rowid, strict)?;
             tables.insert(name.to_ascii_lowercase(), Arc::new(table));
         }
         Ok(Schema { version, tables })
@@ -80,6 +96,7 @@ impl Schema {
 fn load_table(
     conn: &Connection,
     name: &str,
+    index: usize,
     without_rowid: bool,
     strict: bool,
 ) -> rusqlite::Result<Table> {
@@ -160,8 +177,16 @@ fn load_table(
         format!("{} = ?1", rowid_name.unwrap_or("rowid"))
     };
     let select_by_key = format!("SELECT {list} FROM main.{} WHERE {condition}", quote(name));
+    let select_range = match rowid_name {
+        Some(rowid) if !without_rowid => format!(
+            "SELECT {list}, {rowid} FROM main.{} WHERE {rowid} BETWEEN ?1 AND ?2 ORDER BY {rowid}",
+            quote(name)
+        ),
+        _ => String::new(),
+    };
     Ok(Table {
         name: name.to_owned(),
+        index,
         columns,
         stored,
         stored_cids,
@@ -170,6 +195,7 @@ fn load_table(
         without_rowid,
         rowid_name,
         select_by_key,
+        select_range,
     })
 }
 

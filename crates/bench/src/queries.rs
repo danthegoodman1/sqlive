@@ -97,6 +97,15 @@ pub fn run() -> sqlive::Result<()> {
     let plain_one = timed(|i| {
         black_box(plain_query(&plain, QUERY, [room(i)]).expect("a query"));
     });
+    // rusqlite's statement cache clears a statement's bindings as it takes
+    // the statement back, which makes SQLite prepare this one again on its
+    // next run; a statement the caller holds skips that.
+    let mut held = plain.prepare(QUERY)?;
+    let plain_held = timed(|i| {
+        let rows = held.query_map([room(i)], chat).expect("a query");
+        black_box(rows.collect::<rusqlite::Result<Vec<Chat>>>().expect("rows"));
+    });
+    drop(held);
     let live_many = across(THREADS, |i| {
         black_box(db.query(QUERY, [room(i)], chat).expect("a query"));
     });
@@ -124,6 +133,11 @@ pub fn run() -> sqlive::Result<()> {
         "| `rerun`, unchanged, 1 thread | {:.1} | {:.0} | | |",
         micros(rerun_one, QUERIES),
         per_second(QUERIES, rerun_one)
+    );
+    println!(
+        "| 1 thread, rusqlite holding its statement | | | {:.1} | {:.0} |",
+        micros(plain_held, QUERIES),
+        per_second(QUERIES, plain_held)
     );
     println!(
         "| `query`, {THREADS} threads | | {:.0} | | {:.0} |",

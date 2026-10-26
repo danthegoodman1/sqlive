@@ -2,19 +2,21 @@
 //! have changed it.
 
 use crate::constraints::Filter;
-use crate::deps::Reads;
 use crate::event::{CommitEvent, Op, RowChange, Version};
 use crate::schema::META_TABLE;
 use rusqlite::types::Value;
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 
 /// The tables, columns and rows a query result depends on, as of the
 /// snapshot version the query read.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadSet {
     version: Version,
-    tables: Reads,
+    /// In order of their lowercase names.
+    tables: Box<[TableRead]>,
     /// The query reads a table that changes without row events, so every
     /// commit counts.
     every_commit: bool,
@@ -23,23 +25,40 @@ pub struct ReadSet {
 /// One table a query reads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableRead {
-    name: String,
-    /// Lowercase names of the columns read.
-    columns: BTreeSet<String>,
-    /// Every change to the table counts, as for a virtual table's shadow
-    /// tables.
-    every_column: bool,
+    columns: Arc<ColumnsRead>,
     /// The rows the result depends on.
     filter: Filter,
 }
 
-impl TableRead {
-    pub(crate) fn new(name: &str) -> TableRead {
-        TableRead {
+/// The columns a query text reads from one table. They stay the same from
+/// run to run, so every result of the text shares one copy.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ColumnsRead {
+    name: String,
+    /// The name in lowercase, which orders a read set's tables.
+    key: String,
+    /// Lowercase names of the columns read, in order.
+    columns: Box<[String]>,
+    /// Every change to the table counts, as for a virtual table's shadow
+    /// tables.
+    every_column: bool,
+}
+
+/// The columns a statement reads from one table, as its preparation
+/// reports them.
+#[derive(Debug)]
+pub(crate) struct Recorded {
+    name: String,
+    columns: BTreeSet<String>,
+    every_column: bool,
+}
+
+impl Recorded {
+    pub(crate) fn new(name: &str) -> Recorded {
+        Recorded {
             name: name.to_owned(),
             columns: BTreeSet::new(),
             every_column: false,
-            filter: Filter::All,
         }
     }
 
@@ -56,32 +75,58 @@ impl TableRead {
     }
 
     /// The table's name, as SQLite spells it.
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn finish(self) -> Arc<ColumnsRead> {
+        Arc::new(ColumnsRead {
+            key: self.name.to_ascii_lowercase(),
+            name: self.name,
+            columns: self.columns.into_iter().collect(),
+            every_column: self.every_column,
+        })
+    }
+}
+
+impl ColumnsRead {
+    /// The table's name in lowercase.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl TableRead {
+    /// The table's reads, narrowed to the rows `filter` allows; a table
+    /// every change counts for keeps them all.
+    pub(crate) fn new(columns: Arc<ColumnsRead>, filter: Filter) -> TableRead {
+        let filter = if columns.every_column {
+            Filter::All
+        } else {
+            filter
+        };
+        TableRead { columns, filter }
+    }
+
+    /// The table's name, as SQLite spells it.
+    pub fn name(&self) -> &str {
+        &self.columns.name
     }
 
     /// The columns the query reads, in lowercase.
     pub fn columns(&self) -> impl Iterator<Item = &str> {
-        self.columns.iter().map(String::as_str)
+        self.columns.columns.iter().map(String::as_str)
     }
 
     /// Whether the query depends on every column, so any change counts.
     pub fn every_column(&self) -> bool {
-        self.every_column
+        self.columns.every_column
     }
 
     /// The rows the result depends on: a change counts only when its old or
     /// new row matches.
     pub fn filter(&self) -> &Filter {
         &self.filter
-    }
-
-    /// Narrows the rows the result depends on; a table every change counts
-    /// for keeps them all.
-    pub(crate) fn set_filter(&mut self, filter: Filter) {
-        if !self.every_column {
-            self.filter = filter;
-        }
     }
 
     /// Whether an update changed a column the query reads. A column the rows
@@ -92,10 +137,9 @@ impl TableRead {
         let (Some(old), Some(new)) = (&change.old, &change.new) else {
             return true;
         };
-        self.every_column
+        self.every_column()
             || self
-                .columns
-                .iter()
+                .columns()
                 .any(|column| match (old.get(column), new.get(column)) {
                     (Some(a), Some(b)) => !same(a, b),
                     _ => !is_rowid(column),
@@ -130,9 +174,25 @@ fn is_rowid(column: &str) -> bool {
         .any(|alias| alias.eq_ignore_ascii_case(column))
 }
 
+/// Orders names as their lowercase forms order.
+fn cmp_ignoring_case(a: &str, b: &str) -> Ordering {
+    a.bytes()
+        .map(|b| b.to_ascii_lowercase())
+        .cmp(b.bytes().map(|b| b.to_ascii_lowercase()))
+}
+
 impl ReadSet {
-    pub(crate) fn new(version: Version, tables: Reads) -> ReadSet {
-        let every_commit = tables.keys().any(|table| changes_without_events(table));
+    /// A read set of `tables`, which come in order of their lowercase
+    /// names.
+    pub(crate) fn new(version: Version, tables: Box<[TableRead]>) -> ReadSet {
+        debug_assert!(
+            tables
+                .windows(2)
+                .all(|pair| pair[0].columns.key < pair[1].columns.key)
+        );
+        let every_commit = tables
+            .iter()
+            .any(|table| changes_without_events(&table.columns.key));
         ReadSet {
             version,
             tables,
@@ -152,7 +212,15 @@ impl ReadSet {
     }
 
     pub fn tables(&self) -> impl Iterator<Item = &TableRead> {
-        self.tables.values()
+        self.tables.iter()
+    }
+
+    /// The table named `name`, matched without regard to ASCII case.
+    fn table(&self, name: &str) -> Option<&TableRead> {
+        self.tables
+            .binary_search_by(|table| cmp_ignoring_case(&table.columns.key, name))
+            .ok()
+            .map(|i| &self.tables[i])
     }
 
     /// Whether `event` may have changed the query's result. False for an
@@ -171,7 +239,7 @@ impl ReadSet {
 
     /// Whether one row change may have changed the query's result.
     pub fn affected_by(&self, change: &RowChange) -> bool {
-        let Some(table) = self.tables.get(&change.table.to_ascii_lowercase()) else {
+        let Some(table) = self.table(&change.table) else {
             return false;
         };
         if change.op == Op::Update && !table.reads_changed_column(change) {
@@ -186,15 +254,15 @@ impl ReadSet {
 
 impl fmt::Display for ReadSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, table) in self.tables.values().enumerate() {
+        for (i, table) in self.tables.iter().enumerate() {
             if i > 0 {
                 f.write_str("; ")?;
             }
-            if table.every_column {
-                write!(f, "{}[*]", table.name)?;
+            if table.every_column() {
+                write!(f, "{}[*]", table.name())?;
             } else {
                 let columns: Vec<&str> = table.columns().collect();
-                write!(f, "{}[{}]", table.name, columns.join(", "))?;
+                write!(f, "{}[{}]", table.name(), columns.join(", "))?;
             }
             if let Filter::AnyOf(_) = table.filter {
                 write!(f, " where {}", table.filter)?;

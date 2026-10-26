@@ -3,9 +3,9 @@
 //! The hook reports every change SQLite makes to a table, including those
 //! from triggers, foreign-key cascades and `REPLACE` conflict resolution. For
 //! each row, keyed by rowid or by primary key under the key's collations,
-//! the capture keeps the values from the first time the transaction touched
-//! it. `write` reads the touched rows back before committing to find what
-//! changed.
+//! the capture keeps the stored values the row held before the transaction,
+//! read the first time the transaction touches it. `write` reads the
+//! touched rows back before committing to find what changed.
 //!
 //! Values stay exactly as SQLite holds them, text bytes included, so change
 //! detection and row identity never depend on how text converts to a Rust
@@ -50,19 +50,29 @@ impl Raw {
         }
     }
 
-    /// The value for a [`crate::Row`]. Text that is not UTF-8 converts
-    /// lossily, the one place SqLive's rows differ from what SQLite holds.
-    pub fn to_value(&self) -> Value {
-        owned(self.as_ref())
+    /// The value for a [`crate::Row`], keeping the bytes. Text that is not
+    /// UTF-8 converts lossily, the one place SqLive's rows differ from what
+    /// SQLite holds.
+    pub fn into_value(self) -> Value {
+        match self {
+            Raw::Null => Value::Null,
+            Raw::Integer(i) => Value::Integer(i),
+            Raw::Real(r) => Value::Real(r),
+            Raw::Text(bytes) => Value::Text(
+                String::from_utf8(bytes)
+                    .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
+            ),
+            Raw::Blob(bytes) => Value::Blob(bytes),
+        }
     }
 
     /// Same storage class and same bytes, so `-0.0` differs from `0.0`.
-    pub fn same(&self, other: &Raw) -> bool {
+    pub fn same(&self, other: ValueRef<'_>) -> bool {
         match (self, other) {
-            (Raw::Null, Raw::Null) => true,
-            (Raw::Integer(a), Raw::Integer(b)) => a == b,
-            (Raw::Real(a), Raw::Real(b)) => a.to_bits() == b.to_bits(),
-            (Raw::Text(a), Raw::Text(b)) | (Raw::Blob(a), Raw::Blob(b)) => a == b,
+            (Raw::Null, ValueRef::Null) => true,
+            (Raw::Integer(a), ValueRef::Integer(b)) => *a == b,
+            (Raw::Real(a), ValueRef::Real(b)) => a.to_bits() == b.to_bits(),
+            (Raw::Text(a), ValueRef::Text(b)) | (Raw::Blob(a), ValueRef::Blob(b)) => a == b,
             _ => false,
         }
     }
@@ -72,10 +82,6 @@ impl ToSql for Raw {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::Borrowed(self.as_ref()))
     }
-}
-
-pub(crate) fn same_raws(a: &[Raw], b: &[Raw]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.same(y))
 }
 
 /// Copies a value out of SQLite. Text that is not UTF-8 converts lossily.
@@ -105,17 +111,15 @@ pub(crate) struct Touch {
     pub first_old: Option<Vec<Raw>>,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum KeyIdentity {
-    Rowid(i64),
-    PrimaryKey(Vec<EqKey>),
-}
-
 #[derive(Default)]
 pub(crate) struct Capture {
     schema: Option<Arc<Schema>>,
     touched: Vec<Touch>,
-    seen: BTreeSet<(String, KeyIdentity)>,
+    /// Each touched row of a rowid table, by the table's index in `schema`.
+    seen_rowids: BTreeSet<(usize, i64)>,
+    /// Each touched row of a `WITHOUT ROWID` table, by the table's index in
+    /// `schema` and the primary key's equality keys.
+    seen_keys: BTreeSet<(usize, Vec<EqKey>)>,
     /// A change the schema could not account for, such as one to a table
     /// created inside the transaction.
     unaccounted: bool,
@@ -131,14 +135,16 @@ impl Capture {
     pub fn begin(&mut self, schema: Arc<Schema>) {
         self.schema = Some(schema);
         self.touched.clear();
-        self.seen.clear();
+        self.seen_rowids.clear();
+        self.seen_keys.clear();
         self.unaccounted = false;
     }
 
     /// Stops recording and hands over what was recorded.
     pub fn finish(&mut self) -> Captured {
         self.schema = None;
-        self.seen.clear();
+        self.seen_rowids.clear();
+        self.seen_keys.clear();
         Captured {
             touched: std::mem::take(&mut self.touched),
             unaccounted: std::mem::take(&mut self.unaccounted),
@@ -156,55 +162,90 @@ impl Capture {
             self.unaccounted = true;
             return;
         };
-        match case {
-            PreUpdateCase::Insert(new) => match new_values(&info, new) {
-                Some(values) => self.touch(&info, key(&info, new.get_new_row_id(), &values), None),
-                None => self.unaccounted = true,
-            },
-            PreUpdateCase::Delete(old) => match old_values(&info, old) {
-                Some(values) => {
-                    let key = key(&info, old.get_old_row_id(), &values);
-                    self.touch(&info, key, Some(stored(&info, values)));
-                }
-                None => self.unaccounted = true,
-            },
+        let recorded = match case {
+            PreUpdateCase::Insert(new) => self.written(&info, new),
+            PreUpdateCase::Delete(old) => self.removed(&info, old),
+            // An update that keeps its rowid touches one row.
             PreUpdateCase::Update {
                 old_value_accessor: old,
                 new_value_accessor: new,
-            } => match (old_values(&info, old), new_values(&info, new)) {
-                (Some(before), Some(after)) => {
-                    let old_key = key(&info, old.get_old_row_id(), &before);
-                    let new_key = key(&info, new.get_new_row_id(), &after);
-                    self.touch(&info, old_key, Some(stored(&info, before)));
-                    self.touch(&info, new_key, None);
-                }
-                _ => self.unaccounted = true,
-            },
-            PreUpdateCase::Unknown => self.unaccounted = true,
+            } if !info.without_rowid && old.get_old_row_id() == new.get_new_row_id() => {
+                self.removed(&info, old)
+            }
+            PreUpdateCase::Update {
+                old_value_accessor: old,
+                new_value_accessor: new,
+            } => self
+                .removed(&info, old)
+                .and_then(|()| self.written(&info, new)),
+            PreUpdateCase::Unknown => None,
+        };
+        if recorded.is_none() {
+            self.unaccounted = true;
         }
     }
 
-    fn touch(&mut self, table: &Arc<Table>, key: Key, first_old: Option<Vec<Raw>>) {
-        let identity = match &key {
-            Key::Rowid(rowid) => KeyIdentity::Rowid(*rowid),
-            Key::PrimaryKey(values) => KeyIdentity::PrimaryKey(
+    /// Records the row an insert, or an update's new side, writes. `None`
+    /// if the hook's row does not match the schema.
+    fn written(&mut self, table: &Arc<Table>, new: &PreUpdateNewValueAccessor) -> Option<()> {
+        if new.get_column_count() as usize != table.columns.len() {
+            return None;
+        }
+        let key = key(table, new.get_new_row_id(), |cid| {
+            new.get_new_column_value(cid)
+        })?;
+        self.touch(table, key, || Some(None))
+    }
+
+    /// Records the row a delete, or an update's old side, removes, with its
+    /// stored values the first time the transaction touches it. `None` if
+    /// the hook's row does not match the schema.
+    fn removed(&mut self, table: &Arc<Table>, old: &PreUpdateOldValueAccessor) -> Option<()> {
+        if old.get_column_count() as usize != table.columns.len() {
+            return None;
+        }
+        let key = key(table, old.get_old_row_id(), |cid| {
+            old.get_old_column_value(cid)
+        })?;
+        self.touch(table, key, || {
+            table
+                .stored_cids
+                .iter()
+                .map(|&cid| old.get_old_column_value(cid as i32).ok().map(Raw::from_ref))
+                .collect::<Option<Vec<Raw>>>()
+                .map(Some)
+        })
+    }
+
+    /// Records a row the first time the transaction touches it, with
+    /// `first_old` reading its stored values from before the transaction:
+    /// `Some(None)` for a row that did not exist, `None` if they cannot be
+    /// read.
+    fn touch(
+        &mut self,
+        table: &Arc<Table>,
+        key: Key,
+        first_old: impl FnOnce() -> Option<Option<Vec<Raw>>>,
+    ) -> Option<()> {
+        let first_touch = match &key {
+            Key::Rowid(rowid) => self.seen_rowids.insert((table.index, *rowid)),
+            Key::PrimaryKey(values) => self.seen_keys.insert((
+                table.index,
                 values
                     .iter()
                     .zip(&table.pk_collations)
                     .map(|(value, collation)| eq_key(value.as_ref(), collation))
                     .collect(),
-            ),
+            )),
         };
-        if self
-            .seen
-            .insert((table.name.to_ascii_lowercase(), identity))
-        {
+        if first_touch {
             self.touched.push(Touch {
                 table: table.clone(),
                 key,
-                first_old,
+                first_old: first_old()?,
             });
         }
+        Some(())
     }
 }
 
@@ -216,50 +257,21 @@ pub(crate) fn install(conn: &mut Connection, capture: Arc<Mutex<Capture>>) -> ru
     ))
 }
 
-/// Every column's value, with `Null` for `VIRTUAL` generated columns, which
-/// the hook cannot read. `None` if the hook's row does not match the schema.
-fn old_values(table: &Table, old: &PreUpdateOldValueAccessor) -> Option<Vec<Raw>> {
-    if old.get_column_count() as usize != table.columns.len() {
-        return None;
-    }
-    (0..table.columns.len())
-        .map(|i| {
-            if table.columns[i].stored {
-                old.get_old_column_value(i as i32).ok().map(Raw::from_ref)
-            } else {
-                Some(Raw::Null)
-            }
-        })
-        .collect()
-}
-
-fn new_values(table: &Table, new: &PreUpdateNewValueAccessor) -> Option<Vec<Raw>> {
-    if new.get_column_count() as usize != table.columns.len() {
-        return None;
-    }
-    (0..table.columns.len())
-        .map(|i| {
-            if table.columns[i].stored {
-                new.get_new_column_value(i as i32).ok().map(Raw::from_ref)
-            } else {
-                Some(Raw::Null)
-            }
-        })
-        .collect()
-}
-
-fn key(table: &Table, rowid: i64, values: &[Raw]) -> Key {
+/// A row's key: its rowid, or the primary-key values `value` reads by
+/// column index. `None` if a value cannot be read.
+fn key<'a>(
+    table: &Table,
+    rowid: i64,
+    value: impl Fn(i32) -> rusqlite::Result<ValueRef<'a>>,
+) -> Option<Key> {
     if table.without_rowid {
-        Key::PrimaryKey(table.pk.iter().map(|&cid| values[cid].clone()).collect())
+        table
+            .pk
+            .iter()
+            .map(|&cid| value(cid as i32).ok().map(Raw::from_ref))
+            .collect::<Option<Vec<Raw>>>()
+            .map(Key::PrimaryKey)
     } else {
-        Key::Rowid(rowid)
+        Some(Key::Rowid(rowid))
     }
-}
-
-fn stored(table: &Table, mut values: Vec<Raw>) -> Vec<Raw> {
-    table
-        .stored_cids
-        .iter()
-        .map(|&cid| std::mem::replace(&mut values[cid], Raw::Null))
-        .collect()
 }

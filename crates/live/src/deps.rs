@@ -2,7 +2,7 @@
 //! while it prepares the statement: through views, subqueries, CTEs and
 //! joins alike.
 
-use crate::read_set::TableRead;
+use crate::read_set::Recorded;
 use rusqlite::Connection;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use sqlite3_parser::lexer::Scanner;
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 /// Each table a query reads, by lowercase name.
-pub(crate) type Reads = BTreeMap<String, TableRead>;
+pub(crate) type Reads = BTreeMap<String, Recorded>;
 
 /// Where a reader connection's authorizer records reads; `None` outside
 /// [`collect`].
@@ -39,7 +39,7 @@ pub(crate) fn install(conn: &mut Connection) -> rusqlite::Result<Slot> {
                 if matches!(context.database_name, Some("main") | None) {
                     reads
                         .entry(table_name.to_ascii_lowercase())
-                        .or_insert_with(|| TableRead::new(table_name))
+                        .or_insert_with(|| Recorded::new(table_name))
                         .record(column_name);
                 }
                 Authorization::Allow
@@ -102,7 +102,7 @@ pub(crate) fn resolve(conn: &Connection, reads: &mut Reads) -> rusqlite::Result<
         for table in tables {
             reads
                 .entry(table.to_ascii_lowercase())
-                .or_insert_with(|| TableRead::new(&table))
+                .or_insert_with(|| Recorded::new(&table))
                 .record_every_column();
         }
     }

@@ -191,7 +191,7 @@ commit, but `ReadSetIndex` does that bookkeeping for you. Store each query's rea
 under a key you choose, such as a subscription id, and `affected(&event)` returns the
 keys whose queries the commit may change. It looks them up by the read sets'
 constraints instead of testing each one: with 100,000 subscriptions it handles about
-100,000 events a second, against 35 for calling `intersects` on each
+115,000 events a second, against 115 for calling `intersects` on each
 ([Performance](#performance)).
 
 One stream of changes then serves every query:
@@ -274,16 +274,17 @@ collation, `NULL` handling) for you.
 
 ## How it works
 
-- The **preupdate hook** on the writer connection records each touched row. Before
-  `COMMIT`, `write` reads those rows back to compute net changes, then publishes the
-  event once the commit succeeds.
+- The **preupdate hook** on the writer connection records each touched row, with its
+  old values the first time. Before `COMMIT`, `write` reads those rows back to compute
+  net changes, reading a run of consecutive rowids in one range scan, then publishes
+  the event once the commit succeeds.
 - A snapshot can see a commit a moment before its event is published. It then waits
   for the publish, so `changes_since(result.version)` always succeeds.
 - The **authorizer** reports every table and column a query reads, through views,
-  subqueries, and CTEs. Each reader caches these reads, and its prepared statements,
-  by SQL text until the schema changes. A SQL parser adds constraints from the `WHERE`
-  clause with bound parameter values, and a bound from the last row of a `LIMIT`
-  query.
+  subqueries, and CTEs. A SQL parser plans constraints from the `WHERE` clause and a
+  `LIMIT` window. Each reader keeps these reads, the plan and the prepared statement
+  by SQL text until the schema changes, so a repeated query binds its parameters,
+  steps, and adds a bound from the window's last row.
 - `intersects` checks whether an event's old or new row satisfies a read set's
   constraints, using SQLite's comparison rules.
 - BLAKE3 hashes each result's column names and rows as the rows stream out of
@@ -293,7 +294,7 @@ collation, `NULL` handling) for you.
 
 Measured on an Intel Core Ultra 9 285 (24 cores) with a Micron 2 TB NVMe drive
 (ext4), Linux 7.0, Rust 1.98.0, and the SQLite that rusqlite 0.41 bundles. Databases
-live on the drive, since every commit waits for fsync.
+live on the drive unless noted, since every commit waits for fsync.
 
 ```console
 cargo run --release -p sqlive-bench [writes|queries|index|memory]
@@ -308,37 +309,56 @@ settings, WAL and `synchronous = FULL`. Rows are chat rows with a 60-byte body.
 
 | Workload | SqLive commits/s | SqLive rows/s | rusqlite rows/s | SqLive / rusqlite |
 | --- | ---: | ---: | ---: | ---: |
-| Insert 1 row per commit | 231 | 231 | 233 | 0.99 |
-| Insert 1,000 rows per commit | 131 | 130,989 | 144,870 | 0.90 |
-| Update 1,000 rows per commit | 167 | 167,245 | 224,390 | 0.75 |
-| Delete 1,000 rows per commit | 143 | 143,126 | 156,040 | 0.92 |
+| Insert 1 row per commit | 232 | 232 | 231 | 1.00 |
+| Insert 1,000 rows per commit | 148 | 147,521 | 144,276 | 1.02 |
+| Update 1,000 rows per commit | 179 | 178,608 | 225,373 | 0.79 |
+| Delete 1,000 rows per commit | 151 | 150,899 | 158,668 | 0.95 |
 
-A single-row commit costs one fsync, about 4.3 ms on this drive, so SqLive and
-rusqlite run at the same pace. In large transactions, capturing changes costs 8–25%:
-updates cost the most, since SqLive reads each touched row back before `COMMIT` to
-compute its net change.
+Every commit waits for fsync, about 4.3 ms on this drive, so the drive sets the pace
+and the ratios move between runs: across three runs they ranged from 0.79 to 1.02.
+With the databases on tmpfs (`SQLIVE_BENCH_DIR`), where fsync costs nothing, what
+SqLive itself adds shows:
+
+| Workload on tmpfs | SqLive commits/s | SqLive rows/s | rusqlite rows/s | SqLive / rusqlite |
+| --- | ---: | ---: | ---: | ---: |
+| Insert 1 row per commit | 58,357 | 58,357 | 150,333 | 0.39 |
+| Insert 1,000 rows per commit | 1,005 | 1,004,689 | 1,661,432 | 0.60 |
+| Update 1,000 rows per commit | 1,564 | 1,564,467 | 8,774,701 | 0.18 |
+| Delete 1,000 rows per commit | 1,563 | 1,563,341 | 2,723,263 | 0.57 |
+
+A commit adds about 10 µs: SqLive reads and bumps its version row, which writes one
+more page to the WAL, checks the schema cookie, and publishes the event. Each touched
+row adds 0.3–0.5 µs: the preupdate hook copies its old values, `write` reads it back
+before `COMMIT` to compute its net change, reading a run of consecutive rowids in one
+range scan, and SqLive builds the event's rows.
 
 ### Queries
 
 The chat query, `SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT
 10`, over 10,000 rooms of 12 chats, mapping each row to a tuple. 50,000 queries per
-run.
+run. The rusqlite runs use `prepare_cached`, except where noted.
 
 | Query | SqLive µs | SqLive queries/s | rusqlite µs | rusqlite queries/s |
 | --- | ---: | ---: | ---: | ---: |
-| `query`, 1 thread | 12.7 | 79,015 | 6.6 | 150,688 |
-| `rerun`, unchanged, 1 thread | 12.8 | 78,348 | | |
-| `query`, 8 threads | | 52,732 | | 60,992 |
-| `query`, 8 threads, memory statistics off | | 421,577 | | 961,606 |
+| `query`, 1 thread | 6.3 | 158,796 | 6.5 | 153,349 |
+| `rerun`, unchanged, 1 thread | 6.3 | 158,930 | | |
+| 1 thread, rusqlite holding its statement | | | 3.6 | 277,463 |
+| `query`, 8 threads | | 703,957 | | 59,913 |
+| `query`, 8 threads, memory statistics off | | 962,398 | | 951,187 |
 
-SqLive's extra 6 µs per query buys the snapshot's version and schema checks, the read
-set with its constraints and window bound, and the result hash. An unchanged `rerun`
-costs the same as `query`; it saves the push, not the query.
+rusqlite's statement cache clears a statement's bindings when it takes the statement
+back, and SQLite then prepares this query again on its next run, since planning
+looked at its parameter. SqLive keeps each query's statement on its reader
+connection and skips that. Against rusqlite holding its own statement, SqLive's extra
+2.7 µs per query buys the snapshot's version and schema checks, the read set with its
+constraints and window bound, and the result hash. An unchanged `rerun` costs the same
+as `query`; it saves the push, not the query.
 
 SQLite keeps memory statistics by default, and they take one global mutex on every
-allocation, in every connection. With them on, eight threads run slower than one, in
-SqLive and in plain rusqlite alike. Turning them off before SQLite starts, as the chat
-example's `main` does, lets eight threads run 8x the queries:
+allocation, in every connection. Preparing a statement allocates heavily, so eight
+threads of plain rusqlite run slower than one. SqLive allocates little per query, and
+turning the statistics off before SQLite starts, as the chat example's `main` does,
+still lets eight threads run a third more queries:
 
 ```rust
 // SAFETY: before any connection opens.
@@ -352,7 +372,7 @@ statistics.
 
 | Full scan of 120,000 rows | SqLive rows/s | rusqlite rows/s |
 | --- | ---: | ---: |
-| `SELECT * FROM chats` | 4.7–5.8 million | 7.0–8.9 million |
+| `SELECT * FROM chats` | 4.8–5.7 million | 6.6–8.8 million |
 
 The ranges span runs. Hashing every value and building the read set cost about a
 third of plain rusqlite's scan rate.
@@ -365,10 +385,10 @@ inserts one chat into one room, which affects that room's ten subscriptions.
 
 | Method | Events per second | Affected per event |
 | --- | ---: | ---: |
-| `ReadSetIndex::affected` | 100,682 | 10 |
-| `intersects` on every read set | 35 | 10 |
+| `ReadSetIndex::affected` | 115,532 | 10 |
+| `intersects` on every read set | 115 | 10 |
 
-Building the 100,000 read sets, one query each, took 1.35 s.
+Building the 100,000 read sets, one query each, took 0.57 s.
 
 ### Memory
 
@@ -377,17 +397,16 @@ Rust heap measured with a counting allocator; SQLite's heap with
 
 | Held | Count | Rust heap | Per item |
 | --- | ---: | ---: | ---: |
-| Chat-query read sets, held alone | 100,000 | 206.4 MB | 2,164 bytes |
-| Chat-query read sets in a `ReadSetIndex` | 100,000 | 269.2 MB | 2,822 bytes |
+| Chat-query read sets, held alone | 100,000 | 68.5 MB | 718 bytes |
+| Chat-query read sets in a `ReadSetIndex` | 100,000 | 130.6 MB | 1,369 bytes |
 | Retained events, each inserting one chat | 4,096 | 3.0 MB | 777 bytes |
 
 SQLite's own heap, page caches included, held 4.2 MB. A result hash adds 32 bytes per
 subscription.
 
-Most of a read set's 2.2 KB is empty B-tree capacity: its map of tables allocates a
-1,160-byte node with room for eleven tables to hold the chat query's one, and its
-set of column names another node of about 280 bytes. Small sorted vectors would hold
-the same read set in well under half the space.
+A query text's tables and columns live once on each reader connection, and every read
+set the text returns shares them. A read set holds its own filter: here the room and
+the window's bound.
 
 ### Chat server under load
 
@@ -398,14 +417,14 @@ room. The server and the load generator share the machine.
 
 | Rooms × viewers each | Posts/s | Delivered | Delivery p50 | p90 | p99 | Server RSS | Server CPU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 × 10 | 100 | 30,000 of 30,000 | 4.7 ms | 7.4 ms | 31.9 ms | 238 MB | 38% of a core |
-| 10 × 1,000 | 50 | 1,500,000 of 1,500,000 | 6.2 ms | 10.1 ms | 18.9 ms | 227 MB | 114% of a core |
-| 1,000 × 1 | 400 asked, 223 reached | 6,000 of 6,000 | 67.1 ms | 78.8 ms | 127.2 ms | 64 MB | 17% of a core |
+| 1,000 × 10 | 100 | 30,000 of 30,000 | 4.6 ms | 8.8 ms | 35.2 ms | 226 MB | 38% of a core |
+| 10 × 1,000 | 50 | 1,500,000 of 1,500,000 | 6.1 ms | 10.6 ms | 19.5 ms | 221 MB | 114% of a core |
+| 1,000 × 1 | 400 asked, 222 reached | 6,000 of 6,000 | 67.0 ms | 79.4 ms | 125.3 ms | 57 MB | 16% of a core |
 
 - Delivery takes about one commit: the post's own fsync is 4.3 ms at the median.
-- 10,000 viewers joined in 1.4 s, about 7,200 per second, and each held about 21 KB of
+- 10,000 viewers joined in 1.1 s, about 9,300 per second, and each held about 20 KB of
   server memory, most of it connection buffers.
-- Posts top out at 223 per second, the drive's fsync rate for single-row commits.
+- Posts top out at 222 per second, the drive's fsync rate for single-row commits.
   Asked for more, posts queue, and delivery waits behind them. Batching several posts
   into one commit would raise the ceiling.
 - Every commit changes every room's counters, so each viewer gets its counters at

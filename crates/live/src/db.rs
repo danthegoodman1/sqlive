@@ -1,14 +1,17 @@
 //! The live database: one writer connection that records every committed
 //! transaction's net row changes, and the log those changes go to.
 
-use crate::capture::{self, Capture, Captured, Key, Raw, Touch, same_raws};
+use crate::capture::{self, Capture, Captured, Key, Raw, Touch, owned};
 use crate::error::{Error, Result};
 use crate::event::{CommitEvent, Op, Row, RowChange, Version};
 use crate::log::{Changes, Log};
-use crate::read::Reader;
+use crate::read::Readers;
 use crate::schema::{META_TABLE, Schema, Table};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params_from_iter};
+use rusqlite::{
+    CachedStatement, Connection, OpenFlags, Transaction, TransactionBehavior, params_from_iter,
+};
+use std::collections::btree_map::{BTreeMap, Entry};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,7 +48,7 @@ pub struct LiveDb {
     options: Options,
     writer: Mutex<Writer>,
     /// Idle read-only connections, at most `options.readers`.
-    pub(crate) readers: Mutex<Vec<Reader>>,
+    pub(crate) readers: Readers,
     pub(crate) log: Arc<Log>,
 }
 
@@ -121,6 +124,7 @@ impl LiveDb {
         conn.rollback_hook(Some(move || flag.store(true, Ordering::Relaxed)))?;
         let moved = schema.version != meta.schema;
         let log = Arc::new(Log::new(meta.version, options.log_capacity));
+        let readers = Readers::new(options.readers);
         let db = LiveDb {
             path,
             options,
@@ -133,7 +137,7 @@ impl LiveDb {
                 schema,
                 unsure: false,
             }),
-            readers: Mutex::new(Vec::new()),
+            readers,
             log,
         };
         if moved {
@@ -497,59 +501,137 @@ fn bump_version(conn: &Connection, schema: i64) -> rusqlite::Result<Version> {
 }
 
 fn schema_version(conn: &Connection) -> rusqlite::Result<i64> {
-    conn.query_row("PRAGMA schema_version", [], |r| r.get(0))
+    conn.prepare_cached("PRAGMA schema_version")?
+        .query_row([], |r| r.get(0))
 }
 
 /// Reads each touched row back and compares it with its first old value.
-fn net_changes(conn: &Connection, touched: Vec<Touch>) -> Result<Vec<RowChange>> {
+/// A run of touches with consecutive rowids in one table, as a bulk insert
+/// or a range update makes, reads back in one scan.
+fn net_changes(conn: &Connection, mut touched: Vec<Touch>) -> Result<Vec<RowChange>> {
+    // Each table's read-back statements, by the table's index in the schema.
+    let mut by_key: BTreeMap<usize, CachedStatement<'_>> = BTreeMap::new();
+    let mut by_range: BTreeMap<usize, CachedStatement<'_>> = BTreeMap::new();
     let mut changes = Vec::new();
-    for touch in touched {
-        let table = &touch.table;
-        let current = read_back(conn, table, &touch.key)?;
-        let row = |values: Vec<Raw>| {
-            Row::new(
-                table.stored.clone(),
-                values.iter().map(Raw::to_value).collect(),
-            )
-        };
-        let (op, old, new) = match (touch.first_old, current) {
-            (None, None) => continue,
-            (Some(old), Some(new)) if same_raws(&old, &new) => continue,
-            (None, Some(new)) => (Op::Insert, None, Some(row(new))),
-            (Some(old), None) => (Op::Delete, Some(row(old)), None),
-            (Some(old), Some(new)) => (Op::Update, Some(row(old)), Some(row(new))),
-        };
-        changes.push(RowChange {
-            table: table.name.clone(),
-            op,
-            rowid: match touch.key {
-                Key::Rowid(rowid) => Some(rowid),
-                Key::PrimaryKey(_) => None,
-            },
-            old,
-            new,
-        });
+    let mut start = 0;
+    while start < touched.len() {
+        let end = run_end(&touched, start);
+        let table = touched[start].table.clone();
+        let run = &mut touched[start..end];
+        if let (true, Key::Rowid(first), Key::Rowid(last)) =
+            (run.len() > 1, &run[0].key, &run[run.len() - 1].key)
+        {
+            let statement = read_back(&mut by_range, conn, &table, &table.select_range)?;
+            let mut rows = statement.query([*first, *last])?;
+            let mut pending = run.iter_mut().peekable();
+            while let Some(row) = rows.next()? {
+                let rowid: i64 = row.get(table.stored.len())?;
+                while let Some(touch) =
+                    pending.next_if(|touch| matches!(touch.key, Key::Rowid(r) if r < rowid))
+                {
+                    changes.extend(change(touch, None)?);
+                }
+                if let Some(touch) =
+                    pending.next_if(|touch| matches!(touch.key, Key::Rowid(r) if r == rowid))
+                {
+                    changes.extend(change(touch, Some(row))?);
+                }
+            }
+            for touch in pending {
+                changes.extend(change(touch, None)?);
+            }
+        } else {
+            for touch in run {
+                let statement = read_back(&mut by_key, conn, &table, &table.select_by_key)?;
+                let mut rows = match &touch.key {
+                    Key::Rowid(rowid) => statement.query([rowid])?,
+                    Key::PrimaryKey(values) => statement.query(params_from_iter(values))?,
+                };
+                changes.extend(change(touch, rows.next()?)?);
+            }
+        }
+        start = end;
     }
     Ok(changes)
 }
 
-fn read_back(conn: &Connection, table: &Table, key: &Key) -> Result<Option<Vec<Raw>>> {
+/// The end of the run of touches from `start` whose rowids in one table
+/// count up by one.
+fn run_end(touched: &[Touch], start: usize) -> usize {
+    let mut end = start + 1;
+    while let Some(next) = touched.get(end)
+        && let (Key::Rowid(previous), Key::Rowid(rowid)) = (&touched[end - 1].key, &next.key)
+        && next.table.index == touched[start].table.index
+        && previous.checked_add(1) == Some(*rowid)
+    {
+        end += 1;
+    }
+    end
+}
+
+/// A statement that reads `table`'s rows back, prepared once per commit.
+fn read_back<'m, 'c>(
+    statements: &'m mut BTreeMap<usize, CachedStatement<'c>>,
+    conn: &'c Connection,
+    table: &Table,
+    sql: &str,
+) -> Result<&'m mut CachedStatement<'c>> {
     if !table.without_rowid && table.rowid_name.is_none() {
         return Err(Error::Unsupported(format!(
             "table {} has columns named rowid, _rowid_ and oid, so its rowid cannot be read",
             table.name
         )));
     }
-    let mut statement = conn.prepare_cached(&table.select_by_key)?;
-    let mut rows = match key {
-        Key::Rowid(rowid) => statement.query([rowid])?,
-        Key::PrimaryKey(values) => statement.query(params_from_iter(values))?,
+    Ok(match statements.entry(table.index) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(conn.prepare_cached(sql)?),
+    })
+}
+
+/// A touched row's net change, given the row as it now stands: `None` if
+/// the transaction left it as it was.
+fn change(
+    touch: &mut Touch,
+    current: Option<&rusqlite::Row<'_>>,
+) -> rusqlite::Result<Option<RowChange>> {
+    let table = &touch.table;
+    let old_row = |values: Vec<Raw>| {
+        Row::new(
+            table.stored.clone(),
+            values.into_iter().map(Raw::into_value).collect(),
+        )
     };
-    let Some(row) = rows.next()? else {
-        return Ok(None);
+    let new_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Row> {
+        let values = (0..table.stored.len())
+            .map(|i| row.get_ref(i).map(owned))
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Row::new(table.stored.clone(), values))
     };
-    let values = (0..table.stored.len())
-        .map(|i| row.get_ref(i).map(Raw::from_ref))
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(Some(values))
+    let (op, old, new) = match (touch.first_old.take(), current) {
+        (None, None) => return Ok(None),
+        (Some(old), Some(new)) if unchanged(&old, new)? => return Ok(None),
+        (None, Some(new)) => (Op::Insert, None, Some(new_row(new)?)),
+        (Some(old), None) => (Op::Delete, Some(old_row(old)), None),
+        (Some(old), Some(new)) => (Op::Update, Some(old_row(old)), Some(new_row(new)?)),
+    };
+    Ok(Some(RowChange {
+        table: table.name.clone(),
+        op,
+        rowid: match touch.key {
+            Key::Rowid(rowid) => Some(rowid),
+            Key::PrimaryKey(_) => None,
+        },
+        old,
+        new,
+    }))
+}
+
+/// Whether a row read back holds exactly its old stored values.
+fn unchanged(old: &[Raw], row: &rusqlite::Row<'_>) -> rusqlite::Result<bool> {
+    for (i, value) in old.iter().enumerate() {
+        if !value.same(row.get_ref(i)?) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

@@ -130,7 +130,10 @@ pub fn run() -> sqlive::Result<()> {
             work: delete_batch,
         },
     ];
-    println!("\n## writes: WAL, synchronous = FULL, on disk\n");
+    println!(
+        "\n## writes: WAL, synchronous = FULL, in {}\n",
+        dir.display()
+    );
     println!(
         "| Workload | SqLive commits/s | SqLive rows/s | rusqlite rows/s | SqLive / rusqlite |"
     );

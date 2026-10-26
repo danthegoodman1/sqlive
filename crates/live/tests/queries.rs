@@ -5,7 +5,7 @@ mod common;
 
 use common::open;
 use sqlive::rusqlite::{named_params, params};
-use sqlive::{CommitEvent, LiveDb};
+use sqlive::{CommitEvent, LiveDb, Options};
 
 fn ints(row: &sqlive::rusqlite::Row<'_>) -> sqlive::rusqlite::Result<i64> {
     row.get(0)
@@ -83,6 +83,54 @@ fn parameters_bind_by_position_and_by_name() {
             .is_err(),
         "too few parameters"
     );
+}
+
+#[test]
+fn a_read_set_finds_its_tables_in_any_case() {
+    let db = open(
+        "case",
+        "CREATE TABLE Todos (id INTEGER PRIMARY KEY, Title TEXT);",
+    );
+    let result = db
+        .query("SELECT title FROM TODOS", (), |r| r.get::<_, String>(0))
+        .unwrap();
+    let event = commit(&db, "INSERT INTO todos (title) VALUES ('a')");
+    assert_eq!(event.changes[0].table, "Todos");
+    assert!(result.read_set.intersects(&event), "{}", result.read_set);
+}
+
+#[test]
+fn a_named_parameter_left_unbound_is_null_on_every_run() {
+    let db = open(
+        "unbound",
+        "CREATE TABLE t (a); INSERT INTO t VALUES (1), (2);",
+    );
+    let sql = "SELECT a FROM t WHERE a = :a OR :all IS NOT NULL ORDER BY a";
+    let all = db
+        .query(sql, named_params! { ":a": 1, ":all": 1 }, ints)
+        .unwrap();
+    assert_eq!(all.rows, [1, 2]);
+    let one = db.query(sql, named_params! { ":a": 1 }, ints).unwrap();
+    assert_eq!(one.rows, [1], "an unbound parameter is NULL");
+}
+
+#[test]
+fn a_query_runs_inside_another_querys_row_mapping() {
+    let db = open(
+        "nested",
+        "CREATE TABLE t (a); INSERT INTO t VALUES (1), (2);",
+    );
+    let snapshot = db.snapshot().unwrap();
+    let sql = "SELECT a FROM t WHERE a >= ?1 ORDER BY a";
+    let outer = snapshot
+        .query(sql, [1], |row| {
+            let a: i64 = row.get(0)?;
+            let inner = snapshot.query(sql, [a], ints).expect("inner query");
+            Ok((a, inner.rows))
+        })
+        .unwrap();
+    assert_eq!(outer.rows, [(1, vec![1, 2]), (2, vec![2])]);
+    assert_eq!(snapshot.query(sql, [2], ints).unwrap().rows, [2]);
 }
 
 #[test]
@@ -301,13 +349,22 @@ fn a_full_text_query_depends_on_its_shadow_tables() {
 
 #[test]
 fn a_result_never_runs_ahead_of_the_log() {
-    let db = open("race", "CREATE TABLE t (a);");
+    // Each commit checkpoints a 64 KiB row after it becomes visible and
+    // before `write` publishes its event, which gives the readers time to
+    // see it first.
+    let options = Options {
+        checkpoint_pages: 1,
+        ..Options::default()
+    };
+    let db = LiveDb::open_with(common::temp_db("race"), options).unwrap();
+    db.write(|tx| tx.execute_batch("CREATE TABLE t (a, b);"))
+        .unwrap();
     let mut follower = db.changes().unwrap();
     #[allow(clippy::disallowed_methods)]
     std::thread::scope(|scope| {
         scope.spawn(|| {
             for i in 0..300 {
-                db.write(|tx| tx.execute("INSERT INTO t VALUES (?1)", [i]))
+                db.write(|tx| tx.execute("INSERT INTO t VALUES (?1, zeroblob(65536))", [i]))
                     .unwrap();
             }
         });

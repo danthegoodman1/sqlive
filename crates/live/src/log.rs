@@ -3,11 +3,15 @@
 use crate::error::{Error, Result};
 use crate::event::{CommitEvent, Version};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub(crate) struct Log {
     state: Mutex<LogState>,
     published: Condvar,
+    /// `state.latest`, stored each time it changes, for reads that skip the
+    /// lock.
+    reached: AtomicU64,
 }
 
 struct LogState {
@@ -38,11 +42,12 @@ impl Log {
                 closed: false,
             }),
             published: Condvar::new(),
+            reached: AtomicU64::new(latest),
         }
     }
 
     pub fn latest(&self) -> Version {
-        crate::lock(&self.state).latest
+        self.reached.load(Ordering::Acquire)
     }
 
     pub fn publish(&self, event: CommitEvent) {
@@ -54,6 +59,7 @@ impl Log {
             state.epoch += 1;
         }
         state.latest = event.version;
+        self.reached.store(state.latest, Ordering::Release);
         state.events.push_back(Arc::new(event));
         while state.events.len() > state.capacity {
             state.events.pop_front();
@@ -70,6 +76,7 @@ impl Log {
         state.events.clear();
         state.base = latest;
         state.latest = latest;
+        self.reached.store(latest, Ordering::Release);
         state.epoch += 1;
         drop(state);
         self.published.notify_all();
@@ -87,6 +94,9 @@ impl Log {
     /// still ahead, as after a commit that took effect without an event,
     /// moves the log to `version`. Every open stream then lags.
     pub fn catch_up(&self, version: Version) {
+        if version <= self.reached.load(Ordering::Acquire) {
+            return;
+        }
         let mut state = crate::lock(&self.state);
         while state.latest < version && state.committing {
             state = self
@@ -98,6 +108,7 @@ impl Log {
             state.events.clear();
             state.base = version;
             state.latest = version;
+            self.reached.store(version, Ordering::Release);
             state.epoch += 1;
             drop(state);
             self.published.notify_all();

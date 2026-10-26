@@ -15,7 +15,7 @@ Non-goals until a phase names them: writers in other processes, ATTACHed databas
 - The library starts no threads, reads no clocks and iterates only ordered collections. Events list changes in first-touch order. `clippy.toml` in `crates/live` and `crates/sim` enforces this, so a seed replays exactly.
 - Every feature ships with simulator coverage, a property that fails on a wrong answer, and a planted bug the simulator catches.
 - Build the smallest implementation that meets the phase gate.
-- Execution order: Phase 0 through Phase 9.
+- Execution order: Phase 0 through Phase 10.
 
 ## Testing Strategy
 
@@ -395,3 +395,45 @@ Status ledger:
 | Complete | Test | 9D: Browser reconnect | Headless Firefox through a proxy logging each connection: SIGTERM ended the first stream 3 ms later; the browser reconnected 1.0 s later with `Last-Event-ID` equal to the last result's id; the new server sent only the result for a chat posted after the restart, and the page showed it. |
 | Complete | Doc | 9E: Published numbers | README "Performance". |
 | Complete | Gate | Full gate | `scripts/check 10000`: fmt, clippy and every test pass, 0 of 10,000 seeds failed. On the final tree, all 14 chat planted bugs are caught by the chat tests; `scripts/mutants` now holds 82. |
+
+## Phase 10: Performance Recovery
+
+Goal:
+Cut what SqLive adds to queries and writes, keeping every result, read set, hash and event the same.
+
+Scope:
+- 10A Snapshot statements: `BEGIN`, the version and schema cookie, read in one statement, and `ROLLBACK` stay prepared.
+- 10B Constraint plans: `constraints::plan` parses a query text once per schema into conditions whose constants are terms over its parameters; `Plan::bind` fills them in on each run with the same affinity and `NULL` rules.
+- 10C Kept statements: each reader keeps each query text's statement in a slot and releases its bound values when the run ends. rusqlite's statement cache clears bindings when it takes a statement back, which makes SQLite prepare it again whenever planning looked at any parameter.
+- 10D Threads: idle readers sit in per-thread slots instead of one locked stack, and the log's `catch_up` and `latest` read an atomic copy of its latest version.
+- 10E Read sets: a query text's tables and columns are shared by every read set it returns; tables sit in a sorted slice found without allocating.
+- 10F Writes: the hook reads old values only on a row's first touch and new values only for a `WITHOUT ROWID` key; an update that keeps its rowid touches one row; touched rows are keyed by the table's index in the schema; read-back statements are prepared once per commit; a run of consecutive rowids reads back in one range scan; read-back rows are compared in place and old values move into the event.
+- 10G The README's Performance section.
+
+Out of scope:
+- Planner settings: the query planner stability guarantee would avoid the re-prepare too, but it also stops plans that look at bound values, such as a `LIKE ?` prefix search on an index.
+- Batching posts into shared commits.
+
+Completion gate:
+Every library and simulator test passes unchanged; the 10,000-seed sweep has no failures; `scripts/mutants` catches every planted bug, including those for the new code; `/code-review` findings are resolved; the README's numbers come from the final tree.
+
+Testing plan:
+- `a_named_parameter_left_unbound_is_null_on_every_run`, `a_query_runs_inside_another_querys_row_mapping` and `a_read_set_finds_its_tables_in_any_case` cover kept statements and the case-insensitive table lookup.
+- `a_result_never_runs_ahead_of_the_log` checkpoints after every commit, so readers see commits before their events publish on every run.
+- Planted bugs for each new path: kept bindings, the log's fast path, parameter binding in plans, table lookup by case, rowid-moving updates, the range read-back's end, runs across tables, and per-table read-back statements.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 10A: Snapshot statements | `Reader::begin` and `LiveDb::release` in `crates/live/src/read.rs` run `BEGIN`, one `SELECT` of the version and schema cookie, and `ROLLBACK` through `prepare_cached`. The chat query in a profiling loop went from 11.7 to 10.8 µs. |
+| Complete | Work | 10B: Constraint plans | `Plan`, `Pending`, `Test`, `Term`, `PendingWindow` and `plan` in `crates/live/src/constraints.rs`; `Cached::planned` and `Cached::boundary_column` in `read.rs`. 10.8 to 9.0 µs. |
+| Complete | Work | 10C: Kept statements | `Reader::statement`, `Reader::keep` and `bind` in `read.rs`; the connection lives behind `NonNull` so statements can borrow it, and `Drop` finalizes them first. Through rusqlite's cache SQLite re-prepared the chat query on 1,000 of 1,000 runs, and a held statement on 2. 8.8 to 6.2 µs. |
+| Complete | Work | 10D: Threads | `Readers` in `read.rs`; `Log::reached` in `crates/live/src/log.rs`. Eight threads with memory statistics off: 421,577 to 962,398 queries/s; with them on, 52,732 to 703,957. |
+| Complete | Work | 10E: Read sets | `ColumnsRead`, `Recorded`, `TableRead::new` and `ReadSet::table` in `crates/live/src/read_set.rs`; `lowercase` in `schema.rs` for `ReadSetIndex::affected`. A chat-query read set: 2,164 to 718 bytes, 2,822 to 1,369 in a `ReadSetIndex`; `intersects` on every read set, 35 to 115 events/s; the index, 100,682 to 115,532. |
+| Complete | Work | 10F: Writes | `Capture::written`, `removed` and `touch` in `crates/live/src/capture.rs`; `net_changes`, `run_end`, `read_back` and `change` in `db.rs`; `Table::index` and `Table::select_range` in `schema.rs`; the writer's `PRAGMA schema_version` through `prepare_cached`. A 1,000-row update on tmpfs in a profiling loop: 1,057 to 515 µs; a 1,000-row insert, 1,489 to 1,040 µs. |
+| Complete | Doc | 10G: Published numbers | README "Performance", from the final tree, with a tmpfs table for writes and a rusqlite row that holds its statement. |
+| Complete | Test | Tests for the new paths | `a_named_parameter_left_unbound_is_null_on_every_run`, `a_query_runs_inside_another_querys_row_mapping` and `a_read_set_finds_its_tables_in_any_case` in `crates/live/tests/queries.rs`. `a_result_never_runs_ahead_of_the_log` caught "readers do not wait for a commit under way" in 6 of 20 runs before it checkpointed every commit, and 20 of 20 after. |
+| Complete | Test | Phase 10 planted bugs | `scripts/mutants` holds 90, 8 of them Phase 10; its full run caught 89. The miss, "a schema change keeps statements prepared under the old one", no longer planted a bug: a re-planned query prepares a fresh statement into its slot. The bug now also reuses the kept statement, and `a_window_finds_its_sort_key_after_a_column_before_it_is_dropped` catches it. The 13 bugs in `db.rs`, rerun after its last change: 13 of 13 caught. |
+| Complete | Gate | Code review | `/code-review high`, 8 findings. Fixed: kept statements release their bound values; one slot per text replaces a remove and reinsert, so a run allocates no key; `Log::latest` reads the atomic; a plan keeps only its parameter numbering, not the rewritten SQL; `ReadSetIndex::affected` looks tables up without allocating; this ledger. Answered: the slots keep seeds deterministic, since one thread visits them in the same cyclic order whatever its number (now in the `Readers` doc); and binding re-prepares only a parameter planning looked at, while `sqlite3_clear_bindings` re-prepares when planning looked at any, which the 1,000 against 2 re-prepares above show. |
+| Complete | Gate | Full gate | `scripts/check 10000` on the final tree: fmt, clippy and every test pass, 0 of 10,000 seeds failed. |

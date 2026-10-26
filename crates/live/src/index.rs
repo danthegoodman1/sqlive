@@ -15,6 +15,7 @@ use crate::compare::{Collation, EqKey, compare, eq_key};
 use crate::constraints::{Condition, Conjunction, Constraint, Filter};
 use crate::event::{CommitEvent, Row};
 use crate::read_set::ReadSet;
+use crate::schema::lowercase;
 use rusqlite::types::{Value, ValueRef};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -248,7 +249,7 @@ impl<K: Ord + Clone> ReadSetIndex<K> {
         } else {
             let mut found: BTreeSet<&K> = self.every_commit.iter().collect();
             for change in &event.changes {
-                let Some(index) = self.tables.get(&change.table.to_ascii_lowercase()) else {
+                let Some(index) = self.tables.get(lowercase(&change.table).as_ref()) else {
                     continue;
                 };
                 found.extend(&index.whole);
