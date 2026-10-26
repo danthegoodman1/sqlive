@@ -259,7 +259,7 @@ Goal:
 Scope:
 - 6A `insert` (which replaces), `remove`, `get`, `len`, `affected(&event)`.
 - 6B Structure: each conjunction registers under one anchor constraint. Equalities go in maps keyed by SQLite's equality key under their collation; lower and upper bounds, window bounds included, go in maps ordered by SQLite's comparison; everything else goes in a per-table bucket. A row without an indexed column, or with lossy text, reaches every condition on it. Every candidate is checked with `intersects`, and `schema_changed` returns every key. Each key records its registrations, so removal touches only its own.
-- 6C Benchmark: 100,000 subscriptions over 10,000 rooms, recording events per second in `BENCHMARKS.md`.
+- 6C Benchmark: 100,000 subscriptions over 10,000 rooms, recording events per second in the README.
 
 Out of scope:
 - Persistence of subscriptions.
@@ -277,7 +277,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 6A: Index API | `crates/live/src/index.rs`; `affected_matches_testing_every_read_set` (2,000 steps of inserts, replacements, removals and writes) in `crates/live/tests/index.rs`. |
 | Complete | Work | 6B: Equality, bound and table-level structures | `ColumnIndex` and `places` in `crates/live/src/index.rs`; `affected_covers_missing_columns_lossy_text_and_every_commit`. |
-| Complete | Work | 6C: Benchmark | `crates/bench/src/main.rs` (`cargo run --release -p sqlive-bench`); `BENCHMARKS.md`: 103,029 events/s with the index, 35 without. |
+| Complete | Work | 6C: Benchmark | `crates/bench/src/main.rs` (`cargo run --release -p sqlive-bench`); README "Performance": 103,029 events/s with the index, 35 without. |
 | Complete | Test | Index matches brute force | `Live::check_index` and `Live::sync_index` in `crates/sim/src/live/mod.rs` check each event before subscriptions process it, against the harness's own copies of the read sets. Live seeds 0–299: 37,346 events checked, 94,421 read sets found. |
 | Complete | Test | Phase 6 planted bugs | `scripts/mutants --layers unit,sim,seeds`: 55 of 55 caught, 5 of them Phase 6; with `--layers sim,seeds`, the simulator alone catches all 5. |
 | Complete | Gate | 10,000-seed sweep | `cargo run --release -p sqlive-sim -- 0 --seeds 10000` (storage and live): 0 of 10,000 failed. |
@@ -364,21 +364,21 @@ Status ledger:
 ## Phase 9: Performance and Scale
 
 Goal:
-Measure what SqLive costs and how the chat server scales, publish the numbers in `BENCHMARKS.md` and the README, and fix what the measurements expose.
+Measure what SqLive costs and how the chat server scales, publish the numbers in the README, and fix what the measurements expose.
 
 Scope:
 - 9A `sqlive-bench` subcommands: `writes` (single-row and 1,000-row commits through `LiveDb::write` against plain rusqlite with the same settings), `queries` (chat-query latency on one thread and eight, `rerun` unchanged, full scans), `index`, and `memory` (a counting allocator, run in its own process, for read sets alone and in a `ReadSetIndex`, and retained events). Databases live on disk in `target/bench`.
 - 9B `chat-load`: starts the release server, opens live streams across rooms, posts at a fixed rate, and reports per-chat delivery latency, the post ceiling, and the server's RSS and CPU.
 - 9C Fixes: each viewer's counters arrive at most every `STATS_EVERY` (500 ms); the chat server turns off SQLite's memory statistics before opening the database.
 - 9D A browser reconnect across a real restart.
-- 9E `BENCHMARKS.md` and the README's Performance section.
+- 9E The README's Performance section.
 
 Out of scope:
 - Shrinking read sets, whose B-tree nodes are mostly empty capacity.
 - Batching posts into shared commits.
 
 Completion gate:
-Every benchmark runs from one command and its numbers are in `BENCHMARKS.md`; the chat load test delivers every chat; the throttle has a test and a planted bug.
+Every benchmark runs from one command and its numbers are in the README; the chat load test delivers every chat; the throttle has a test and a planted bug.
 
 Testing plan:
 - Run `sqlive-bench` with memory statistics on and off, and `chat-load` spread across rooms, fanned out within rooms, and past the fsync ceiling.
@@ -393,5 +393,5 @@ Status ledger:
 | Complete | Work | 9B: Chat load test | `examples/chat/src/bin/chat-load.rs`. 1,000 rooms × 10 viewers at 100 posts/s: 30,000 of 30,000 delivered, p50 4.7 ms, p99 31.9 ms, 238 MB, 38% of a core. 10 rooms × 1,000 viewers at 50 posts/s: 1,500,000 of 1,500,000, p50 6.2 ms, p99 18.9 ms. Ceiling: 223 posts/s, the drive's fsync rate. |
 | Complete | Work | 9C: Counter throttle and memory statistics | Before the throttle, 10,000 viewers at 100 posts/s took 8.5 cores; after, 0.38. With memory statistics off, eight threads ran 421,577 chat queries/s against 52,732. `a_viewers_counters_arrive_at_most_twice_a_second` catches the planted bug "every counter change reaches every viewer"; on the single-threaded test runtime it missed it, so the test runs on two worker threads. |
 | Complete | Test | 9D: Browser reconnect | Headless Firefox through a proxy logging each connection: SIGTERM ended the first stream 3 ms later; the browser reconnected 1.0 s later with `Last-Event-ID` equal to the last result's id; the new server sent only the result for a chat posted after the restart, and the page showed it. |
-| Complete | Doc | 9E: Published numbers | `BENCHMARKS.md`; README "Performance". |
+| Complete | Doc | 9E: Published numbers | README "Performance". |
 | Complete | Gate | Full gate | `scripts/check 10000`: fmt, clippy and every test pass, 0 of 10,000 seeds failed. On the final tree, all 14 chat planted bugs are caught by the chat tests; `scripts/mutants` now holds 82. |
