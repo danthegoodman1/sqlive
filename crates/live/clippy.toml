@@ -1,0 +1,12 @@
+# Events and read sets must come out the same for the same inputs, so a
+# simulator seed replays exactly.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is random; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is random; use BTreeSet" },
+    { path = "std::time::Instant", reason = "the library reads no clock" },
+    { path = "std::time::SystemTime", reason = "the library reads no clock" },
+]
+disallowed-methods = [
+    { path = "std::thread::scope", reason = "work runs on the caller's thread" },
+    { path = "std::thread::spawn", reason = "work runs on the caller's thread" },
+]

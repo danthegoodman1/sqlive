@@ -1,0 +1,11 @@
+[package]
+name = "sqlive"
+version = "0.1.0"
+description = "Live queries for SQLite: versioned read sets and commit events"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+sqlite3-parser.workspace = true

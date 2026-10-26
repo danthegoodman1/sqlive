@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/live", "crates/sim", "examples/chat"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/danthegoodman1/sqlive"
+
+[workspace.dependencies]
+rusqlite = { version = "0.41", features = ["bundled", "hooks", "preupdate_hook"] }
+sqlite3-parser = { version = "0.17", default-features = false }
+sqlive = { path = "crates/live" }
+
+[profile.release]
+debug = 1

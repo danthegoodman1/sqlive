@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# The local gate: formatting, lints, tests, and a seed sweep.
+#
+#     scripts/check [SEEDS]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+seeds="${1:-1000}"
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --release
+cargo run --release -p sqlive-sim -- 0 --seeds "$seeds"

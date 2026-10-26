@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Plants known bugs, one at a time, in a scratch copy of the workspace and
+reports which layer catches each: the library's unit tests, the simulator's
+tests (scenarios and regression seeds), the chat example's tests, or a seed
+sweep.
+
+    scripts/mutants [--seeds N] [--only NAME]... [--check] [--no-baseline]
+
+A mutant is a list of replacements; each must match exactly once, ignoring
+whitespace, so formatting changes leave the mutants intact. The copy lives
+in target/mutants/src and shares one target directory: dependencies build
+once, and every workspace crate rebuilds for each mutant. First the
+unmutated code runs every layer, since a layer that fails without a mutant
+would claim to catch them all. A step that hangs counts as a catch, and is
+killed with every process it started. Exits non-zero if the unmutated code
+fails, or any mutant goes uncaught or fails to build.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+PRNG = "crates/sim/src/prng.rs"
+SIM = "crates/sim/src/lib.rs"
+STEP_TIMEOUT = 900
+
+MUTANTS = [
+    # Phase 0
+    (
+        "prng streams ignore their purpose",
+        [(PRNG, "Prng::new(seed ^ fnv1a(purpose.as_bytes()))", "Prng::new(seed)")],
+    ),
+    (
+        "a planted failure on every fifth seed",
+        [(SIM, "for step in 0..self.options.steps {",
+          'if self.seed % 5 == 3 { return Err(Failure { seed: self.seed, step: 0, message: "planted".into() }); }'
+          " for step in 0..self.options.steps {")],
+    ),
+]
+
+
+def main():
+    # SIGTERM unwinds like Ctrl-C, so each step's cleanup runs.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--seeds", type=int, default=300)
+    parser.add_argument("--only", action="append", help="run only this mutant; repeatable")
+    parser.add_argument("--check", action="store_true", help="only check that every mutant applies")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="skip checking that the unmutated code passes every layer")
+    args = parser.parse_args()
+
+    root = Path(__file__).resolve().parent.parent
+    work = root / "target" / "mutants"
+    copy = work / "src"
+    target = work / "target"
+    if args.only:
+        unknown = set(args.only) - {name for name, _ in MUTANTS}
+        if unknown:
+            sys.exit(f"unknown mutants: {sorted(unknown)}")
+    if args.check:
+        broken = 0
+        for name, replacements in MUTANTS:
+            if args.only and name not in args.only:
+                continue
+            for path, old, _ in replacements:
+                count = len(list(re.finditer(pattern(old), (root / path).read_text())))
+                if count != 1:
+                    print(f"{name}: {count} matches in {path}")
+                    broken += 1
+        sys.exit(1 if broken else 0)
+    # A layer that fails without a mutant would claim to catch every one.
+    if not args.no_baseline:
+        print("== baseline", flush=True)
+        fresh_copy(root, copy)
+        outcome = catch(copy, target, args.seeds)
+        if outcome != "MISSED":
+            sys.exit(f"the unmutated code fails: {outcome}")
+    results = []
+    for name, replacements in MUTANTS:
+        if args.only and name not in args.only:
+            continue
+        print(f"== {name}", flush=True)
+        fresh_copy(root, copy)
+        for path, old, new in replacements:
+            file = copy / path
+            text = file.read_text()
+            matches = list(re.finditer(pattern(old), text))
+            if len(matches) != 1:
+                sys.exit(f"{name}: expected one match in {path}, found {len(matches)}, for:\n{old}")
+            match = matches[0]
+            file.write_text(text[: match.start()] + new + text[match.end() :])
+        outcome = catch(copy, target, args.seeds)
+        print(f"   {outcome}", flush=True)
+        results.append((name, outcome))
+
+    print()
+    width = max((len(name) for name, _ in results), default=0)
+    for name, outcome in results:
+        print(f"{name:<{width}}  {outcome}")
+    caught = sum(1 for _, outcome in results if outcome.startswith("caught"))
+    print(f"{caught} of {len(results)} caught")
+    if any(not outcome.startswith("caught") for _, outcome in results):
+        sys.exit(1)
+
+
+def fresh_copy(root, copy):
+    """Copies the tree to `copy`. Fresh modification times make cargo
+    rebuild every workspace crate, so no crate keeps an earlier build."""
+    if copy.exists():
+        shutil.rmtree(copy)
+    shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target", ".git", "*.db*"),
+                    copy_function=shutil.copy)
+
+
+def pattern(old):
+    """A regex for `old` that ignores whitespace."""
+    return r"\s*".join(re.escape(char) for char in old if not char.isspace())
+
+
+def catch(copy, target, seeds):
+    """Which layer catches the mutant, or MISSED."""
+    env = {"CARGO_TARGET_DIR": str(target)}
+    build = run(copy, env, ["cargo", "build", "-q", "--release", "--workspace", "--tests", "--bins"])
+    if build is None or build.returncode != 0:
+        print(build.stderr[-2000:] if build else "build timed out")
+        return "did not build"
+    layers = [
+        ("library unit tests", ["cargo", "test", "-q", "--release", "-p", "sqlive"]),
+        ("sim tests", ["cargo", "test", "-q", "--release", "-p", "sqlive-sim"]),
+        ("chat tests", ["cargo", "test", "-q", "--release", "-p", "chat-example"]),
+        ("seeds", ["cargo", "run", "-q", "--release", "-p", "sqlive-sim", "--", "0",
+                   "--seeds", str(seeds)]),
+    ]
+    for layer, command in layers:
+        result = run(copy, env, command)
+        if result is None:
+            return f"caught by {layer} (hung)"
+        if result.returncode != 0:
+            if os.environ.get("MUTANTS_VERBOSE"):
+                print(result.stdout[-3000:], result.stderr[-3000:])
+            summary = next((line for line in result.stdout.splitlines() if " seeds from " in line), "")
+            return f"caught by {layer}" + (f" ({summary})" if summary else "")
+    return "MISSED"
+
+
+def run(cwd, env, command):
+    """The finished process, or None if it ran past the step timeout. The
+    step runs in its own process group, which is killed however the step
+    ends, so a hung test binary never outlives it."""
+    process = subprocess.Popen(command, cwd=cwd, env={**os.environ, **env},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=STEP_TIMEOUT)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+if __name__ == "__main__":
+    main()

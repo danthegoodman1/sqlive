@@ -31,20 +31,18 @@ Non-goals until a phase names them: writers in other processes, ATTACHed databas
 ## Phase 0: Scaffold
 
 Goal:
-A workspace with the library crate, a simulator with seed tooling, and a local check gate.
+A workspace with the library crate, a simulator with seed tooling, a local check gate, and CI.
 
 Scope:
 - 0A Git repository and Cargo workspace: `crates/live` (`sqlive`), `crates/sim` (`sqlive-sim`), `examples/chat` (`chat-example`). rusqlite with `bundled`, `hooks` and `preupdate_hook`.
 - 0B `clippy.toml` in `crates/live` and `crates/sim` banning `HashMap`, `HashSet`, `std::time` and `std::thread`. The sweep runner opts out with `#[expect]`.
-- 0C Simulator PRNG (xoshiro256** seeded through SplitMix64, with `Prng::stream(seed, purpose)`), plus the driver CLI: `[SEED | COMMIT] [--seeds N]`, a parallel sweep, `SIM_TRACE`, a replay line on failure, and a trace hash.
-- 0D `scripts/check` (fmt, clippy `-D warnings`, tests, 1,000-seed sweep) and `scripts/mutants`.
+- 0C Simulator PRNG (xoshiro256** seeded through SplitMix64, with `Prng::stream(seed, purpose)`), plus the driver CLI: `[SEED | COMMIT] [--seeds N]`, a parallel sweep, `SIM_TRACE`, a replay line on failure, and a trace digest.
+- 0D `scripts/check` (fmt, clippy `-D warnings`, tests, seed sweep) and `scripts/mutants`.
 - 0E `CLAUDE.md` with the core rules and commands.
-
-Out of scope:
-- Hosted CI, which needs a remote.
+- 0F GitHub Actions CI: fmt, clippy, tests, a run seeded by the commit hash, and a 1,000-seed sweep.
 
 Completion gate:
-`scripts/check` passes, and `scripts/mutants` catches the Phase 0 planted bugs.
+`scripts/check` passes, `scripts/mutants` catches the Phase 0 planted bugs, and CI passes on `main`.
 
 Testing plan:
 - PRNG unit tests: fixed outputs for fixed seeds; drawing from one stream leaves another unchanged.
@@ -54,14 +52,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 0A: Git repository and workspace | Missing: `Cargo.toml`, the three crate manifests, first commit. |
-| Incomplete | Work | 0B: Clippy bans | Missing: `crates/live/clippy.toml`, `crates/sim/clippy.toml`; a clippy run rejecting a planted `HashMap`. |
-| Incomplete | Work | 0C: PRNG and driver CLI | Missing: `crates/sim/src/prng.rs`, `crates/sim/src/main.rs`, sweep output. |
-| Incomplete | Work | 0D: `scripts/check` and `scripts/mutants` | Missing: both scripts and a passing run. |
-| Incomplete | Work | 0E: `CLAUDE.md` | Missing: file. |
-| Incomplete | Test | PRNG fixed-output and stream-independence tests | Missing: tests in `crates/sim/src/prng.rs`. |
-| Incomplete | Test | Planted failing property caught by the sweep | Missing: `scripts/mutants` report. |
-| Incomplete | Gate | `scripts/check` passes | Missing: run output. |
+| Complete | Work | 0A: Git repository and workspace | `Cargo.toml`, `crates/live/Cargo.toml`, `crates/sim/Cargo.toml`, `examples/chat/Cargo.toml`; rusqlite 0.41 bundles SQLite 3.54.1. |
+| Complete | Work | 0B: Clippy bans | `crates/live/clippy.toml`, `crates/sim/clippy.toml`; a planted `HashMap` in `crates/live/src/lib.rs` fails `cargo clippy -p sqlive -- -D warnings` with "use of a disallowed type". |
+| Complete | Work | 0C: PRNG and driver CLI | `crates/sim/src/prng.rs`, `crates/sim/src/main.rs`, `crates/sim/src/trace.rs`; `parse_seed` accepts decimal seeds and commit hashes (`seeds_parse_from_decimal_and_commit_hashes`). |
+| Complete | Work | 0D: `scripts/check` and `scripts/mutants` | `scripts/check 200` passes; `scripts/mutants --seeds 100`: 2 of 2 caught. |
+| Complete | Work | 0E: `CLAUDE.md` | `CLAUDE.md`. |
+| In Progress | Work | 0F: CI | `.github/workflows/ci.yml`. Needs: a passing run on `main`. |
+| Complete | Test | PRNG fixed-output and stream-independence tests | `a_seed_always_draws_the_same_numbers`, `streams_with_different_purposes_differ`, `drawing_from_one_stream_leaves_another_unchanged`, `below_stays_in_bounds`. |
+| Complete | Test | Planted failing property caught by the sweep | Mutant "a planted failure on every fifth seed": caught by `crates/sim/tests/seeds.rs`; in the mutated copy, `--seeds 10` prints "2 of 10 seeds from 0 failed" with replay lines for seeds 3 and 8 and exits 1. |
+| Complete | Gate | `scripts/check` passes | `scripts/check 200`: fmt, clippy, tests, "0 of 200 seeds from 0 failed". |
 
 ## Phase 1: Simulated VFS
 
