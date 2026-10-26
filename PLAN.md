@@ -277,7 +277,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 6A: Index API | `crates/live/src/index.rs`; `affected_matches_testing_every_read_set` (2,000 steps of inserts, replacements, removals and writes) in `crates/live/tests/index.rs`. |
 | Complete | Work | 6B: Equality, bound and table-level structures | `ColumnIndex` and `places` in `crates/live/src/index.rs`; `affected_covers_missing_columns_lossy_text_and_every_commit`. |
-| Complete | Work | 6C: Benchmark | `crates/bench/src/main.rs` (`cargo run --release -p sqlive-bench`); README "Performance": 103,029 events/s with the index, 35 without. |
+| Complete | Work | 6C: Benchmark | `crates/bench/src/main.rs` (`cargo run --release -p sqlive-bench`); README "Performance": 100,682 events/s with the index, 35 without. |
 | Complete | Test | Index matches brute force | `Live::check_index` and `Live::sync_index` in `crates/sim/src/live/mod.rs` check each event before subscriptions process it, against the harness's own copies of the read sets. Live seeds 0–299: 37,346 events checked, 94,421 read sets found. |
 | Complete | Test | Phase 6 planted bugs | `scripts/mutants --layers unit,sim,seeds`: 55 of 55 caught, 5 of them Phase 6; with `--layers sim,seeds`, the simulator alone catches all 5. |
 | Complete | Gate | 10,000-seed sweep | `cargo run --release -p sqlive-sim -- 0 --seeds 10000` (storage and live): 0 of 10,000 failed. |
