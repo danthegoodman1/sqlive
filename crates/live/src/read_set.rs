@@ -145,6 +145,12 @@ impl ReadSet {
         self.version
     }
 
+    /// Whether every commit after the version intersects, as when the query
+    /// reads SqLive's version table or one of SQLite's internal tables.
+    pub fn every_commit(&self) -> bool {
+        self.every_commit
+    }
+
     pub fn tables(&self) -> impl Iterator<Item = &TableRead> {
         self.tables.values()
     }

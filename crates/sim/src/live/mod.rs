@@ -16,7 +16,9 @@
 //!   processed every event, whether it processes them at once or late and
 //!   out of order, and whether it started from a snapshot held across
 //!   writes;
-//! - a snapshot held across writes returns the rows of its version.
+//! - a snapshot held across writes returns the rows of its version;
+//! - an index of every subscription's read set finds, for each event,
+//!   exactly the read sets that intersect it.
 //!
 //! The oracle, a plain read-only connection, reads with fault injection
 //! suspended, so the checks themselves never fail on an injected error.
@@ -35,7 +37,8 @@ use crate::vfs::{FaultConfig, IoStats, SimVfs};
 use replica::{Dump, Replica, difference};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use schema::SchemaSpec;
-use sqlive::{LiveDb, Options, Version};
+use sqlive::{Changes, LiveDb, Options, ReadSetIndex, Version};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,6 +111,10 @@ pub struct LiveSummary {
     pub subscriptions: Tally,
     pub subscription_checks: u64,
     pub snapshot_checks: u64,
+    /// Events whose affected read sets the index found.
+    pub index_checks: u64,
+    /// Read sets the index found across those events.
+    pub index_hits: u64,
     pub io: IoStats,
     pub digest: u64,
 }
@@ -119,7 +126,7 @@ impl fmt::Display for LiveSummary {
             "{} writes ({} failed), {} statements ({} failed), {} events with {} changes ({} schema), \
              {} lags, {} rebuilds, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
              {} rolled back, \
-             {} subscription checks, {} queries ({} constrained, {} windowed), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, \
+             {} subscription checks, {} queries ({} constrained, {} windowed), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, {} index checks ({} hits), \
              I/O errors: {} read {} write {} sync {} busy, digest {:016x}",
             self.writes,
             self.failed_writes,
@@ -149,6 +156,8 @@ impl fmt::Display for LiveSummary {
             self.subscriptions.failed_queries,
             self.subscriptions.ended,
             self.snapshot_checks,
+            self.index_checks,
+            self.index_hits,
             self.io.read_errors,
             self.io.write_errors,
             self.io.sync_errors,
@@ -185,6 +194,13 @@ struct Live {
     replicas: Vec<Replica>,
     subscriptions: Vec<Subscription>,
     next_subscription: u64,
+    /// Every held read set, by subscription id.
+    index: ReadSetIndex<u64>,
+    /// The harness's own copy of each indexed read set, which the index's
+    /// answers are checked against.
+    indexed: BTreeMap<u64, sqlive::ReadSet>,
+    /// Every event, for checking the index.
+    index_stream: Option<Changes>,
     oracle: Option<Connection>,
     /// A second read-only connection, which holds a read transaction beside
     /// a snapshot.
@@ -220,6 +236,9 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         replicas: vec![Replica::new("eager"), Replica::new("lazy")],
         subscriptions: Vec::new(),
         next_subscription: 0,
+        index: ReadSetIndex::new(),
+        indexed: BTreeMap::new(),
+        index_stream: None,
         oracle: None,
         witness: None,
         db: None,
@@ -279,6 +298,7 @@ impl Live {
         };
         self.oracle = Some(reader()?);
         self.witness = Some(reader()?);
+        self.index_stream = Some(db.changes().map_err(|e| format!("index stream: {e}"))?);
         self.db = Some(Arc::new(db));
         Ok(())
     }
@@ -483,6 +503,7 @@ impl Live {
     /// subscription processes everything and must catch up.
     fn follow(&mut self, settle: bool) -> Result<(), String> {
         let db = self.db.clone().expect("open");
+        self.check_index(&db)?;
         for subscription in &mut self.subscriptions {
             let process = settle
                 || subscription.kind == Kind::Eager
@@ -494,6 +515,7 @@ impl Live {
                 &mut self.summary.subscriptions,
             )?;
         }
+        self.sync_index();
         let latest = db.version();
         let oracle = self.oracle.as_ref().expect("open");
         let subscriptions = &self.subscriptions;
@@ -546,6 +568,68 @@ impl Live {
             self.summary.subscription_checks += 1;
         }
         Ok(())
+    }
+
+    /// Checks every event since the last check against the index: it must
+    /// find exactly the read sets, as last indexed, that the event
+    /// intersects. Runs before subscriptions process the events, while their
+    /// read sets still predate them.
+    fn check_index(&mut self, db: &LiveDb) -> Result<(), String> {
+        let stream = self.index_stream.as_mut().expect("open");
+        while let Some(item) = stream.try_next() {
+            let event = match item {
+                Ok(event) => event,
+                Err(sqlive::Error::Lagged { .. }) => {
+                    *stream = db.changes().map_err(|e| format!("index stream: {e}"))?;
+                    break;
+                }
+                Err(e) => return Err(format!("index stream: {e}")),
+            };
+            let found: Vec<u64> = self.index.affected(&event).collect();
+            let expected: Vec<u64> = self
+                .indexed
+                .iter()
+                .filter(|(_, read_set)| read_set.intersects(&event))
+                .map(|(id, _)| *id)
+                .collect();
+            if found != expected {
+                return Err(format!(
+                    "the index found {found:?} for event {}, but {expected:?} intersect it: {event:?}",
+                    event.version
+                ));
+            }
+            self.summary.index_checks += 1;
+            self.summary.index_hits += found.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Indexes each subscription's held read set, replacing older ones and
+    /// removing those no subscription holds.
+    fn sync_index(&mut self) {
+        let mut held: BTreeMap<u64, &sqlive::ReadSet> = BTreeMap::new();
+        for subscription in &self.subscriptions {
+            if let Some(h) = &subscription.held {
+                held.insert(subscription.id, &h.read_set);
+            }
+        }
+        let gone: Vec<u64> = self
+            .indexed
+            .keys()
+            .filter(|id| !held.contains_key(id))
+            .copied()
+            .collect();
+        for id in gone {
+            self.indexed.remove(&id);
+            self.index.remove(&id);
+        }
+        // A newer read set replaces the indexed one in place.
+        for (id, read_set) in held {
+            if self.indexed.get(&id).map(sqlive::ReadSet::version) != Some(read_set.version()) {
+                self.index.insert(id, read_set.clone());
+                self.indexed.insert(id, read_set.clone());
+            }
+        }
     }
 
     /// With faults off, brings every subscription up to date and checks it.

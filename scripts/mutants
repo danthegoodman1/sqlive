@@ -37,6 +37,7 @@ READ = "crates/live/src/read.rs"
 READ_SET = "crates/live/src/read_set.rs"
 CONSTRAINTS = "crates/live/src/constraints.rs"
 COMPARE = "crates/live/src/compare.rs"
+INDEX = "crates/live/src/index.rs"
 
 STEP_TIMEOUT = 900
 
@@ -266,6 +267,29 @@ MUTANTS = [
     (
         "a flipped comparison keeps its operator",
         [(CONSTRAINTS, "let op = if flipped { flip(*op)? } else { *op };", "let op = *op;")],
+    ),
+    # Phase 6
+    (
+        "index equality keys skip NOCASE folding",
+        [(INDEX, "self.equal.get(&eq_key(ValueRef::from(value), collation))",
+          "self.equal.get(&eq_key(ValueRef::from(value), &Collation::Binary))")],
+    ),
+    (
+        "index lower bounds are exclusive",
+        [(INDEX, "self.from.range(..=&ordered)", "self.from.range(..&ordered)")],
+    ),
+    (
+        "insert keeps the read set it replaces",
+        [(INDEX, "self.remove(&key); if read_set.every_commit() {",
+          "if self.entries.contains_key(&key) { return; } if read_set.every_commit() {")],
+    ),
+    (
+        "a row without an indexed column finds nothing",
+        [(INDEX, "found.extend(self.equal.values().flatten());", "return;")],
+    ),
+    (
+        "a window with NULLs first misses NULL rows",
+        [(INDEX, "window.push(Place::Null(column(constraint)));", "")],
     ),
 ]
 

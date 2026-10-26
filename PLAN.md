@@ -257,8 +257,8 @@ Goal:
 `ReadSetIndex<K>` returns the subscriptions an event affects without testing each one.
 
 Scope:
-- 6A `insert` (which replaces), `remove`, `affected(&event)`.
-- 6B Structure: equality maps keyed by (table, column, comparison key normalized for collation and affinity); interval maps for ranges and window bounds; a table-level bucket. `schema_changed` returns every key.
+- 6A `insert` (which replaces), `remove`, `get`, `len`, `affected(&event)`.
+- 6B Structure: each conjunction registers under one anchor constraint. Equalities go in maps keyed by SQLite's equality key under their collation; lower and upper bounds, window bounds included, go in maps ordered by SQLite's comparison; everything else goes in a per-table bucket. A row without an indexed column, or with lossy text, reaches every condition on it. Every candidate is checked with `intersects`, and `schema_changed` returns every key. Each key records its registrations, so removal touches only its own.
 - 6C Benchmark: 100,000 subscriptions over 10,000 rooms, recording events per second in `BENCHMARKS.md`.
 
 Out of scope:
@@ -268,20 +268,20 @@ Completion gate:
 The differential property holds over a 10,000-seed sweep; the benchmark is recorded; `scripts/mutants` catches every Phase 6 planted bug; `/code-review` findings are resolved.
 
 Testing plan:
-- Property: for every event, `affected` equals the set of keys whose read set `intersects` it.
-- Planted bugs: equality keys without `NOCASE` folding; exclusive interval endpoints; `insert` that drops the replacement read set.
+- Property: for every event, `affected` equals the set of keys whose read set `intersects` it, in a unit test with random read sets and in the simulator over every subscription.
+- Planted bugs: equality keys without `NOCASE` folding; exclusive interval endpoints; `insert` that keeps the read set it replaces; a row without an indexed column finding nothing; a `NULLS FIRST` window missing `NULL` rows.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 6A: Index API | Missing: `crates/live/src/index.rs`; unit tests. |
-| Incomplete | Work | 6B: Equality, interval and table-level structures | Missing: implementation; unit tests. |
-| Incomplete | Work | 6C: Benchmark | Missing: bench target and `BENCHMARKS.md` entry. |
-| Incomplete | Test | Index matches brute force | Missing: simulator property and seed tests. |
-| Incomplete | Test | Phase 6 planted bugs | Missing: `scripts/mutants` report, 3 of 3 caught. |
-| Incomplete | Gate | 10,000-seed sweep | Missing: sweep output. |
-| Incomplete | Gate | Code review | Missing: `/code-review` findings and resolutions. |
+| Complete | Work | 6A: Index API | `crates/live/src/index.rs`; `affected_matches_testing_every_read_set` (2,000 steps of inserts, replacements, removals and writes) in `crates/live/tests/index.rs`. |
+| Complete | Work | 6B: Equality, bound and table-level structures | `ColumnIndex` and `places` in `crates/live/src/index.rs`; `affected_covers_missing_columns_lossy_text_and_every_commit`. |
+| Complete | Work | 6C: Benchmark | `crates/bench/src/main.rs` (`cargo run --release -p sqlive-bench`); `BENCHMARKS.md`: 103,029 events/s with the index, 35 without. |
+| Complete | Test | Index matches brute force | `Live::check_index` and `Live::sync_index` in `crates/sim/src/live/mod.rs` check each event before subscriptions process it, against the harness's own copies of the read sets. Live seeds 0–299: 37,346 events checked, 94,421 read sets found. |
+| Complete | Test | Phase 6 planted bugs | `scripts/mutants --layers unit,sim,seeds`: 55 of 55 caught, 5 of them Phase 6; with `--layers sim,seeds`, the simulator alone catches all 5. |
+| Complete | Gate | 10,000-seed sweep | `cargo run --release -p sqlive-sim -- 0 --seeds 10000` (storage and live): 0 of 10,000 failed. |
+| Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved: the simulator checks each event before subscriptions re-run and compares with its own copies of the read sets, so it catches all five planted bugs; stream errors other than lag fail the run; the README tells custom indexes to check `ReadSet::every_commit()`; a read set that registers nowhere leaves no empty table entry; the anchor doc matches the code, which prefers an equality on a value over `IS NULL`; the module doc notes that two-sided ranges register under their lower bound; the collation lives in the column key alone; the benchmark moved to `crates/bench`, so `crates/live` reads no clocks. |
 
 ## Phase 7: Live Chat Example
 

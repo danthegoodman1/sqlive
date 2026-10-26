@@ -190,10 +190,12 @@ for event in db.changes()? {
 }
 ```
 
-To build your own index, read each table's `filter()` from `ReadSet::tables()`: either
-`Filter::All` or `Filter::AnyOf` conjunctions of `Constraint { column, collation,
-condition }`. `Constraint::matches(row)` applies SQLite's comparison rules (storage
-class, collation, `NULL` handling) for you.
+To build your own index, first check `ReadSet::every_commit()`: a read set that reads
+`_sqlive_meta` or one of SQLite's internal tables intersects every commit. Then read
+each table's `filter()` from `ReadSet::tables()`: either `Filter::All` or
+`Filter::AnyOf` conjunctions of `Constraint { column, collation, condition }`.
+`Constraint::matches(row)` applies SQLite's comparison rules (storage class,
+collation, `NULL` handling) for you.
 
 ## Guarantees
 
