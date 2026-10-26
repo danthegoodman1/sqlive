@@ -39,6 +39,11 @@ db.write(|tx| {
 })?;
 ```
 
+`LiveDb::open_with(path, Options { .. })` sets the VFS, the number of pooled read
+connections (`readers`), how many events the log retains (`log_capacity`), the busy
+timeout, and the WAL checkpoint threshold (`checkpoint_pages`). SqLive puts the database
+in WAL mode with `synchronous = FULL` and keeps its version in a `_sqlive_meta` table.
+
 ## Write
 
 `write` runs your closure inside a SQLite transaction and returns the closure's value
@@ -61,6 +66,9 @@ let (todo_id, version) = db.write(|tx| {
 - Writes serialize on one writer connection. Keep closures short; they hold the write
   lock.
 - Run `VACUUM` through `db.vacuum()`, since SQLite runs it outside a transaction.
+- A closure may not touch `_sqlive_meta`, attach databases, or change `journal_mode`,
+  `synchronous`, `locking_mode` or `query_only`.
+- `db.version()` is the latest published version.
 
 ## Query
 
@@ -89,7 +97,9 @@ Queries run on read-only connections, concurrently with writes (WAL mode).
 
 `changes_since(v)` yields every commit event after version `v`, starting with events
 already in the retained log. Commits that land between your query and your
-subscription are therefore included.
+subscription are therefore included. Iterating blocks until the next commit and ends
+when the database closes; `try_next()` returns at once. A `v` that has not committed
+yet is an `Error::FutureVersion`.
 
 ```rust
 let mut current = db.query(SQL, [5], to_todo)?;
@@ -116,8 +126,8 @@ CommitEvent {
     version: 1043,
     schema_changed: false,
     changes: [
-        RowChange { table: "todos", op: Insert, old: None,
-                    new: Some({id: 519, list_id: 5, title: "Buy milk", done: 0}) },
+        RowChange { table: "todos", op: Insert, rowid: Some(519), old: None,
+                    new: Some({id: 519, list_id: 5, title: 'Buy milk', done: 0}) },
     ],
 }
 ```
@@ -153,8 +163,12 @@ index then owns SQLite's comparison rules (affinity, collation, NULL handling).
 - **Conservative:** `intersects` returns false only when a change cannot affect the
   result. It may return true for a change that leaves the result the same.
 - **Durable:** a published event's transaction survives a crash.
-- **Schema:** DDL and `db.vacuum()` set `schema_changed`, and `intersects` returns true
-  for every read set.
+- **Schema:** DDL and `db.vacuum()` set `schema_changed` and leave `changes` empty;
+  reload what you hold. `intersects` returns true for every read set.
+- **Rows:** a `RowChange` carries the row's stored columns, before and after, plus its
+  rowid (`None` for a `WITHOUT ROWID` table, whose key identifies it). `VIRTUAL`
+  generated columns are left out. Text that is not valid UTF-8 appears lossily
+  converted, though changes to it are still detected exactly.
 - **Restarts:** the retained log lives in memory. After a restart, `changes_since(v)`
   for any `v` below the current version yields `Lagged`.
 - **Scope:** SqLive sees writes made through `write` on this `LiveDb`. Route every

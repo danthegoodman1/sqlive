@@ -28,6 +28,11 @@ from pathlib import Path
 PRNG = "crates/sim/src/prng.rs"
 VFS = "crates/sim/src/vfs.rs"
 STORAGE = "crates/sim/src/storage.rs"
+CAPTURE = "crates/live/src/capture.rs"
+LOG = "crates/live/src/log.rs"
+DB = "crates/live/src/db.rs"
+SCHEMA = "crates/live/src/schema.rs"
+
 STEP_TIMEOUT = 900
 
 MUTANTS = [
@@ -59,6 +64,57 @@ MUTANTS = [
         "crash decisions differ between runs of a seed",
         [(VFS, 'crash_prng: Prng::stream(seed, "vfs crashes"),', 'crash_prng: Prng::stream(seed ^ n, "vfs crashes"),')],
     ),
+    # Phase 2
+    (
+        "deletes from triggers and cascades go unrecorded",
+        [(CAPTURE, "let Some(info) = schema.table(table).cloned() else {",
+          "if let PreUpdateCase::Delete(old) = case { if old.get_query_depth() > 0 { return; } } "
+          "let Some(info) = schema.table(table).cloned() else {")],
+    ),
+        (
+        "primary keys compare without their collation",
+        [(CAPTURE, ".map(|(value, collation)| eq_key(value.as_ref(), collation))",
+          ".map(|(value, _)| eq_key(value.as_ref(), &crate::compare::Collation::Binary))")],
+    ),
+    (
+        "read-back ignores the key's collation",
+        [(SCHEMA, "quote(collation.name())", 'quote("BINARY")')],
+    ),
+    (
+        "shadow tables are left out of the schema",
+        [(SCHEMA, "type IN ('table', 'shadow')", "type = 'table'")],
+    ),
+    (
+        "a schema moved outside a write goes unflagged",
+        [(DB, "force_schema_changed || moved_outside ||", "force_schema_changed ||")],
+    ),
+    (
+        "the version table accepts triggers",
+        [(DB, "| AuthAction::CreateTrigger { table_name, .. }", "")],
+    ),
+    (
+        "every touch is recorded, not only the first",
+        [(CAPTURE, "if self.seen.insert((table.name.to_ascii_lowercase(), identity)) {",
+          "if { self.seen.insert((table.name.to_ascii_lowercase(), identity)); true } {")],
+    ),
+    (
+        "a schema change goes unflagged",
+        [(DB, "force_schema_changed || moved_outside || schema_version(&tx)? != before;",
+          "force_schema_changed || moved_outside;")],
+    ),
+    (
+        "net changes compare reals by value, so 0.0 equals -0.0",
+        [(CAPTURE, "(Raw::Real(a), Raw::Real(b)) => a.to_bits() == b.to_bits(),",
+          "(Raw::Real(a), Raw::Real(b)) => a == b,")],
+    ),
+    (
+        "changes_since resumes one event late",
+        [(LOG, "next: since + 1,", "next: since + 2,")],
+    ),
+    (
+        "a stream behind the log does not lag",
+        [(LOG, "if state.epoch != self.epoch || self.next <= state.base {", "if state.epoch != self.epoch {")],
+    ),
 ]
 
 
@@ -71,8 +127,13 @@ def main():
     parser.add_argument("--check", action="store_true", help="only check that every mutant applies")
     parser.add_argument("--no-baseline", action="store_true",
                         help="skip checking that the unmutated code passes every layer")
+    parser.add_argument("--layers", default="unit,sim,chat,seeds",
+                        help="comma-separated layers to run: unit, sim, chat, seeds")
     args = parser.parse_args()
 
+    unknown_layers = set(args.layers.split(",")) - {"unit", "sim", "chat", "seeds"}
+    if unknown_layers:
+        sys.exit(f"unknown layers: {sorted(unknown_layers)}")
     root = Path(__file__).resolve().parent.parent
     work = root / "target" / "mutants"
     copy = work / "src"
@@ -96,7 +157,7 @@ def main():
     if not args.no_baseline:
         print("== baseline", flush=True)
         fresh_copy(root, copy)
-        outcome = catch(copy, target, args.seeds)
+        outcome = catch(copy, target, args.seeds, args.layers)
         if outcome != "MISSED":
             sys.exit(f"the unmutated code fails: {outcome}")
     results = []
@@ -113,7 +174,7 @@ def main():
                 sys.exit(f"{name}: expected one match in {path}, found {len(matches)}, for:\n{old}")
             match = matches[0]
             file.write_text(text[: match.start()] + new + text[match.end() :])
-        outcome = catch(copy, target, args.seeds)
+        outcome = catch(copy, target, args.seeds, args.layers)
         print(f"   {outcome}", flush=True)
         results.append((name, outcome))
 
@@ -141,21 +202,24 @@ def pattern(old):
     return r"\s*".join(re.escape(char) for char in old if not char.isspace())
 
 
-def catch(copy, target, seeds):
-    """Which layer catches the mutant, or MISSED."""
+def catch(copy, target, seeds, chosen):
+    """Which of the chosen layers catches the mutant, or MISSED."""
     env = {"CARGO_TARGET_DIR": str(target)}
     build = run(copy, env, ["cargo", "build", "-q", "--release", "--workspace", "--tests", "--bins"])
     if build is None or build.returncode != 0:
         print(build.stderr[-2000:] if build else "build timed out")
         return "did not build"
     layers = [
-        ("library unit tests", ["cargo", "test", "-q", "--release", "-p", "sqlive"]),
-        ("sim tests", ["cargo", "test", "-q", "--release", "-p", "sqlive-sim"]),
-        ("chat tests", ["cargo", "test", "-q", "--release", "-p", "chat-example"]),
-        ("seeds", ["cargo", "run", "-q", "--release", "-p", "sqlive-sim", "--", "0",
-                   "--seeds", str(seeds)]),
+        ("unit", "library unit tests", ["cargo", "test", "-q", "--release", "-p", "sqlive"]),
+        ("sim", "sim tests", ["cargo", "test", "-q", "--release", "-p", "sqlive-sim"]),
+        ("chat", "chat tests", ["cargo", "test", "-q", "--release", "-p", "chat-example"]),
+        ("seeds", "seeds", ["cargo", "run", "-q", "--release", "-p", "sqlive-sim", "--", "0",
+                            "--seeds", str(seeds)]),
     ]
-    for layer, command in layers:
+    chosen = set(chosen.split(","))
+    for key, layer, command in layers:
+        if key not in chosen:
+            continue
         result = run(copy, env, command)
         if result is None:
             return f"caught by {layer} (hung)"

@@ -2,6 +2,7 @@
 //! workload, the faults, and the crash points; the run checks every answer
 //! against SQLite itself.
 
+pub mod live;
 pub mod prng;
 pub mod storage;
 pub mod trace;
@@ -14,25 +15,39 @@ use std::fmt;
 pub enum Harness {
     /// Plain SQLite on the simulated VFS, checked against a row model.
     Storage,
+    /// SqLive on the simulated VFS, checked against SQLite itself.
+    Live,
 }
 
+impl Harness {
+    pub const ALL: [Harness; 2] = [Harness::Storage, Harness::Live];
+
+    pub fn parse(name: &str) -> Option<Harness> {
+        match name {
+            "storage" => Some(Harness::Storage),
+            "live" => Some(Harness::Live),
+            _ => None,
+        }
+    }
+}
+
+/// Runs one seed through each chosen harness.
 pub struct Simulator {
     seed: u64,
-    harness: Harness,
+    harnesses: Vec<Harness>,
     verbose: bool,
 }
 
 #[derive(Debug)]
 pub struct Summary {
     pub seed: u64,
-    pub harness: Harness,
     pub text: String,
     pub digest: u64,
 }
 
 impl fmt::Display for Summary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "seed {} ({:?}): {}", self.seed, self.harness, self.text)
+        write!(f, "seed {}: {}", self.seed, self.text)
     }
 }
 
@@ -54,16 +69,18 @@ impl fmt::Display for Failure {
 }
 
 impl Simulator {
+    /// Runs every harness.
     pub fn from_seed(seed: u64) -> Simulator {
         Simulator {
             seed,
-            harness: Harness::Storage,
+            harnesses: Harness::ALL.to_vec(),
             verbose: false,
         }
     }
 
+    /// Runs only `harness`.
     pub fn harness(mut self, harness: Harness) -> Simulator {
-        self.harness = harness;
+        self.harnesses = vec![harness];
         self
     }
 
@@ -74,37 +91,51 @@ impl Simulator {
     }
 
     pub fn options(&self) -> String {
-        match self.harness {
-            Harness::Storage => format!("{:?}", storage::StorageOptions::from_seed(self.seed)),
-        }
+        self.harnesses
+            .iter()
+            .map(|harness| match harness {
+                Harness::Storage => format!("{:?}", storage::StorageOptions::from_seed(self.seed)),
+                Harness::Live => format!("{:?}", live::LiveOptions::from_seed(self.seed)),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn run(self) -> Result<Summary, Failure> {
         vfs::configure_sqlite();
-        // SAFETY: reseeds SQLite's PRNG, which picks WAL salts, so the run
-        // replays byte for byte; no connection is passed.
-        unsafe {
-            rusqlite::ffi::sqlite3_test_control(
-                rusqlite::ffi::SQLITE_TESTCTRL_PRNG_SEED,
-                self.seed as std::ffi::c_int,
-                std::ptr::null_mut::<rusqlite::ffi::sqlite3>(),
-            );
+        let mut texts = Vec::new();
+        let mut digest = 0u64;
+        for &harness in &self.harnesses {
+            // SAFETY: reseeds SQLite's PRNG, which picks WAL salts, so the
+            // run replays byte for byte; no connection is passed.
+            unsafe {
+                rusqlite::ffi::sqlite3_test_control(
+                    rusqlite::ffi::SQLITE_TESTCTRL_PRNG_SEED,
+                    self.seed as std::ffi::c_int,
+                    std::ptr::null_mut::<rusqlite::ffi::sqlite3>(),
+                );
+            }
+            let failure = |message| Failure {
+                seed: self.seed,
+                harness,
+                message,
+            };
+            let (text, run_digest) = match harness {
+                Harness::Storage => storage::run(self.seed, self.verbose)
+                    .map(|s| (s.to_string(), s.digest))
+                    .map_err(failure)?,
+                Harness::Live => live::run(self.seed, self.verbose)
+                    .map(|s| (s.to_string(), s.digest))
+                    .map_err(failure)?,
+            };
+            texts.push(format!("{harness:?}: {text}"));
+            digest = digest.rotate_left(7) ^ run_digest;
         }
-        let failure = |message| Failure {
+        Ok(Summary {
             seed: self.seed,
-            harness: self.harness,
-            message,
-        };
-        match self.harness {
-            Harness::Storage => storage::run(self.seed, self.verbose)
-                .map(|summary| Summary {
-                    seed: self.seed,
-                    harness: self.harness,
-                    text: summary.to_string(),
-                    digest: summary.digest,
-                })
-                .map_err(failure),
-        }
+            text: texts.join("; "),
+            digest,
+        })
     }
 }
 

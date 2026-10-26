@@ -102,41 +102,42 @@ Goal:
 Every successful `write` publishes one versioned event with net row changes. A replica built only from events matches the database.
 
 Scope:
-- 2A `LiveDb::open` and `open_with(Options { vfs, readers, log_capacity })`: WAL, `synchronous=FULL`, `foreign_keys=ON`, and a `_live_meta` version row.
-- 2B `write`: `BEGIN IMMEDIATE`, the closure, version bump, read-back, `COMMIT`, publish. An authorizer on the writer denies `BEGIN`, `COMMIT` and `ROLLBACK` inside the closure and allows savepoints. An `Err` or a failed statement rolls back and publishes nothing.
-- 2C Capture: the preupdate hook records touched rows (table, key, first old value) in first-touch order and skips `_live_meta`.
-- 2D Net changes: read back each touched key's current row and emit Insert, Update, Delete or nothing.
-- 2E Schema events: a `PRAGMA schema_version` change across the closure sets `schema_changed`; `db.vacuum()` publishes `schema_changed`.
-- 2F Retained log: `changes()` and `changes_since(v)`, as a blocking iterator plus `try_next`, with bounded capacity and `Lagged`.
-- 2G Simulator workloads. Schemas: rowid tables with and without `INTEGER PRIMARY KEY`, composite keys, `WITHOUT ROWID`, `STRICT`, generated columns, declared affinities and collations. Operations: triggers, FK cascades, `REPLACE` and upserts, `INSERT OR IGNORE`, savepoints with `ROLLBACK TO`, failing statements, closures returning `Err`, DDL, and `vacuum`.
+- 2A `LiveDb::open` and `open_with(Options { vfs, readers, log_capacity, busy_timeout, checkpoint_pages })`: WAL, `synchronous=FULL`, `foreign_keys=ON`, and a `_sqlive_meta` version row.
+- 2B `write`: `BEGIN IMMEDIATE`, the closure, version bump, read-back, `COMMIT`, publish. An authorizer on the writer denies `BEGIN`, `COMMIT`, `ROLLBACK`, `ATTACH`, durability pragmas, and any write, trigger, index or `ALTER` on `_sqlive_meta` inside the closure, and allows savepoints. An `Err` or a failed statement rolls back and publishes nothing.
+- 2C Capture: the preupdate hook records touched rows (table, key, first old value) in first-touch order and skips `_sqlive_meta`. Values stay exactly as SQLite holds them, and `WITHOUT ROWID` keys compare under the primary key's own collations.
+- 2D Net changes: read back each touched key's current row and emit Insert, Update, Delete or nothing, comparing values bit for bit.
+- 2E Schema events: a `PRAGMA schema_version` change during the closure or since the last write sets `schema_changed`; `db.vacuum()` publishes `schema_changed`. Virtual-table shadow tables count as tables.
+- 2F Retained log: `changes()` and `changes_since(v)`, as a blocking iterator plus `try_next`, with bounded capacity, `Lagged`, and `FutureVersion`.
+- 2G Simulator workloads. Schemas: rowid tables with and without `INTEGER PRIMARY KEY`, composite keys, `WITHOUT ROWID`, `STRICT`, generated columns, declared affinities and collations, key collations that differ from their columns', unique constraints, foreign-key cascades, triggers, indexes. Operations: every insert conflict policy, upserts, updates that move keys, deletes, savepoints with `ROLLBACK TO`, failing statements, closures returning `Err`, DDL, and `vacuum`.
 
 Out of scope:
 - Faults and crashes on live workloads (Phase 3).
+- Rows reproduce text that is not UTF-8 lossily; change detection stays exact.
 
 Completion gate:
 All properties hold over a 10,000-seed sweep; `scripts/mutants` catches every Phase 2 planted bug; `/code-review` findings are resolved.
 
 Testing plan:
 - Unit tests for net-change coalescing: insert then delete yields nothing; update then delete yields Delete with the first old value.
-- Properties: a replica that applies events (and reloads from a dump on `schema_changed`) equals a full dump at every check. Versions have no gaps and match `_live_meta`. Rolled-back and rejected transactions publish nothing.
-- Planted bugs: capture through `update_hook`, which misses REPLACE deletes; skipped read-back, which leaks `ROLLBACK TO` changes; publishing when `COMMIT` fails; `changes_since` resuming at `v` or `v + 2`; no `Lagged` after the log drops `v + 1`.
+- Properties: a replica that applies events (and reloads from a dump on `schema_changed` or `Lagged`) equals a full dump at every check. Versions have no gaps and match `_sqlive_meta`. Rolled-back and rejected transactions publish nothing. Each applied change must match exactly the rows its key names.
+- Planted bugs: unrecorded trigger and cascade deletes; keys compared without their collation; read-back without the key's collation; shadow tables left out; schema changes unflagged, during or outside a write; triggers allowed on the version table; every touch recorded; reals compared by value; `changes_since` resuming late; no `Lagged` after the log drops events.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Decision | Net changes by reading touched rows back before `COMMIT` | `README.md` Guarantees, "Net". |
-| Incomplete | Work | 2A: Open and options | Missing: `crates/live/src/db.rs`; unit test reading pragmas back. |
-| Incomplete | Work | 2B: `write` lifecycle and transaction-statement guard | Missing: implementation; tests for `Err`, a failed statement, and a denied `COMMIT`. |
-| Incomplete | Work | 2C: Preupdate capture | Missing: `crates/live/src/capture.rs`; tests for REPLACE, cascade and `WITHOUT ROWID`. |
-| Incomplete | Work | 2D: Net changes | Missing: coalescing unit tests. |
-| Incomplete | Work | 2E: Schema events and `vacuum` | Missing: tests for DDL and `vacuum`. |
-| Incomplete | Work | 2F: Retained log, `changes_since`, `Lagged` | Missing: `crates/live/src/log.rs`; tests at log boundaries. |
-| Incomplete | Work | 2G: Simulator schemas and write workloads | Missing: `crates/sim/src/schema.rs`, `crates/sim/src/writes.rs`. |
-| Incomplete | Test | Replica, version and rollback properties | Missing: property functions and seed tests. |
-| Incomplete | Test | Phase 2 planted bugs | Missing: `scripts/mutants` report, 5 of 5 caught. |
-| Incomplete | Gate | 10,000-seed sweep | Missing: sweep output. |
-| Incomplete | Gate | Code review | Missing: `/code-review` findings and resolutions. |
+| Complete | Decision | Net changes by reading touched rows back before `COMMIT` | `README.md` Guarantees, "Net"; `net_changes` in `crates/live/src/db.rs`. |
+| Complete | Work | 2A: Open and options | `crates/live/src/db.rs` (`LiveDb::open_with`); `a_stream_behind_the_log_lags_and_a_reopen_forgets_the_log` reopens and reads the version back. |
+| Complete | Work | 2B: `write` lifecycle and transaction guard | `LiveDb::write`, `install_guard`; `a_failed_closure_rolls_back_and_publishes_nothing`, `a_closure_cannot_end_the_transaction_or_touch_the_version`, `a_closure_cannot_attach_triggers_to_or_alter_the_version_table`. |
+| Complete | Work | 2C: Preupdate capture | `crates/live/src/capture.rs`; `replace_conflicts_cascades_and_triggers_appear`, `without_rowid_rows_are_keyed_by_primary_key_under_its_collation`, `a_primary_key_collation_differs_from_its_column_collation`, `text_that_is_not_utf8_still_shows_its_changes`, `rows_leave_out_virtual_generated_columns`. |
+| Complete | Work | 2D: Net changes | `inserts_updates_and_deletes_publish_net_changes`, `changes_within_one_transaction_net_out`, `a_rolled_back_savepoint_leaves_no_change`. |
+| Complete | Work | 2E: Schema events and `vacuum` | `schema_changes_and_vacuum_set_schema_changed`, `a_schema_changed_outside_a_write_flags_the_next_event`, `writes_to_virtual_table_shadow_tables_are_row_changes`. |
+| Complete | Work | 2F: Retained log, `changes_since`, `Lagged` | `crates/live/src/log.rs` with 5 unit tests; `a_stream_behind_the_log_lags_and_a_reopen_forgets_the_log`. |
+| Complete | Work | 2G: Simulator schemas and write workloads | `crates/sim/src/live/{schema,writes,replica,mod}.rs`; seed 4: 172 writes, 811 statements (95 failed), 682 row changes. |
+| Complete | Test | Replica, version and rollback properties | `Live::finish_write`, `Live::check`, `Replica::apply_change`; `live_seeds_0_to_63_pass_and_replay`. |
+| Complete | Test | Phase 2 planted bugs | `scripts/mutants --seeds 300`: 17 of 17 caught (11 Phase 2). With `--layers sim,seeds`, the simulator alone catches every Phase 2 bug it can reach; shadow tables, schema changes outside a write and version-table triggers need setups only the unit tests build. |
+| Complete | Gate | 10,000-seed sweep | `cargo run --release -p sqlive-sim -- 0 --seeds 10000` (storage and live): 0 of 10,000 failed, after the review fixes. |
+| Complete | Gate | Code review | `/code-review high` found 10 issues, all resolved: keys use the primary key's collations (`pragma_index_xinfo`), and the simulator generates differing ones; capture keeps raw values; the guard refuses triggers, indexes and `ALTER` on `_sqlive_meta`, and recording runs through the version bump; a schema moved outside a write flags the next event; shadow tables count; the seed tests serialize on SQLite's PRNG; `--layers` rejects unknown names; the `schema_change` doc matches; the README documents `rowid`, `Options`, `try_next` and `FutureVersion`. The commit-error paths it flagged as untested are Phase 3's scope. |
 
 ## Phase 3: Crashes and Faults
 

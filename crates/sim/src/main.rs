@@ -1,16 +1,17 @@
 //! Runs simulations. With no seed it picks one; pass a seed, or a git commit
 //! hash, to replay a run. `--seeds N` runs N consecutive seeds on every core.
 
-use sqlive_sim::{Simulator, parse_seed};
+use sqlive_sim::{Harness, Simulator, parse_seed};
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const USAGE: &str = "usage: sqlive-sim [SEED] [--seeds N]";
+const USAGE: &str = "usage: sqlive-sim [SEED] [--seeds N] [--harness storage|live]";
 
 fn main() -> ExitCode {
     let mut seed = None;
     let mut count = None;
+    let mut harness = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let parsed = match arg.as_str() {
@@ -18,6 +19,10 @@ fn main() -> ExitCode {
                 .next()
                 .and_then(|n| n.parse().ok())
                 .map(|n| count = Some(n)),
+            "--harness" => args
+                .next()
+                .and_then(|name| Harness::parse(&name))
+                .map(|h| harness = Some(h)),
             text => parse_seed(text).ok().map(|value| seed = Some(value)),
         };
         if parsed.is_none() {
@@ -27,13 +32,21 @@ fn main() -> ExitCode {
     }
     let seed = seed.unwrap_or_else(random_seed);
     match count {
-        None => run_one(seed),
-        Some(count) => sweep(seed, count),
+        None => run_one(seed, harness),
+        Some(count) => sweep(seed, count, harness),
     }
 }
 
-fn run_one(seed: u64) -> ExitCode {
-    let mut simulator = Simulator::from_seed(seed);
+fn simulator(seed: u64, harness: Option<Harness>) -> Simulator {
+    let simulator = Simulator::from_seed(seed);
+    match harness {
+        Some(harness) => simulator.harness(harness),
+        None => simulator,
+    }
+}
+
+fn run_one(seed: u64, harness: Option<Harness>) -> ExitCode {
+    let mut simulator = simulator(seed, harness);
     if std::env::var_os("SIM_TRACE").is_some() {
         simulator = simulator.trace();
     }
@@ -57,7 +70,7 @@ fn run_one(seed: u64) -> ExitCode {
     clippy::disallowed_methods,
     reason = "runs are independent, so running them on threads keeps each one deterministic"
 )]
-fn sweep(start: u64, count: u64) -> ExitCode {
+fn sweep(start: u64, count: u64, harness: Option<Harness>) -> ExitCode {
     let next = AtomicU64::new(0);
     let failures = Mutex::new(Vec::new());
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -70,7 +83,7 @@ fn sweep(start: u64, count: u64) -> ExitCode {
                         break;
                     }
                     let seed = start.wrapping_add(index);
-                    let run = std::panic::catch_unwind(|| Simulator::from_seed(seed).run());
+                    let run = std::panic::catch_unwind(|| simulator(seed, harness).run());
                     let failed = match run {
                         Ok(Ok(_)) => false,
                         Ok(Err(failure)) => {
