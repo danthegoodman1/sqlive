@@ -464,7 +464,12 @@ impl Live {
     fn check_hold(&mut self, hold: Hold<'_>) -> Result<(), String> {
         let Hold { snapshot, query } = hold;
         let version = snapshot.version();
-        let held = snapshot.query(&query.sql, query.params.clone(), subscriptions::rows);
+        let mut columns = None;
+        let held = snapshot.query(
+            &query.sql,
+            query.params.clone(),
+            subscriptions::naming(&mut columns),
+        );
         drop(snapshot);
         let witness = self.witness.as_ref().expect("open");
         let expected = self
@@ -490,6 +495,7 @@ impl Live {
             let kind = *self.queries.pick(&[Kind::Eager, Kind::Lagging]);
             let held = Held {
                 rows: held.rows,
+                columns,
                 version: held.version,
                 read_set: held.read_set,
                 hash: held.hash,

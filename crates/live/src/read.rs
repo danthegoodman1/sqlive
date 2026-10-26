@@ -296,7 +296,7 @@ impl Snapshot<'_> {
         reader.still_open()?;
         let mut reads = cached.reads;
         constrain(&mut reads, analysis, boundary);
-        let (hash, buffer) = hasher.finish();
+        let (hash, buffer) = hasher.finish(statement)?;
         *reader.hash_buffer.borrow_mut() = buffer;
         let unchanged = previous == Some(hash);
         if unchanged {

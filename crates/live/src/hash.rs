@@ -4,10 +4,10 @@
 use rusqlite::types::ValueRef;
 use std::fmt;
 
-/// A digest of a query's rows: each row in order, and each value in it with
-/// its storage class. Any difference in a value, its storage class, the
-/// row order or the row count changes the hash, and the same rows hash the
-/// same in every process.
+/// A digest of a query's result: its column names, then each row in order,
+/// and each value in it with its storage class. Any difference in a column
+/// name, a value, its storage class, the row order or the row count changes
+/// the hash, and the same result hashes the same in every process.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ResultHash([u8; 32]);
 
@@ -56,13 +56,13 @@ impl fmt::Debug for ResultHash {
 /// several chunks at a time, and a small one a block at a time.
 const BUFFER: usize = 16 * 1024;
 
-/// Marks the start of a row, apart from the storage-class tags.
-const ROW: u8 = 5;
-
 /// Hashes a result as its rows stream out of SQLite.
 pub(crate) struct RowHasher {
     hasher: blake3::Hasher,
     buffer: Vec<u8>,
+    /// The column count, once the header holding it and the names is
+    /// written; the count marks where each row ends.
+    columns: Option<usize>,
 }
 
 impl RowHasher {
@@ -73,12 +73,32 @@ impl RowHasher {
         RowHasher {
             hasher: blake3::Hasher::new_derive_key("sqlive 2026-10-26 query result hash"),
             buffer,
+            columns: None,
         }
     }
 
+    /// Writes the column count and each name with its length. Called once
+    /// the statement has stepped: a statement prepared under an older
+    /// schema reports that schema's columns until its first step.
+    fn header(&mut self, statement: &rusqlite::Statement<'_>) -> rusqlite::Result<usize> {
+        let count = statement.column_count();
+        self.buffer.extend_from_slice(&(count as u64).to_le_bytes());
+        for i in 0..count {
+            let name = statement.column_name(i)?;
+            self.buffer
+                .extend_from_slice(&(name.len() as u64).to_le_bytes());
+            self.buffer.extend_from_slice(name.as_bytes());
+        }
+        self.columns = Some(count);
+        Ok(count)
+    }
+
     pub(crate) fn row(&mut self, row: &rusqlite::Row<'_>) -> rusqlite::Result<()> {
-        self.buffer.push(ROW);
-        for i in 0..row.as_ref().column_count() {
+        let columns = match self.columns {
+            Some(columns) => columns,
+            None => self.header(row.as_ref())?,
+        };
+        for i in 0..columns {
             self.value(row.get_ref(i)?);
         }
         Ok(())
@@ -124,8 +144,15 @@ impl RowHasher {
         self.buffer.clear();
     }
 
-    pub(crate) fn finish(mut self) -> (ResultHash, Vec<u8>) {
+    /// Ends the hash of `statement`'s result, which has stepped to its end.
+    pub(crate) fn finish(
+        mut self,
+        statement: &rusqlite::Statement<'_>,
+    ) -> rusqlite::Result<(ResultHash, Vec<u8>)> {
+        if self.columns.is_none() {
+            self.header(statement)?;
+        }
         self.flush();
-        (ResultHash(*self.hasher.finalize().as_bytes()), self.buffer)
+        Ok((ResultHash(*self.hasher.finalize().as_bytes()), self.buffer))
     }
 }

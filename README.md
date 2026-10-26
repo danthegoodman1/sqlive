@@ -95,7 +95,7 @@ todos.rows;      // Vec<Todo>
 todos.version;   // commit version of the snapshot the query read
 todos.read_set;  // todos[done, id, list_id, title] where list_id = 5 AND id >= 412
                  //   (412 = id of the 50th row)
-todos.hash;      // ResultHash: a BLAKE3 digest of the rows
+todos.hash;      // ResultHash: a BLAKE3 digest of the column names and rows
 ```
 
 Queries run on read-only connections, concurrently with writes (WAL mode).
@@ -165,7 +165,7 @@ A read set carries its snapshot version, and `intersects` returns false for even
 or below it, since the result already reflects them.
 
 `intersects` can report a commit that leaves the rows the same, so `rerun` checks.
-It runs the query again and compares the rows' hash with the one you pass in. When
+It runs the query again and compares the result's hash with the one you pass in. When
 they match, the result is `unchanged` and carries no rows, so you have nothing to
 push. Its read set and hash still replace the old ones, because its version is newer.
 Between runs you keep only the read set and the 32-byte hash. `rerun` maps rows as it
@@ -239,16 +239,16 @@ collation, `NULL` handling) for you.
   value.
 - **Conservative:** `intersects` returns false only when a change cannot affect the
   result. It may return true for a change that leaves the result the same.
-- **Hashes:** a `ResultHash` covers each row in order, and each value in it with its
-  storage class (reals by their bits). Any difference in a value, a storage class, the
-  row order or the row count changes it. The same rows hash the same in every process,
-  so a client can keep the hash, as it would an ETag: `to_string()` writes 64 hex
-  digits and `ResultHash::from_hex` reads them back, while `as_bytes` and `from_bytes`
-  give the raw 32 bytes. The hash covers the values of every column the query returns,
-  including any your mapping ignores, and only the values: after an event that sets
-  `schema_changed`, run `query` instead of `rerun` if your clients depend on column
-  names. A query without a complete `ORDER BY` can return the same rows in another
-  order, which counts as a change.
+- **Hashes:** a `ResultHash` covers the result's column names, then each row in order,
+  and each value in it with its storage class (reals by their bits). Any difference in
+  a column name, a value, a storage class, the row order or the row count changes it.
+  The same result hashes the same in every process, so a client can keep the hash, as
+  it would an ETag: `to_string()` writes 64 hex digits and `ResultHash::from_hex`
+  reads them back, while `as_bytes` and `from_bytes` give the raw 32 bytes. The hash
+  covers every column the query returns, including any your mapping ignores. SQLite
+  may rename an unnamed expression, such as `count(*)`, between releases, so name
+  computed columns with `AS` to keep their hashes stable. A query without a complete
+  `ORDER BY` can return the same rows in another order, which counts as a change.
 - **Durable:** a published event's transaction survives a crash. A commit that
   reported an error can still reappear after a crash, without an event; streams from
   before it lag.
@@ -281,8 +281,8 @@ collation, `NULL` handling) for you.
   query.
 - `intersects` checks whether an event's old or new row satisfies a read set's
   constraints, using SQLite's comparison rules.
-- BLAKE3 hashes each result's rows as they stream out of SQLite, in buffered blocks
-  so it can hash several chunks at once.
+- BLAKE3 hashes each result's column names and rows as the rows stream out of
+  SQLite, in buffered blocks so it can hash several chunks at once.
 
 ## Example: live chat
 

@@ -334,13 +334,21 @@ MUTANTS = [
         [(HASH, "r.to_bits()", "(r + 0.0).to_bits()")],
     ),
     (
-        "rows run together in result hashes",
-        [(HASH, "self.buffer.push(ROW);", "")],
+        "column names go unhashed",
+        [(HASH, "self.buffer.extend_from_slice(name.as_bytes());", "")],
+    ),
+    (
+        "column names hash without their length",
+        [(HASH, "self.buffer.extend_from_slice(&(name.len() as u64).to_le_bytes());", "")],
+    ),
+    (
+        "an empty result's columns go unhashed",
+        [(HASH, "if self.columns.is_none() { self.header(statement)?; } self.flush();", "self.flush();")],
     ),
     (
         "the last bytes of a result go unhashed",
-        [(HASH, "pub(crate) fn finish(mut self) -> (ResultHash, Vec<u8>) { self.flush();",
-          "pub(crate) fn finish(self) -> (ResultHash, Vec<u8>) {")],
+        [(HASH, "self.header(statement)?; } self.flush(); Ok(",
+          "self.header(statement)?; } Ok(")],
     ),
     (
         "large values go unhashed",

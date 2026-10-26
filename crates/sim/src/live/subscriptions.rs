@@ -25,6 +25,8 @@ pub enum Kind {
 
 pub struct Held {
     pub rows: Rows,
+    /// The column names, from the first row; `None` with no rows.
+    pub columns: Option<Vec<String>>,
     pub version: Version,
     pub read_set: ReadSet,
     pub hash: ResultHash,
@@ -90,6 +92,23 @@ pub fn rows(row: &rusqlite::Row<'_>) -> rusqlite::Result<Vec<Value>> {
         .collect()
 }
 
+/// `rows`, recording the result's column names from its first row in
+/// `columns`.
+pub fn naming(
+    columns: &mut Option<Vec<String>>,
+) -> impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Vec<Value>> + '_ {
+    move |row| {
+        if columns.is_none() {
+            let statement = row.as_ref();
+            let names = (0..statement.column_count())
+                .map(|i| statement.column_name(i).map(str::to_owned))
+                .collect::<rusqlite::Result<_>>()?;
+            *columns = Some(names);
+        }
+        rows(row)
+    }
+}
+
 impl Subscription {
     pub fn new(id: u64, query: QuerySpec, kind: Kind) -> Subscription {
         Subscription {
@@ -108,7 +127,9 @@ impl Subscription {
         self.held = None;
         self.stream = None;
         self.buffer.clear();
-        let result = match db.query(&self.query.sql, self.query.params.clone(), rows) {
+        let mut columns = None;
+        let params = self.query.params.clone();
+        let result = match db.query(&self.query.sql, params, naming(&mut columns)) {
             Ok(result) => result,
             Err(e) => {
                 tally.failed(&e);
@@ -119,6 +140,7 @@ impl Subscription {
         tally.count(&result.read_set);
         self.held = Some(Held {
             rows: result.rows,
+            columns,
             version: result.version,
             read_set: result.read_set,
             hash: result.hash,
@@ -130,14 +152,15 @@ impl Subscription {
     /// stream from the new version. An unchanged result keeps the held rows,
     /// which the oracle checks once the subscription catches up; it must
     /// carry no rows. A changed result of a completely ordered query must
-    /// differ from the held rows. Returns false if an injected fault made
-    /// the query fail.
+    /// differ from the held result in its rows or column names. Returns
+    /// false if an injected fault made the query fail.
     fn rerun(&mut self, db: &LiveDb, tally: &mut Tally) -> Result<bool, String> {
         let held = self.held.take().expect("a held result to re-run");
         self.stream = None;
         self.buffer.clear();
         let params = self.query.params.clone();
-        let result = match db.rerun(&self.query.sql, params, held.hash, rows) {
+        let mut columns = None;
+        let result = match db.rerun(&self.query.sql, params, held.hash, naming(&mut columns)) {
             Ok(result) => result,
             Err(e) => {
                 tally.failed(&e);
@@ -145,7 +168,7 @@ impl Subscription {
             }
         };
         tally.reruns += 1;
-        let rows = if result.unchanged {
+        let (rows, columns) = if result.unchanged {
             tally.unchanged += 1;
             if !result.rows.is_empty() {
                 return Err(format!(
@@ -153,21 +176,28 @@ impl Subscription {
                     self.id, result.version, result.rows
                 ));
             }
-            held.rows
+            (held.rows, held.columns)
         } else {
-            if self.query.ordered && same_rows(&held.rows, &result.rows, true) {
+            // With no rows, the names are unknown; ordered results with the
+            // same names and rows must hash the same.
+            if self.query.ordered
+                && columns.is_some()
+                && columns == held.columns
+                && same_rows(&held.rows, &result.rows, true)
+            {
                 return Err(format!(
                     "subscription {}: a re-run at version {} reported a change but returned \
-                     the rows it held, {:?}, for {} {:?}",
+                     the columns {columns:?} and rows {:?} it held, for {} {:?}",
                     self.id, result.version, result.rows, self.query.sql, self.query.params
                 ));
             }
-            result.rows
+            (result.rows, columns)
         };
         self.follow_from(db, result.version)?;
         tally.count(&result.read_set);
         self.held = Some(Held {
             rows,
+            columns,
             version: result.version,
             read_set: result.read_set,
             hash: result.hash,
