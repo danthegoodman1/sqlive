@@ -172,16 +172,27 @@ CommitEvent {
 }
 ```
 
-## Many subscriptions
+## Many live queries
 
-`ReadSetIndex` finds the subscriptions an event affects without testing each one.
+With many live queries, you could call `intersects` on every read set for every
+commit, but `ReadSetIndex` does that bookkeeping for you. Store each query's read set
+under a key you choose, such as a subscription id, and `affected(&event)` returns the
+keys whose queries the commit may change. It looks them up by the read sets'
+constraints instead of testing each one: with 100,000 subscriptions it handles about
+100,000 events a second, against 35 for calling `intersects` on each
+([`BENCHMARKS.md`](BENCHMARKS.md)).
+
+One stream of changes then serves every query:
 
 ```rust
 let mut subs: ReadSetIndex<SubId> = ReadSetIndex::new();
-subs.insert(sub_id, result.read_set);
 
-for event in db.changes()? {
-    let event = event?;
+let result = db.query(SQL, [5], to_todo)?;
+subs.insert(sub_id, result.read_set);
+push_to_clients(sub_id, &result.rows);
+
+for event in db.changes_since(result.version)? {
+    let event = event?;                       // on Err(Lagged), re-run every query
     let hits: Vec<SubId> = subs.affected(&event).collect();
     for sub_id in hits {
         let result = rerun(sub_id)?;          // app code
@@ -191,9 +202,14 @@ for event in db.changes()? {
 }
 ```
 
-To build your own index, first check `ReadSet::every_commit()`: a read set that reads
-`_sqlive_meta` or one of SQLite's internal tables intersects every commit. Then read
-each table's `filter()` from `ReadSet::tables()`: either `Filter::All` or
+- `insert` replaces a key's read set; `remove` drops it when the client leaves.
+- A query added while the loop runs must join the index before the loop checks a
+  commit newer than the query's version. The [chat example](#example-live-chat) runs
+  the query and the insert under the same lock its loop holds while checking a commit.
+
+To index read sets yourself, first check `ReadSet::every_commit()`: a read set that
+reads `_sqlive_meta` or one of SQLite's internal tables intersects every commit. Then
+read each table's `filter()` from `ReadSet::tables()`: either `Filter::All` or
 `Filter::AnyOf` conjunctions of `Constraint { column, collation, condition }`.
 `Constraint::matches(row)` applies SQLite's comparison rules (storage class,
 collation, `NULL` handling) for you.
