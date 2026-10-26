@@ -38,6 +38,7 @@ READ_SET = "crates/live/src/read_set.rs"
 CONSTRAINTS = "crates/live/src/constraints.rs"
 COMPARE = "crates/live/src/compare.rs"
 INDEX = "crates/live/src/index.rs"
+HASH = "crates/live/src/hash.rs"
 CHAT = "examples/chat/src/lib.rs"
 
 STEP_TIMEOUT = 900
@@ -300,8 +301,8 @@ MUTANTS = [
     ),
     (
         "a chat re-run keeps the room's old read set",
-        [(CHAT, "index.insert(room.to_owned(), read_set); entry.results.send_replace(result);",
-          "let _ = read_set; entry.results.send_replace(result);")],
+        [(CHAT, "index.insert(room.to_owned(), read_set); entry.version = version;",
+          "let _ = read_set; entry.version = version;")],
     ),
     (
         "a chat takes the clock's time behind an earlier chat",
@@ -312,12 +313,70 @@ MUTANTS = [
         [(CHAT, "FROM chats WHERE room = ?1)))", "FROM chats)))")],
     ),
     (
-        "a chat viewer joins without counting",
-        [(CHAT, "entry.viewers += 1;", "")],
+        "a chat viewer never joins its room's mailboxes",
+        [(CHAT, "entry.viewers.insert(id, mailbox.clone());", "")],
     ),
     (
         "the chat follower stops when it lags",
         [(CHAT, "Err(Error::Lagged { .. }) =>", "Err(Error::Lagged { .. }) if false =>")],
+    ),
+    # Phase 8
+    (
+        "integers and reals hash without their storage class",
+        [(HASH, "self.buffer.push(1);", ""), (HASH, "self.buffer.push(2);", "")],
+    ),
+    (
+        "text and blobs hash without their length",
+        [(HASH, "self.buffer.extend_from_slice(&(bytes.len() as u64).to_le_bytes());", "")],
+    ),
+    (
+        "result hashes compare reals by value, so 0.0 equals -0.0",
+        [(HASH, "r.to_bits()", "(r + 0.0).to_bits()")],
+    ),
+    (
+        "rows run together in result hashes",
+        [(HASH, "self.buffer.push(ROW);", "")],
+    ),
+    (
+        "the last bytes of a result go unhashed",
+        [(HASH, "pub(crate) fn finish(mut self) -> (ResultHash, Vec<u8>) { self.flush();",
+          "pub(crate) fn finish(self) -> (ResultHash, Vec<u8>) {")],
+    ),
+    (
+        "large values go unhashed",
+        [(HASH, "self.flush(); self.hasher.update(bytes);", "self.flush();")],
+    ),
+    (
+        "an unchanged re-run returns its rows",
+        [(READ, "if unchanged { out = Vec::new(); }", "")],
+    ),
+    (
+        "a re-run reports every result unchanged",
+        [(READ, "let unchanged = previous == Some(hash);", "let unchanged = previous.is_some();")],
+    ),
+    (
+        "a re-run never reports a result unchanged",
+        [(READ, "let unchanged = previous == Some(hash);", "let unchanged = false;")],
+    ),
+    (
+        "a schema change keeps statements prepared under the old one",
+        [(READ, "reader.conn.flush_prepared_statement_cache();", "")],
+    ),
+    (
+        "hex digits pair in the wrong order",
+        [(HASH, "*byte = (high * 16 + low) as u8;", "*byte = (low * 16 + high) as u8;")],
+    ),
+    (
+        "the chat pushes unchanged re-runs",
+        [(CHAT, "let changed = hash != entry.hash;", "let changed = true;")],
+    ),
+    (
+        "a chat viewer's mailbox keeps the oldest result",
+        [(CHAT, "*lock(&self.slot) = Some(result);", "lock(&self.slot).get_or_insert(result);")],
+    ),
+    (
+        "a joining chat viewer leaves the room's viewers behind",
+        [(CHAT, "if entry.hash != hash { push(entry, &shown); }", "")],
     ),
 ]
 

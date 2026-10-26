@@ -61,7 +61,7 @@
   .who { font-weight: 600; }
   .when, .muted { color: var(--muted); font-size: 13px; }
   .empty { color: var(--muted); padding: 8px 0; }
-  .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .stat { background: var(--code); border-radius: 6px; padding: 8px 10px; }
   .stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
   .hidden { display: none; }
@@ -108,10 +108,12 @@
       <code id="readset" class="readset"></code>
       <div class="stats">
         <div class="stat"><b id="reruns">0</b><span class="muted">re-runs</span></div>
+        <div class="stat"><b id="unchanged">0</b><span class="muted">unchanged</span></div>
         <div class="stat"><b id="skips">0</b><span class="muted">skips</span></div>
       </div>
       <p class="muted">A chat in another room adds a skip here and changes nothing else:
-        its row falls outside this read set, so the query does not re-run.</p>
+        its row falls outside this read set, so the query does not re-run. A re-run
+        whose rows hash the same as the list's counts as unchanged and pushes nothing.</p>
     </div>
   </section>
 </main>
@@ -150,7 +152,9 @@
     source.addEventListener("result", (event) => render(JSON.parse(event.data)));
     source.addEventListener("stats", (event) => {
       const stats = JSON.parse(event.data);
+      $("version").textContent = stats.version;
       $("reruns").textContent = stats.reruns;
+      $("unchanged").textContent = stats.unchanged;
       $("skips").textContent = stats.skips;
     });
     source.onerror = () => {
@@ -162,7 +166,6 @@
   }
 
   function render(result) {
-    $("version").textContent = result.version;
     $("readset").textContent = result.read_set;
     const first = !rendered;
     rendered = true;

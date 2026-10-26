@@ -1,6 +1,8 @@
 //! A chat server whose rooms update live. Each room shows the result of one
 //! SqLive query; a follower re-runs it whenever a commit intersects the
-//! query's read set, and pushes the new rows to everyone in the room.
+//! query's read set, and pushes the new rows to everyone in the room when
+//! their hash changed. A room keeps only the version and hash of the rows
+//! its viewers hold.
 
 use axum::Router;
 use axum::extract::{Json, Path, State};
@@ -11,12 +13,14 @@ use axum::routing::{get, post};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use sqlive::rusqlite::Row;
-use sqlive::{CommitEvent, Error, LiveDb, Options, ReadSetIndex, Version};
+use sqlive::{
+    CommitEvent, Error, LiveDb, Options, QueryResult, ReadSet, ReadSetIndex, ResultHash, Version,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 /// The live query each room shows.
 pub const QUERY: &str = "SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10";
@@ -63,20 +67,60 @@ pub struct RoomResult {
     pub read_set: String,
 }
 
-/// What the follower did for a room while it was open.
+/// The room's version, and what the follower did for the room while it
+/// was open.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct RoomStats {
-    /// Re-runs of the room's query that pushed a newer result, after a commit
-    /// intersected its read set or the follower fell behind the log.
+    /// The version of the room's latest query; the rows every viewer holds
+    /// are current as of it.
+    pub version: Version,
+    /// Re-runs of the room's query, after a commit intersected its read set
+    /// or the follower fell behind the log.
     pub reruns: u64,
+    /// Re-runs whose rows hashed the same as the room's, so nothing was
+    /// pushed.
+    pub unchanged: u64,
     /// Commits that left the room's read set untouched, so nothing ran.
     pub skips: u64,
 }
 
+/// The newest result a viewer has yet to send. A newer result replaces an
+/// unsent one, so a slow viewer skips to the latest rows and holds at most
+/// one result.
+#[derive(Default)]
+struct Mailbox {
+    slot: Mutex<Option<Arc<RoomResult>>>,
+    ready: Notify,
+}
+
+impl Mailbox {
+    fn put(&self, result: Arc<RoomResult>) {
+        *lock(&self.slot) = Some(result);
+        self.ready.notify_one();
+    }
+
+    fn take(&self) -> Option<Arc<RoomResult>> {
+        lock(&self.slot).take()
+    }
+
+    async fn next(&self) -> Arc<RoomResult> {
+        loop {
+            if let Some(result) = self.take() {
+                return result;
+            }
+            // `notify_one` leaves a permit when no one waits, so a result
+            // put after the check above still wakes this wait.
+            self.ready.notified().await;
+        }
+    }
+}
+
 struct Room {
-    viewers: usize,
-    results: watch::Sender<RoomResult>,
-    stats: watch::Sender<RoomStats>,
+    viewers: BTreeMap<u64, Arc<Mailbox>>,
+    /// The version and hash of the rows every viewer holds.
+    version: Version,
+    hash: ResultHash,
+    stats: Arc<watch::Sender<RoomStats>>,
 }
 
 /// The rooms someone is watching and the index of their read sets.
@@ -86,6 +130,7 @@ struct Hub {
     /// Rooms whose last re-run failed; the follower retries them on the
     /// next commit.
     retry: BTreeSet<String>,
+    next_viewer: u64,
 }
 
 pub struct Chat {
@@ -96,9 +141,23 @@ pub struct Chat {
 /// One viewer of a room; the room closes when its last viewer drops.
 pub struct Viewer {
     pub room: String,
-    pub results: watch::Receiver<RoomResult>,
     pub stats: watch::Receiver<RoomStats>,
+    mailbox: Arc<Mailbox>,
+    id: u64,
     hub: Weak<Mutex<Hub>>,
+}
+
+impl Viewer {
+    /// Waits for the room's next result. The first is the result the viewer
+    /// joined with.
+    pub async fn next_result(&self) -> Arc<RoomResult> {
+        self.mailbox.next().await
+    }
+
+    /// The room's next result, if one is waiting.
+    pub fn try_result(&self) -> Option<Arc<RoomResult>> {
+        self.mailbox.take()
+    }
 }
 
 impl Drop for Viewer {
@@ -106,8 +165,8 @@ impl Drop for Viewer {
         if let Some(hub) = self.hub.upgrade() {
             let mut hub = lock(&hub);
             let close = hub.rooms.get_mut(&self.room).is_some_and(|room| {
-                room.viewers -= 1;
-                room.viewers == 0
+                room.viewers.remove(&self.id);
+                room.viewers.is_empty()
             });
             if close {
                 hub.rooms.remove(&self.room);
@@ -123,14 +182,21 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn query(db: &LiveDb, room: &str) -> sqlive::Result<(RoomResult, sqlive::ReadSet)> {
-    let result = db.query(QUERY, [room], ChatRow::from_row)?;
-    let room_result = RoomResult {
+/// Splits a result into what viewers see and the read set the index keeps.
+fn split(result: QueryResult<ChatRow>) -> (RoomResult, ReadSet) {
+    let shown = RoomResult {
         version: result.version,
         chats: result.rows,
         read_set: result.read_set.to_string(),
     };
-    Ok((room_result, result.read_set))
+    (shown, result.read_set)
+}
+
+/// Hands a result to each of the room's viewers.
+fn push(room: &Room, result: &Arc<RoomResult>) {
+    for mailbox in room.viewers.values() {
+        mailbox.put(result.clone());
+    }
 }
 
 impl Chat {
@@ -147,6 +213,7 @@ impl Chat {
             rooms: BTreeMap::new(),
             index: ReadSetIndex::new(),
             retry: BTreeSet::new(),
+            next_viewer: 0,
         }));
         let changes = db.changes()?;
         let (weak_db, weak_hub) = (Arc::downgrade(&db), Arc::downgrade(&hub));
@@ -180,29 +247,53 @@ impl Chat {
         Ok(version)
     }
 
-    /// Joins a room, querying it if no one is watching it yet.
+    /// Joins a room and queries it for the new viewer.
     pub fn watch(&self, room: &str) -> sqlive::Result<Viewer> {
         // Querying under the hub's lock keeps the follower from checking a
         // commit between this query and the room joining the index.
         let mut hub = lock(&self.hub);
-        if !hub.rooms.contains_key(room) {
-            let (result, read_set) = query(&self.db, room)?;
-            hub.index.insert(room.to_owned(), read_set);
-            hub.rooms.insert(
-                room.to_owned(),
-                Room {
-                    viewers: 0,
-                    results: watch::Sender::new(result),
-                    stats: watch::Sender::new(RoomStats::default()),
-                },
-            );
+        let result = self.db.query(QUERY, [room], ChatRow::from_row)?;
+        let (version, hash) = (result.version, result.hash);
+        let (shown, read_set) = split(result);
+        let shown = Arc::new(shown);
+        hub.index.insert(room.to_owned(), read_set);
+        let id = hub.next_viewer;
+        hub.next_viewer += 1;
+        let entry = hub.rooms.entry(room.to_owned()).or_insert_with(|| Room {
+            viewers: BTreeMap::new(),
+            version,
+            hash,
+            stats: Arc::new(watch::Sender::new(RoomStats {
+                version,
+                ..RoomStats::default()
+            })),
+        });
+        // This query may see a commit the follower has not reached. The
+        // room's viewers then get these rows too, so every viewer holds the
+        // rows the room's hash describes.
+        if entry.hash != hash {
+            push(entry, &shown);
         }
-        let entry = hub.rooms.get_mut(room).expect("just inserted");
-        entry.viewers += 1;
+        entry.version = version;
+        entry.hash = hash;
+        let mailbox = Arc::new(Mailbox::default());
+        mailbox.put(shown);
+        entry.viewers.insert(id, mailbox.clone());
+        let stats = entry.stats.clone();
+        drop(hub);
+        let receiver = stats.subscribe();
+        // Counted outside the hub's lock, so a slow reader of the counters
+        // holds up only this join; a newer version may have landed first.
+        stats.send_if_modified(|stats| {
+            let moved = version > stats.version;
+            stats.version = stats.version.max(version);
+            moved
+        });
         Ok(Viewer {
             room: room.to_owned(),
-            results: entry.results.subscribe(),
-            stats: entry.stats.subscribe(),
+            stats: receiver,
+            mailbox,
+            id,
             hub: Arc::downgrade(&self.hub),
         })
     }
@@ -215,7 +306,7 @@ fn follow(mut changes: sqlive::Changes, db: Weak<LiveDb>, hub: Weak<Mutex<Hub>>)
         let (Some(db), Some(hub)) = (db.upgrade(), hub.upgrade()) else {
             return;
         };
-        let rooms = match item {
+        let (rooms, skipped) = match item {
             Ok(event) => affected(&mut lock(&hub), &event),
             Err(Error::Lagged { .. }) => {
                 // The follower fell behind the log: start over from now and
@@ -224,56 +315,104 @@ fn follow(mut changes: sqlive::Changes, db: Weak<LiveDb>, hub: Weak<Mutex<Hub>>)
                 changes = fresh;
                 let mut hub = lock(&hub);
                 hub.retry.clear();
-                hub.rooms.keys().cloned().collect()
+                (hub.rooms.keys().cloned().collect(), Vec::new())
             }
             Err(_) => return,
         };
-        // The queries run outside the hub's lock, so viewers join and leave
-        // rooms meanwhile.
+        // Counted outside the hub's lock, so a slow reader of the counters
+        // holds up only the follower.
+        for stats in skipped {
+            stats.send_modify(|stats| stats.skips += 1);
+        }
         for room in rooms {
             rerun(&db, &hub, &room);
         }
     }
 }
 
-/// Counts a skip for each room the event leaves alone, and returns the rooms
-/// to re-run: those it affects, and those whose last re-run failed.
-fn affected(hub: &mut Hub, event: &CommitEvent) -> BTreeSet<String> {
+/// The rooms to re-run, those the event affects and those whose last re-run
+/// failed, and the counters of the rooms it leaves alone.
+fn affected(
+    hub: &mut Hub,
+    event: &CommitEvent,
+) -> (BTreeSet<String>, Vec<Arc<watch::Sender<RoomStats>>>) {
     let mut rooms: BTreeSet<String> = hub.index.affected(event).collect();
     rooms.append(&mut hub.retry);
-    for (name, room) in &hub.rooms {
-        if !rooms.contains(name) {
-            room.stats.send_modify(|stats| stats.skips += 1);
-        }
-    }
-    rooms
+    let skipped = hub
+        .rooms
+        .iter()
+        .filter(|(name, _)| !rooms.contains(*name))
+        .map(|(_, room)| room.stats.clone())
+        .collect();
+    (rooms, skipped)
 }
 
+/// Re-runs a room's query against the hash of the rows its viewers hold,
+/// and pushes the rows only if they changed.
 fn rerun(db: &LiveDb, hub: &Mutex<Hub>, room: &str) {
-    let fresh = query(db, room);
-    let mut hub = lock(hub);
-    let Hub {
-        rooms,
-        index,
-        retry,
-    } = &mut *hub;
-    // The room may have closed during the query.
-    let Some(entry) = rooms.get(room) else {
+    loop {
+        let Some(hash) = lock(hub).rooms.get(room).map(|entry| entry.hash) else {
+            return;
+        };
+        // The query runs outside the hub's lock, so viewers join and leave
+        // rooms meanwhile.
+        let fresh = db.rerun(QUERY, [room], hash, ChatRow::from_row);
+        let mut guard = lock(hub);
+        let Hub {
+            rooms,
+            index,
+            retry,
+            ..
+        } = &mut *guard;
+        // The room may have closed during the query.
+        let Some(entry) = rooms.get_mut(room) else {
+            return;
+        };
+        let counted = match fresh {
+            // A viewer who joined meanwhile read this version or a newer one.
+            Ok(result) if result.version <= entry.version => None,
+            // A viewer who joined meanwhile moved the room to other rows, and
+            // an unchanged result has none to bring the others along.
+            Ok(result) if result.unchanged && result.hash != entry.hash => continue,
+            Ok(result) => {
+                let QueryResult {
+                    rows,
+                    version,
+                    read_set,
+                    hash,
+                    ..
+                } = result;
+                let changed = hash != entry.hash;
+                if changed {
+                    let shown = RoomResult {
+                        version,
+                        chats: rows,
+                        read_set: read_set.to_string(),
+                    };
+                    push(entry, &Arc::new(shown));
+                }
+                index.insert(room.to_owned(), read_set);
+                entry.version = version;
+                entry.hash = hash;
+                Some((entry.stats.clone(), version, changed))
+            }
+            Err(error) => {
+                eprintln!("re-running room {room:?}: {error}");
+                retry.insert(room.to_owned());
+                None
+            }
+        };
+        drop(guard);
+        // Counted outside the hub's lock, so a slow reader of the counters
+        // holds up only the follower; a newer version may have landed first.
+        if let Some((stats, version, changed)) = counted {
+            stats.send_modify(|stats| {
+                stats.version = stats.version.max(version);
+                stats.reruns += 1;
+                stats.unchanged += u64::from(!changed);
+            });
+        }
         return;
-    };
-    let shown = entry.results.borrow().version;
-    match fresh {
-        // The room may also have closed and reopened with a newer result.
-        Ok((result, read_set)) if result.version > shown => {
-            index.insert(room.to_owned(), read_set);
-            entry.results.send_replace(result);
-            entry.stats.send_modify(|stats| stats.reruns += 1);
-        }
-        Ok(_) => {}
-        Err(error) => {
-            eprintln!("re-running room {room:?}: {error}");
-            retry.insert(room.to_owned());
-        }
     }
 }
 
@@ -367,23 +506,17 @@ async fn live(
         .await
         .map_err(server_error)?
         .map_err(server_error)?;
-    let first = [
-        result_event(&viewer.results.borrow_and_update()),
-        stats_event(&viewer.stats.borrow_and_update()),
-    ];
+    let first = stats_event(&viewer.stats.borrow_and_update());
     Ok(Sse::new(updates(first, viewer)).keep_alive(KeepAlive::default()))
 }
 
-/// The room's current result and stats, then each change to either, until
+/// The room's stats, then each result and each change to the stats, until
 /// the room closes or the client leaves and drops the viewer.
-fn updates(first: [Event; 2], viewer: Viewer) -> impl Stream<Item = Result<Event, Infallible>> {
+fn updates(first: Event, viewer: Viewer) -> impl Stream<Item = Result<Event, Infallible>> {
     use futures_util::StreamExt;
     let later = futures_util::stream::unfold(viewer, |mut viewer| async move {
         let event = tokio::select! {
-            changed = viewer.results.changed() => {
-                changed.ok()?;
-                result_event(&viewer.results.borrow_and_update())
-            }
+            result = viewer.mailbox.next() => result_event(&result),
             changed = viewer.stats.changed() => {
                 changed.ok()?;
                 stats_event(&viewer.stats.borrow_and_update())
@@ -391,5 +524,5 @@ fn updates(first: [Event; 2], viewer: Viewer) -> impl Stream<Item = Result<Event
         };
         Some((event, viewer))
     });
-    futures_util::stream::iter(first).chain(later).map(Ok)
+    futures_util::stream::iter([first]).chain(later).map(Ok)
 }

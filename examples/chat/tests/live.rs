@@ -1,8 +1,9 @@
-//! The chat's live rooms: pushes to the posting room, skips elsewhere, the
-//! ten-chat window, chat order, rooms closing, catching up after a lag,
-//! persistence across a restart, and the HTTP routes.
+//! The chat's live rooms: pushes to the posting room, skips elsewhere,
+//! re-runs that change nothing, slow viewers, viewers who join ahead of the
+//! follower, the ten-chat window, chat order, rooms closing, catching up
+//! after a lag, persistence across a restart, and the HTTP routes.
 
-use chat_example::{Chat, RoomResult, RoomStats, router};
+use chat_example::{Chat, RoomResult, RoomStats, Viewer, router};
 use sqlive::Options;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +35,23 @@ async fn until<T: Clone>(receiver: &mut watch::Receiver<T>, done: impl Fn(&T) ->
     .clone()
 }
 
+/// The viewer's next result.
+async fn next(viewer: &Viewer) -> Arc<RoomResult> {
+    tokio::time::timeout(Duration::from_secs(5), viewer.next_result())
+        .await
+        .expect("a result in time")
+}
+
+/// Waits for a result that satisfies `done`.
+async fn next_until(viewer: &Viewer, done: impl Fn(&RoomResult) -> bool) -> Arc<RoomResult> {
+    loop {
+        let result = next(viewer).await;
+        if done(&result) {
+            return result;
+        }
+    }
+}
+
 fn bodies(result: &RoomResult) -> Vec<&str> {
     result.chats.iter().map(|chat| chat.body.as_str()).collect()
 }
@@ -42,38 +60,93 @@ fn checked(stats: &RoomStats) -> u64 {
     stats.reruns + stats.skips
 }
 
+/// Re-runs, unchanged re-runs and skips.
+fn counts(stats: &RoomStats) -> (u64, u64, u64) {
+    (stats.reruns, stats.unchanged, stats.skips)
+}
+
 #[tokio::test]
 async fn a_chat_reaches_its_room_and_skips_the_others() {
     let chat = Chat::open(&temp_db("rooms")).unwrap();
     let mut a = chat.watch("a").unwrap();
     let mut b = chat.watch("b").unwrap();
-    assert!(a.results.borrow_and_update().chats.is_empty());
-    let before_b = b.results.borrow_and_update().clone();
+    assert!(next(&a).await.chats.is_empty());
+    assert!(next(&b).await.chats.is_empty());
 
     chat.post("a", "ann", "hello").unwrap();
-    let result = until(&mut a.results, |r| !r.chats.is_empty()).await;
-    assert_eq!(bodies(&result), ["hello"]);
+    assert_eq!(bodies(&*next(&a).await), ["hello"]);
     let stats_a = until(&mut a.stats, |s| checked(s) >= 1).await;
-    assert_eq!(
-        stats_a,
-        RoomStats {
-            reruns: 1,
-            skips: 0
-        }
-    );
+    assert_eq!(counts(&stats_a), (1, 0, 0));
     let stats_b = until(&mut b.stats, |s| checked(s) >= 1).await;
-    assert_eq!(
-        stats_b,
-        RoomStats {
-            reruns: 0,
-            skips: 1
-        }
+    assert_eq!(counts(&stats_b), (0, 0, 1));
+    assert!(b.try_result().is_none(), "room b got no new result");
+}
+
+#[tokio::test]
+async fn a_rerun_that_finds_the_same_rows_pushes_nothing() {
+    let chat = Chat::open(&temp_db("unchanged")).unwrap();
+    let mut a = chat.watch("a").unwrap();
+    let b = chat.watch("b").unwrap();
+    let joined = next(&a).await.version;
+    {
+        // An outstanding borrow blocks the watch's sender, so the follower
+        // stalls on the first commit while the chat is posted and deleted.
+        let _stall = b.stats.borrow();
+        chat.post("a", "ann", "gone soon").unwrap();
+        chat.db()
+            .write(|tx| tx.execute("DELETE FROM chats WHERE body = 'gone soon'", []))
+            .unwrap();
+    }
+    // The insert intersects room a, but its re-run finds the empty room
+    // the viewer already holds; the delete then predates the result.
+    let stats = until(&mut a.stats, |s| checked(s) == 2).await;
+    assert_eq!(counts(&stats), (1, 1, 1));
+    assert!(
+        stats.version > joined,
+        "the room's version moves on without a push"
     );
     assert!(
-        !b.results.has_changed().unwrap(),
-        "room b got no new result"
+        a.try_result().is_none(),
+        "an unchanged re-run pushes nothing"
     );
-    assert_eq!(*b.results.borrow(), before_b);
+}
+
+#[tokio::test]
+async fn a_slow_viewer_skips_to_the_newest_result() {
+    let chat = Chat::open(&temp_db("slow")).unwrap();
+    let mut a = chat.watch("a").unwrap();
+    for i in 0..3 {
+        chat.post("a", "ann", &format!("chat {i}")).unwrap();
+    }
+    until(&mut a.stats, |s| checked(s) == 3).await;
+    // The viewer read nothing meanwhile, so only the newest result waits.
+    let waiting = a.try_result().expect("a result waits");
+    assert_eq!(bodies(&waiting), ["chat 2", "chat 1", "chat 0"]);
+    assert!(a.try_result().is_none());
+}
+
+#[tokio::test]
+async fn a_viewer_who_joins_ahead_of_the_follower_brings_the_room_along() {
+    let chat = Chat::open(&temp_db("ahead")).unwrap();
+    let mut first = chat.watch("a").unwrap();
+    let b = chat.watch("b").unwrap();
+    next(&first).await;
+    next(&b).await;
+    let second = {
+        // The follower re-runs room b for the first commit, then stalls
+        // outside the hub's lock counting it, before it reaches the second.
+        let _stall = b.stats.borrow();
+        chat.post("b", "bo", "elsewhere").unwrap();
+        chat.post("a", "ann", "hello").unwrap();
+        chat.watch("a").unwrap()
+    };
+    // The new viewer read the chat first, so both viewers get it then.
+    assert_eq!(bodies(&*next(&second).await), ["hello"]);
+    let pushed = first.try_result().expect("the join pushed the new rows");
+    assert_eq!(bodies(&pushed), ["hello"]);
+    // The follower then finds nothing new for room a.
+    until(&mut first.stats, |s| s.skips == 2).await;
+    assert!(first.try_result().is_none());
 }
 
 #[tokio::test]
@@ -83,10 +156,7 @@ async fn a_room_shows_its_ten_newest_chats() {
     for i in 0..11 {
         chat.post("a", "ann", &format!("chat {i}")).unwrap();
     }
-    let result = until(&mut a.results, |r| {
-        r.chats.first().is_some_and(|c| c.body == "chat 10")
-    })
-    .await;
+    let result = next_until(&a, |r| r.chats.first().is_some_and(|c| c.body == "chat 10")).await;
     let expected: Vec<String> = (1..=10).rev().map(|i| format!("chat {i}")).collect();
     assert_eq!(bodies(&result), expected);
     assert!(
@@ -96,8 +166,8 @@ async fn a_room_shows_its_ten_newest_chats() {
         "a full window bounds the read set: {}",
         result.read_set
     );
-    // A chat older than the window cannot change the list.
-    // A re-run can see several commits, and those after the first then skip.
+    // A chat older than the window cannot change the list. A re-run can see
+    // several commits, and those after the first then skip.
     let stats = until(&mut a.stats, |s| checked(s) == 11).await;
     chat.db()
         .write(|tx| {
@@ -136,16 +206,12 @@ async fn a_post_sorts_after_every_earlier_chat_in_its_room() {
         .unwrap();
     chat.post("a", "bo", "after").unwrap();
     chat.post("b", "bo", "elsewhere").unwrap();
-    let a = chat.watch("a").unwrap();
-    let chats = a.results.borrow().chats.clone();
-    assert_eq!(
-        chats.iter().map(|c| c.body.as_str()).collect::<Vec<_>>(),
-        ["after", "ahead"]
-    );
-    assert_eq!(chats[0].created_at, ahead + 1);
+    let result = next(&chat.watch("a").unwrap()).await;
+    assert_eq!(bodies(&result), ["after", "ahead"]);
+    assert_eq!(result.chats[0].created_at, ahead + 1);
     // Another room's clock stays its own.
-    let b = chat.watch("b").unwrap();
-    assert!(b.results.borrow().chats[0].created_at < ahead);
+    let result = next(&chat.watch("b").unwrap()).await;
+    assert!(result.chats[0].created_at < ahead);
 }
 
 #[tokio::test]
@@ -161,8 +227,8 @@ async fn a_room_closes_when_its_last_viewer_leaves() {
     drop(second);
     // Reopening the room starts it over.
     let again = chat.watch("a").unwrap();
-    assert_eq!(*again.stats.borrow(), RoomStats::default());
-    assert_eq!(bodies(&again.results.borrow()), ["hello"]);
+    assert_eq!(counts(&again.stats.borrow()), (0, 0, 0));
+    assert_eq!(bodies(&*next(&again).await), ["hello"]);
 }
 
 #[tokio::test]
@@ -172,7 +238,7 @@ async fn a_follower_behind_the_log_queries_every_room_again() {
         ..Options::default()
     };
     let chat = Chat::open_with(&temp_db("lag"), options).unwrap();
-    let mut a = chat.watch("a").unwrap();
+    let a = chat.watch("a").unwrap();
     let mut b = chat.watch("b").unwrap();
     {
         // An outstanding borrow blocks the watch's sender, so the follower
@@ -182,13 +248,11 @@ async fn a_follower_behind_the_log_queries_every_room_again() {
             chat.post("a", "ann", &format!("chat {i}")).unwrap();
         }
     }
-    let result = until(&mut a.results, |r| {
-        r.chats.first().is_some_and(|c| c.body == "chat 4")
-    })
-    .await;
+    let result = next_until(&a, |r| r.chats.first().is_some_and(|c| c.body == "chat 4")).await;
     assert_eq!(result.chats.len(), 5);
-    // No commit touched room b, yet it re-ran when the follower caught up.
-    until(&mut b.stats, |s| s.reruns >= 1).await;
+    // No commit touched room b, yet it re-ran when the follower caught up,
+    // and found its rows unchanged.
+    until(&mut b.stats, |s| s.unchanged >= 1).await;
 }
 
 #[tokio::test]
@@ -201,11 +265,8 @@ async fn chats_survive_a_restart() {
         }
     }
     let chat = Chat::open(&path).unwrap();
-    let viewer = chat.watch("a").unwrap();
-    assert_eq!(
-        bodies(&viewer.results.borrow()),
-        ["chat 2", "chat 1", "chat 0"]
-    );
+    let result = next(&chat.watch("a").unwrap()).await;
+    assert_eq!(bodies(&result), ["chat 2", "chat 1", "chat 0"]);
 }
 
 /// Sends a request and reads until the response holds `want`.
@@ -265,6 +326,7 @@ async fn the_page_and_routes_serve_over_http() {
     let stream = live.await.unwrap();
     assert!(stream.contains("text/event-stream"), "{stream}");
     assert!(stream.contains("event: result"), "{stream}");
+    assert!(stream.contains("event: stats"), "{stream}");
 
     let rejected = http(
         port,

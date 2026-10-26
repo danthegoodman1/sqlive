@@ -7,6 +7,7 @@ use crate::db::{LiveDb, open_connection};
 use crate::deps::{self, Reads, Slot};
 use crate::error::{Error, Result};
 use crate::event::Version;
+use crate::hash::{ResultHash, RowHasher};
 use crate::params::{ParamValues, QueryParams};
 use crate::read_set::ReadSet;
 use crate::schema::Schema;
@@ -16,13 +17,17 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A query's rows, the version of the snapshot it read, and what the rows
-/// depend on.
+/// A query's rows, the version of the snapshot it read, what the rows
+/// depend on, and a hash of the rows.
 #[derive(Clone, Debug)]
 pub struct QueryResult<T> {
+    /// Empty when the result is `unchanged`.
     pub rows: Vec<T>,
     pub version: Version,
     pub read_set: ReadSet,
+    pub hash: ResultHash,
+    /// Set by `rerun` when the rows hash the same as the previous result's.
+    pub unchanged: bool,
 }
 
 /// Distinct query texts whose reads a reader remembers.
@@ -36,6 +41,8 @@ pub(crate) struct Reader {
     schema: Arc<Schema>,
     /// What each query text reads, recorded under `cookie`.
     cache: RefCell<BTreeMap<String, Cached>>,
+    /// The buffer each result's hash gathers its bytes in.
+    hash_buffer: RefCell<Vec<u8>>,
 }
 
 /// What a reader remembers about a query text.
@@ -57,6 +64,7 @@ impl Reader {
             cookie: -1,
             schema: Arc::new(Schema::default()),
             cache: RefCell::new(BTreeMap::new()),
+            hash_buffer: RefCell::new(Vec::new()),
         })
     }
 
@@ -135,7 +143,10 @@ impl LiveDb {
                             return Err(e.into());
                         }
                     }
+                    // Statements prepared under the old schema report its
+                    // columns until their first step re-prepares them.
                     reader.cache.get_mut().clear();
+                    reader.conn.flush_prepared_statement_cache();
                     reader.cookie = schema;
                 }
                 Ok(Snapshot {
@@ -159,6 +170,18 @@ impl LiveDb {
         map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> Result<QueryResult<T>> {
         self.snapshot()?.query(sql, params, map)
+    }
+
+    /// Runs a query again in a fresh snapshot and compares its rows with a
+    /// previous result's hash. See [`Snapshot::rerun`].
+    pub fn rerun<T>(
+        &self,
+        sql: &str,
+        params: impl QueryParams,
+        previous: ResultHash,
+        map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<QueryResult<T>> {
+        self.snapshot()?.rerun(sql, params, previous, map)
     }
 
     /// Returns a reader to the pool once its transaction has ended.
@@ -185,6 +208,32 @@ impl Snapshot<'_> {
         &self,
         sql: &str,
         params: impl QueryParams,
+        map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<QueryResult<T>> {
+        self.run(sql, params, None, map)
+    }
+
+    /// Runs a query again and compares its rows with `previous`, the hash
+    /// of an earlier result. When they hash the same, the result is
+    /// `unchanged` and carries no rows, so the app has nothing to push. It
+    /// still carries this snapshot's version, read set and hash, which
+    /// replace the earlier result's. The rows are mapped as they are read,
+    /// then dropped if unchanged.
+    pub fn rerun<T>(
+        &self,
+        sql: &str,
+        params: impl QueryParams,
+        previous: ResultHash,
+        map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<QueryResult<T>> {
+        self.run(sql, params, Some(previous), map)
+    }
+
+    fn run<T>(
+        &self,
+        sql: &str,
+        params: impl QueryParams,
+        previous: Option<ResultHash>,
         mut map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     ) -> Result<QueryResult<T>> {
         let reader = self
@@ -231,6 +280,7 @@ impl Snapshot<'_> {
         // Only the row that fills the window bounds it.
         let filling = analysis.window.as_ref().map(|plan| plan.limit);
         let mut boundary = None;
+        let mut hasher = RowHasher::new(reader.hash_buffer.take());
         let mut rows = statement.raw_query();
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -239,16 +289,25 @@ impl Snapshot<'_> {
             {
                 boundary = Some(owned(row.get_ref(i)?));
             }
+            hasher.row(row)?;
             out.push(map(row)?);
         }
         drop(rows);
         reader.still_open()?;
         let mut reads = cached.reads;
         constrain(&mut reads, analysis, boundary);
+        let (hash, buffer) = hasher.finish();
+        *reader.hash_buffer.borrow_mut() = buffer;
+        let unchanged = previous == Some(hash);
+        if unchanged {
+            out = Vec::new();
+        }
         Ok(QueryResult {
             rows: out,
             version: self.version,
             read_set: ReadSet::new(self.version, reads),
+            hash,
+            unchanged,
         })
     }
 }

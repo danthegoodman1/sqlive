@@ -95,6 +95,7 @@ todos.rows;      // Vec<Todo>
 todos.version;   // commit version of the snapshot the query read
 todos.read_set;  // todos[done, id, list_id, title] where list_id = 5 AND id >= 412
                  //   (412 = id of the 50th row)
+todos.hash;      // ResultHash: a BLAKE3 digest of the rows
 ```
 
 Queries run on read-only connections, concurrently with writes (WAL mode).
@@ -142,22 +143,33 @@ when the database closes; `try_next()` returns at once. A `v` that has not commi
 yet is an `Error::FutureVersion`.
 
 ```rust
-let mut current = db.query(SQL, [5], to_todo)?;
-push_to_clients(&current.rows);
+let first = db.query(SQL, [5], to_todo)?;
+push_to_clients(&first.rows);
+let (mut read_set, mut hash) = (first.read_set, first.hash);
 
-for event in db.changes_since(current.version)? {
+for event in db.changes_since(read_set.version())? {
     // Err(Lagged): the log no longer reaches back to this version.
     // Re-query and resubscribe.
     let event = event?;
-    if current.read_set.intersects(&event) {
-        current = db.query(SQL, [5], to_todo)?;
-        push_to_clients(&current.rows);
+    if read_set.intersects(&event) {
+        let result = db.rerun(SQL, [5], hash, to_todo)?;
+        if !result.unchanged {
+            push_to_clients(&result.rows);
+        }
+        (read_set, hash) = (result.read_set, result.hash);
     }
 }
 ```
 
 A read set carries its snapshot version, and `intersects` returns false for events at
 or below it, since the result already reflects them.
+
+`intersects` can report a commit that leaves the rows the same, so `rerun` checks.
+It runs the query again and compares the rows' hash with the one you pass in. When
+they match, the result is `unchanged` and carries no rows, so you have nothing to
+push. Its read set and hash still replace the old ones, because its version is newer.
+Between runs you keep only the read set and the 32-byte hash. `rerun` maps rows as it
+reads them and drops them if they are unchanged.
 
 An event prints as:
 
@@ -185,19 +197,24 @@ constraints instead of testing each one: with 100,000 subscriptions it handles a
 One stream of changes then serves every query:
 
 ```rust
-let mut subs: ReadSetIndex<SubId> = ReadSetIndex::new();
+let mut index: ReadSetIndex<SubId> = ReadSetIndex::new();
+let mut hashes: BTreeMap<SubId, ResultHash> = BTreeMap::new();
 
 let result = db.query(SQL, [5], to_todo)?;
-subs.insert(sub_id, result.read_set);
 push_to_clients(sub_id, &result.rows);
+index.insert(sub_id, result.read_set);
+hashes.insert(sub_id, result.hash);
 
 for event in db.changes_since(result.version)? {
-    let event = event?;                       // on Err(Lagged), re-run every query
-    let hits: Vec<SubId> = subs.affected(&event).collect();
+    let event = event?;                        // on Err(Lagged), re-run every query
+    let hits: Vec<SubId> = index.affected(&event).collect();
     for sub_id in hits {
-        let result = rerun(sub_id)?;          // app code
-        subs.insert(sub_id, result.read_set); // replaces the old read set
-        push_to_clients(sub_id, &result.rows);
+        let result = rerun(sub_id, hashes[&sub_id])?; // app code: db.rerun(...)
+        if !result.unchanged {
+            push_to_clients(sub_id, &result.rows);
+        }
+        index.insert(sub_id, result.read_set); // replaces the old read set
+        hashes.insert(sub_id, result.hash);
     }
 }
 ```
@@ -222,6 +239,16 @@ collation, `NULL` handling) for you.
   value.
 - **Conservative:** `intersects` returns false only when a change cannot affect the
   result. It may return true for a change that leaves the result the same.
+- **Hashes:** a `ResultHash` covers each row in order, and each value in it with its
+  storage class (reals by their bits). Any difference in a value, a storage class, the
+  row order or the row count changes it. The same rows hash the same in every process,
+  so a client can keep the hash, as it would an ETag: `to_string()` writes 64 hex
+  digits and `ResultHash::from_hex` reads them back, while `as_bytes` and `from_bytes`
+  give the raw 32 bytes. The hash covers the values of every column the query returns,
+  including any your mapping ignores, and only the values: after an event that sets
+  `schema_changed`, run `query` instead of `rerun` if your clients depend on column
+  names. A query without a complete `ORDER BY` can return the same rows in another
+  order, which counts as a change.
 - **Durable:** a published event's transaction survives a crash. A commit that
   reported an error can still reappear after a crash, without an event; streams from
   before it lag.
@@ -248,11 +275,14 @@ collation, `NULL` handling) for you.
 - A snapshot can see a commit a moment before its event is published. It then waits
   for the publish, so `changes_since(result.version)` always succeeds.
 - The **authorizer** reports every table and column a query reads, through views,
-  subqueries, and CTEs. Each reader caches these reads by SQL text until the schema
-  changes. A SQL parser adds constraints from the `WHERE` clause with
-  bound parameter values, and a bound from the last row of a `LIMIT` query.
+  subqueries, and CTEs. Each reader caches these reads, and its prepared statements,
+  by SQL text until the schema changes. A SQL parser adds constraints from the `WHERE`
+  clause with bound parameter values, and a bound from the last row of a `LIMIT`
+  query.
 - `intersects` checks whether an event's old or new row satisfies a read set's
   constraints, using SQLite's comparison rules.
+- BLAKE3 hashes each result's rows as they stream out of SQLite, in buffered blocks
+  so it can hash several chunks at once.
 
 ## Example: live chat
 
@@ -270,18 +300,20 @@ SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10
 ```
 
 so the page lists only the ten newest chats, and each new chat pushes the oldest off.
-Below the list, the page shows the query's read set and two counters: re-runs and
-skips. Post in one room while another room is open in a second tab: the posting room's
-list updates and its re-runs count rises, while the other room's list stays put and
-its skips count rises.
+Below the list, the page shows the query's read set and three counters: re-runs,
+unchanged re-runs and skips. Post in one room while another room is open in a second
+tab: the posting room's list updates and its re-runs count rises, while the other
+room's list stays put and its skips count rises.
 
 ![Two rooms: a chat posted to lobby re-runs its query, while kitchen skips it](examples/chat/screenshot.png)
 
 The server keeps one `ReadSetIndex` of the open rooms' read sets. A follower thread
-reads `db.changes()`, asks the index which rooms each commit affects, re-runs those
-rooms' queries, and pushes the new rows to the room's viewers over server-sent events
-(`GET /rooms/{room}/live`). If the follower falls behind the log, it re-runs every
-room. `POST /rooms/{room}/chats` writes a chat.
+reads `db.changes()`, asks the index which rooms each commit affects, and re-runs
+those rooms' queries with `rerun`. When the rows changed, it pushes them to the room's
+viewers over server-sent events (`GET /rooms/{room}/live`). A room keeps only the
+version and hash of the rows its viewers hold, and each viewer holds at most one
+unsent result: a newer one replaces it. If the follower falls behind the log, it
+re-runs every room. `POST /rooms/{room}/chats` writes a chat.
 
 ## Development
 

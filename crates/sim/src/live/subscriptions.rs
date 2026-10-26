@@ -1,13 +1,15 @@
 //! Live queries as an app would run them: query, follow the change stream,
-//! and re-run whenever the read set intersects an event. The harness checks
-//! each caught-up subscription against the same query run fresh on the
-//! oracle.
+//! and re-run against the held result's hash whenever the read set
+//! intersects an event. The harness checks each caught-up subscription
+//! against the same query run fresh on the oracle.
 
 use super::queries::QuerySpec;
 use crate::prng::Prng;
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
-use sqlive::{Changes, CommitEvent, Condition, Error, Filter, LiveDb, ReadSet, Version};
+use sqlive::{
+    Changes, CommitEvent, Condition, Error, Filter, LiveDb, ReadSet, ResultHash, Version,
+};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -25,6 +27,7 @@ pub struct Held {
     pub rows: Rows,
     pub version: Version,
     pub read_set: ReadSet,
+    pub hash: ResultHash,
 }
 
 pub struct Subscription {
@@ -42,7 +45,7 @@ pub struct Tally {
     pub tested: u64,
     pub intersected: u64,
     pub reruns: u64,
-    /// Re-runs whose rows came out the same.
+    /// Re-runs whose rows hashed the same as the held result's.
     pub unchanged: u64,
     pub failed_queries: u64,
     /// Failed queries whose snapshot SQLite had ended.
@@ -102,7 +105,7 @@ impl Subscription {
     /// Queries afresh and follows the stream from the result's version.
     /// Returns false if an injected fault made the query fail.
     pub fn requery(&mut self, db: &LiveDb, tally: &mut Tally) -> Result<bool, String> {
-        let previous = self.held.take().map(|held| held.rows);
+        self.held = None;
         self.stream = None;
         self.buffer.clear();
         let result = match db.query(&self.query.sql, self.query.params.clone(), rows) {
@@ -112,25 +115,74 @@ impl Subscription {
                 return Ok(false);
             }
         };
-        if let Some(previous) = previous {
-            tally.reruns += 1;
-            if same_rows(&previous, &result.rows, self.query.ordered) {
-                tally.unchanged += 1;
-            }
-        }
-        self.stream = Some(db.changes_since(result.version).map_err(|e| {
-            format!(
-                "subscription {} cannot follow version {}: {e}",
-                self.id, result.version
-            )
-        })?);
+        self.follow_from(db, result.version)?;
         tally.count(&result.read_set);
         self.held = Some(Held {
             rows: result.rows,
             version: result.version,
             read_set: result.read_set,
+            hash: result.hash,
         });
         Ok(true)
+    }
+
+    /// Re-runs the query against the held result's hash and follows the
+    /// stream from the new version. An unchanged result keeps the held rows,
+    /// which the oracle checks once the subscription catches up; it must
+    /// carry no rows. A changed result of a completely ordered query must
+    /// differ from the held rows. Returns false if an injected fault made
+    /// the query fail.
+    fn rerun(&mut self, db: &LiveDb, tally: &mut Tally) -> Result<bool, String> {
+        let held = self.held.take().expect("a held result to re-run");
+        self.stream = None;
+        self.buffer.clear();
+        let params = self.query.params.clone();
+        let result = match db.rerun(&self.query.sql, params, held.hash, rows) {
+            Ok(result) => result,
+            Err(e) => {
+                tally.failed(&e);
+                return Ok(false);
+            }
+        };
+        tally.reruns += 1;
+        let rows = if result.unchanged {
+            tally.unchanged += 1;
+            if !result.rows.is_empty() {
+                return Err(format!(
+                    "subscription {}: an unchanged re-run at version {} returned rows {:?}",
+                    self.id, result.version, result.rows
+                ));
+            }
+            held.rows
+        } else {
+            if self.query.ordered && same_rows(&held.rows, &result.rows, true) {
+                return Err(format!(
+                    "subscription {}: a re-run at version {} reported a change but returned \
+                     the rows it held, {:?}, for {} {:?}",
+                    self.id, result.version, result.rows, self.query.sql, self.query.params
+                ));
+            }
+            result.rows
+        };
+        self.follow_from(db, result.version)?;
+        tally.count(&result.read_set);
+        self.held = Some(Held {
+            rows,
+            version: result.version,
+            read_set: result.read_set,
+            hash: result.hash,
+        });
+        Ok(true)
+    }
+
+    fn follow_from(&mut self, db: &LiveDb, version: Version) -> Result<(), String> {
+        self.stream = Some(db.changes_since(version).map_err(|e| {
+            format!(
+                "subscription {} cannot follow version {version}: {e}",
+                self.id
+            )
+        })?);
+        Ok(())
     }
 
     /// Adopts a result read elsewhere, as a snapshot query is, and follows
@@ -211,7 +263,7 @@ impl Subscription {
             tally.tested += 1;
             if held.read_set.intersects(&event) {
                 tally.intersected += 1;
-                if !self.requery(db, tally)? {
+                if !self.rerun(db, tally)? {
                     break;
                 }
             }

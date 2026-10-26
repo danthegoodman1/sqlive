@@ -8,6 +8,7 @@ rust-version = "1.85"
 repository = "https://github.com/danthegoodman1/sqlive"
 
 [workspace.dependencies]
+blake3 = "1.8.7"
 rusqlite = { version = "0.41", features = ["bundled", "hooks", "preupdate_hook", "column_metadata"] }
 sqlite3-parser = { version = "0.17", default-features = false }
 sqlive = { path = "crates/live" }

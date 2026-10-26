@@ -385,3 +385,30 @@ fn read_set_text(db: &LiveDb) -> ReadSet {
     assert!(read_set.to_string().contains("body = '5'"), "{read_set}");
     read_set
 }
+
+/// A reader caches the statements it runs. After a column before the sort
+/// key is dropped, a statement cached earlier must still find the sort key,
+/// now one column to the left.
+#[test]
+fn a_window_finds_its_sort_key_after_a_column_before_it_is_dropped() {
+    let db = open(
+        "drop-column",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a, c, d);
+         INSERT INTO t (a, c, d) VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);",
+    );
+    let sql = "SELECT * FROM t ORDER BY c DESC LIMIT 2";
+    for _ in 0..2 {
+        assert_eq!(
+            read_set(&db, sql, ()).to_string(),
+            "t[a, c, d, id] where c >= 20"
+        );
+    }
+    db.write(|tx| tx.execute_batch("ALTER TABLE t DROP COLUMN a"))
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            read_set(&db, sql, ()).to_string(),
+            "t[c, d, id] where c >= 20"
+        );
+    }
+}

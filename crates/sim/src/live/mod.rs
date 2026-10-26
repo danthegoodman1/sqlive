@@ -492,6 +492,7 @@ impl Live {
                 rows: held.rows,
                 version: held.version,
                 read_set: held.read_set,
+                hash: held.hash,
             };
             self.subscribe(Some((kind, query, held)))?;
         }
