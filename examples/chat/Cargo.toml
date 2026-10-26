@@ -7,3 +7,10 @@ publish = false
 
 [dependencies]
 sqlive.workspace = true
+axum = "0.8.9"
+futures-util = "0.3.34"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

@@ -289,29 +289,31 @@ Goal:
 A web page where people join a room by id and post chats. SQLite persists the chats, and the page shows the room's last 10 chats, updated live through read-set intersection.
 
 Scope:
-- 7A `examples/chat` (axum, tokio) on `127.0.0.1:3000` with `chat.db`. Schema `chats(id INTEGER PRIMARY KEY, room TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL)` with an index on `(room, created_at)`. Routes: `GET /`, `POST /rooms/{room}/chats`, `GET /rooms/{room}/live` (server-sent events).
-- 7B Live query: `SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10`. One task consumes `changes()` and checks a `ReadSetIndex`. Each hit re-runs its query on `spawn_blocking` and pushes the version, rows, read set and counters (events seen, re-runs, skips).
-- 7C Page: room id and name inputs, a message box, and a list that renders exactly the query's rows. A callout explains that the list shows only the last 10 chats because it is the live query's result: each new chat pushes the oldest off the list. A panel shows the read set (`chats ... where room = 'lobby' AND created_at >= ...`) and the counters, so a chat in another room visibly adds a skip and changes nothing else.
+- 7A `examples/chat` (axum, tokio) on `127.0.0.1:3000` with `chat.db` (`CHAT_ADDR` and `CHAT_DB` override them). Schema `chats(id INTEGER PRIMARY KEY, room TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL)` with a unique index on `(room, created_at)`, so each room's order is total; a post takes the clock's time, or one past the room's newest chat if that is later. Routes: `GET /`, `POST /rooms/{room}/chats`, `GET /rooms/{room}/live` (server-sent events).
+- 7B Live query: `SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10`. One follower thread consumes `changes()` and checks a `ReadSetIndex` of the open rooms, re-runs each hit, and pushes the version, rows and read set to the room's viewers; every room's counters (re-runs, skips) update as a separate event. A new room queries and joins the index under the hub's lock, so the follower checks no commit between them. The follower re-runs queries outside that lock, and a result replaces a room's only when it is newer. A failed re-run retries on the next commit; a lag re-runs every room.
+- 7C Page: room id and name inputs, a message box, and a list that renders exactly the query's rows. A callout explains that the list shows only the last 10 chats because it is the live query's result: each new chat pushes the oldest off the list. A panel shows the read set (`chats[...] where room = 'lobby' AND created_at >= ...`) and the counters, so a chat in another room visibly adds a skip and changes nothing else.
 - 7D README section "Example: live chat" matches the running app.
 
 Out of scope:
 - Authentication, history paging, multiple server processes.
 
 Completion gate:
-Integration tests pass; a manual check with two browser tabs in different rooms shows live updates in the posting room and a skip in the other; `/code-review` findings are resolved.
+Integration tests pass; a browser check with two rooms open shows live updates in the posting room and a skip in the other; `/code-review` findings are resolved.
 
 Testing plan:
-- Integration tests in `examples/chat/tests/live.rs` with subscribers in rooms A and B. A chat posted to A pushes a new result to A and adds a skip to B with no push. After 11 chats, A holds the 10 newest. Restarting the server on the same `chat.db` keeps the chats.
-- Manual: two tabs, screenshots of the callout, the list and the counters.
+- Integration tests in `examples/chat/tests/live.rs` with viewers in rooms A and B. A chat posted to A pushes a new result to A and adds a skip to B with no push. After 11 chats, A holds the 10 newest, and a chat older than the window skips. A post sorts after a chat stamped ahead of the clock in its room, and only its room. A room closes with its last viewer. A follower stalled past the log's capacity re-runs every room. Reopening `chat.db` keeps the chats. The routes serve the page, accept a post, stream it, reject an empty name, and limit room ids by characters.
+- Planted bugs in the follower, the re-run, post timestamps, viewer counting and the lag path, caught by the chat tests.
+- Browser: headless Firefox renders two rooms side by side while a chat posts to one.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 7A: Server, schema, routes | Missing: `examples/chat/src/main.rs`. |
-| Incomplete | Work | 7B: Live query loop with `ReadSetIndex` and counters | Missing: implementation. |
-| Incomplete | Work | 7C: Page with callout and read-set panel | Missing: `examples/chat/static/index.html`. |
-| Incomplete | Doc | 7D: README example section matches the app | Missing: run against the README commands. |
-| Incomplete | Test | Room isolation, 10-row window, persistence across restart | Missing: `examples/chat/tests/live.rs`. |
-| Incomplete | Test | Manual two-tab check | Missing: screenshots. |
-| Incomplete | Gate | Code review | Missing: `/code-review` findings and resolutions. |
+| Complete | Work | 7A: Server, schema, routes | `examples/chat/src/main.rs`, `router` in `examples/chat/src/lib.rs`; `the_page_and_routes_serve_over_http`, `a_post_sorts_after_every_earlier_chat_in_its_room`. |
+| Complete | Work | 7B: Live query loop with `ReadSetIndex` and counters | `follow`, `affected`, `rerun` and `Chat::watch` in `examples/chat/src/lib.rs`; `a_chat_reaches_its_room_and_skips_the_others`, `a_room_shows_its_ten_newest_chats`, `a_room_closes_when_its_last_viewer_leaves`, `a_follower_behind_the_log_queries_every_room_again`. |
+| Complete | Work | 7C: Page with callout and read-set panel | `examples/chat/static/index.html`; `examples/chat/screenshot.png`. |
+| Complete | Doc | 7D: README example section matches the app | `README.md` "Example: live chat", checked against the running server. |
+| Complete | Test | Room isolation, 10-row window, chat order, closing rooms, lag, persistence across restart | `examples/chat/tests/live.rs`: 7 tests pass, and 30 of 30 release runs pass under 16 busy CPU threads; `scripts/check 10000` passes. |
+| Complete | Test | Browser check | `examples/chat/screenshot.png`: headless Firefox with `lobby` and `kitchen` open while a chat posts to `lobby`. The lobby list gains the chat and drops its oldest (version 16, 1 re-run); kitchen keeps version 15 and counts 1 skip. |
+| Complete | Gate | Code review | `/code-review high`, 10 findings, all resolved: room and name limits count characters and the page reports a failed join; a failed re-run logs and retries; the timestamp `max` reads only the room; re-runs run outside the hub lock; a lag counts its re-runs; the unique index and room-scoped timestamps fix the order; Phase 7 mutants; `affected` collects a `BTreeSet`; the derivable commit counter is gone; the page tracks its first render and writes the author to the hash. |
+| Complete | Test | Phase 7 planted bugs | `scripts/mutants` (all layers): 61 of 61 caught, 6 of them Phase 7, each by `examples/chat/tests/live.rs`. |

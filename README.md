@@ -8,13 +8,14 @@ columns, and key ranges the result depends on. Every committed write emits a
 SqLive reports what changed and what each query depends on. Your app tracks
 subscriptions and pushes updates to clients.
 
-Status: design stage. [`PLAN.md`](PLAN.md) tracks the build.
+Status: every phase in [`PLAN.md`](PLAN.md) is built and tested. SqLive is young and
+unpublished; expect the API to change.
 
 ## Install
 
 ```toml
 [dependencies]
-sqlive = "0.1"
+sqlive = { git = "https://github.com/danthegoodman1/sqlive" }
 ```
 
 The crate bundles SQLite built with `SQLITE_ENABLE_PREUPDATE_HOOK`.
@@ -243,9 +244,28 @@ collation, `NULL` handling) for you.
 cargo run -p chat-example
 ```
 
-Open <http://127.0.0.1:3000>, enter a room id, and post. The page shows the live query
-`SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10`; chats in other
-rooms leave it untouched.
+Open <http://127.0.0.1:3000>, enter a room id and your name, and post. Chats persist in
+`chat.db` (set `CHAT_DB` to move it, and `CHAT_ADDR` to listen elsewhere).
+
+Each room shows the result of one live query:
+
+```sql
+SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10
+```
+
+so the page lists only the ten newest chats, and each new chat pushes the oldest off.
+Below the list, the page shows the query's read set and two counters: re-runs and
+skips. Post in one room while another room is open in a second tab: the posting room's
+list updates and its re-runs count rises, while the other room's list stays put and
+its skips count rises.
+
+![Two rooms: a chat posted to lobby re-runs its query, while kitchen skips it](examples/chat/screenshot.png)
+
+The server keeps one `ReadSetIndex` of the open rooms' read sets. A follower thread
+reads `db.changes()`, asks the index which rooms each commit affects, re-runs those
+rooms' queries, and pushes the new rows to the room's viewers over server-sent events
+(`GET /rooms/{room}/live`). If the follower falls behind the log, it re-runs every
+room. `POST /rooms/{room}/chats` writes a chat.
 
 ## Development
 

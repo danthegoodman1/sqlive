@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SqLive chat</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --line: #e2e2dc; --accent: #2f6fdb; --accent-text: #ffffff;
+    --callout: #fff7e0; --callout-line: #e8cf7c; --code: #f0f0ec;
+    --fresh: #e6f4ea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #1f1f1d; --text: #ecece8; --muted: #a0a09a;
+      --line: #33332f; --accent: #6d9bf0; --accent-text: #0f0f0e;
+      --callout: #2b2615; --callout-line: #6b5b24; --code: #2a2a27;
+      --fresh: #1e3326;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .lede { color: var(--muted); margin: 0 0 20px; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; }
+  input, textarea, button { font: inherit; }
+  input, textarea {
+    flex: 1 1 160px; min-width: 0; padding: 8px 10px; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  }
+  button {
+    padding: 8px 16px; border: 0; border-radius: 6px; cursor: pointer;
+    background: var(--accent); color: var(--accent-text); font-weight: 600;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 16px; margin-top: 16px;
+  }
+  .callout {
+    background: var(--callout); border: 1px solid var(--callout-line);
+    border-radius: 8px; padding: 12px 14px; margin-top: 16px;
+  }
+  code, .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
+  }
+  code { background: var(--code); padding: 1px 4px; border-radius: 4px; }
+  .readset {
+    display: block; background: var(--code); padding: 8px 10px; border-radius: 6px;
+    overflow-wrap: anywhere; margin: 6px 0 12px;
+  }
+  ol { list-style: none; margin: 0; padding: 0; }
+  li { padding: 10px 0; border-top: 1px solid var(--line); }
+  li:first-child { border-top: 0; }
+  li.fresh { background: var(--fresh); transition: background 1.5s; }
+  .who { font-weight: 600; }
+  .when, .muted { color: var(--muted); font-size: 13px; }
+  .empty { color: var(--muted); padding: 8px 0; }
+  .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .stat { background: var(--code); border-radius: 6px; padding: 8px 10px; }
+  .stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .hidden { display: none; }
+  .status { margin-top: 8px; font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>SqLive chat</h1>
+  <p class="lede">Join a room by id. Chats persist in SQLite, and the list updates live
+    whenever a commit intersects the room query's read set.</p>
+
+  <form id="join">
+    <input id="room" placeholder="Room id, such as lobby" maxlength="64" required>
+    <input id="author" placeholder="Your name" maxlength="40" required>
+    <button>Join</button>
+  </form>
+
+  <section id="joined" class="hidden">
+    <div class="callout">
+      This list is the live query's result, so it shows only the
+      <strong>10 most recent chats</strong>:
+      <code>SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10</code>.
+      Each new chat pushes the oldest one off the list; every chat stays in
+      <code>chat.db</code>.
+    </div>
+
+    <div class="card">
+      <form id="send">
+        <input id="body" placeholder="Message" maxlength="1000" autocomplete="off" required>
+        <button id="send-button">Send</button>
+      </form>
+      <div id="status" class="status"></div>
+    </div>
+
+    <div class="card">
+      <div class="muted">Room <span id="room-name" class="mono"></span>,
+        version <span id="version" class="mono">-</span></div>
+      <ol id="chats"></ol>
+    </div>
+
+    <div class="card">
+      <div class="muted">Read set of this room's query</div>
+      <code id="readset" class="readset"></code>
+      <div class="stats">
+        <div class="stat"><b id="reruns">0</b><span class="muted">re-runs</span></div>
+        <div class="stat"><b id="skips">0</b><span class="muted">skips</span></div>
+      </div>
+      <p class="muted">A chat in another room adds a skip here and changes nothing else:
+        its row falls outside this read set, so the query does not re-run.</p>
+    </div>
+  </section>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const remember = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
+  const recall = (key) => { try { return localStorage.getItem(key) || ""; } catch { return ""; } };
+
+  let source = null;
+  let room = "";
+  let seen = new Set();
+  let rendered = false;
+
+  const linked = new URLSearchParams(location.hash.slice(1));
+  $("room").value = linked.get("room") || recall("room");
+  $("author").value = linked.get("author") || recall("author");
+
+  $("join").addEventListener("submit", (event) => {
+    event.preventDefault();
+    room = $("room").value.trim();
+    if (!room) return;
+    remember("room", room);
+    remember("author", $("author").value.trim());
+    location.hash = new URLSearchParams({ room, author: $("author").value.trim() }).toString();
+    join();
+  });
+
+  function join() {
+    if (source) source.close();
+    seen = new Set();
+    rendered = false;
+    $("joined").classList.remove("hidden");
+    $("room-name").textContent = room;
+    $("chats").replaceChildren();
+    source = new EventSource("/rooms/" + encodeURIComponent(room) + "/live");
+    source.addEventListener("result", (event) => render(JSON.parse(event.data)));
+    source.addEventListener("stats", (event) => {
+      const stats = JSON.parse(event.data);
+      $("reruns").textContent = stats.reruns;
+      $("skips").textContent = stats.skips;
+    });
+    source.onerror = () => {
+      $("status").textContent = source.readyState === EventSource.CLOSED
+        ? "Could not join this room." : "Reconnecting...";
+    };
+    source.onopen = () => { $("status").textContent = ""; };
+    $("body").focus();
+  }
+
+  function render(result) {
+    $("version").textContent = result.version;
+    $("readset").textContent = result.read_set;
+    const first = !rendered;
+    rendered = true;
+    const items = result.chats.map((chat) => {
+      const item = document.createElement("li");
+      if (!first && !seen.has(chat.id)) item.className = "fresh";
+      const who = document.createElement("span");
+      who.className = "who";
+      who.textContent = chat.author;
+      const when = document.createElement("span");
+      when.className = "when";
+      when.textContent = "  " + new Date(chat.created_at).toLocaleTimeString();
+      const body = document.createElement("div");
+      body.textContent = chat.body;
+      item.append(who, when, body);
+      return item;
+    });
+    seen = new Set(result.chats.map((chat) => chat.id));
+    if (items.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "empty";
+      empty.textContent = "No chats yet. Say hello.";
+      items.push(empty);
+    }
+    $("chats").replaceChildren(...items);
+  }
+
+  $("send").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const body = $("body").value.trim();
+    const author = $("author").value.trim();
+    if (!body || !author || !room) {
+      $("status").textContent = "Enter your name and a message.";
+      return;
+    }
+    $("send-button").disabled = true;
+    try {
+      const response = await fetch("/rooms/" + encodeURIComponent(room) + "/chats", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ author, body }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      $("body").value = "";
+      $("status").textContent = "";
+    } catch (error) {
+      $("status").textContent = "Could not send: " + error.message;
+    } finally {
+      $("send-button").disabled = false;
+      $("body").focus();
+    }
+  });
+
+  if ($("room").value && $("author").value) {
+    room = $("room").value.trim();
+    join();
+  }
+</script>
+</body>
+</html>
