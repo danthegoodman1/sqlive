@@ -338,6 +338,11 @@ The chat query, `SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LI
 10`, over 10,000 rooms of 12 chats, mapping each row to a tuple. 50,000 queries per
 run. The rusqlite runs use `prepare_cached`, except where noted.
 
+The 10.8 MB database is hot: the fill has just written it, so every page is in
+memory. Each connection's SQLite page cache holds 2 MB, and of the 25 pages a chat
+query fetches, 23.4 come from that cache and 1.7 from the OS page cache. These tables
+measure CPU time; the last one reads from the drive.
+
 | Query | SqLive µs | SqLive queries/s | rusqlite µs | rusqlite queries/s |
 | --- | ---: | ---: | ---: | ---: |
 | `query`, 1 thread | 6.3 | 158,796 | 6.5 | 153,349 |
@@ -376,6 +381,18 @@ statistics.
 
 The ranges span runs. Hashing every value and building the read set cost about a
 third of plain rusqlite's scan rate.
+
+With the OS page cache emptied first, fresh connections read each page from the
+drive the first time a query needs it:
+
+| OS page cache emptied first | SqLive µs | rusqlite µs |
+| --- | ---: | ---: |
+| `query`, first of each room, 1 thread | 12.6–13.0 | 13.4–14.7 |
+
+The drive adds about 7 µs to each query, and SqLive's own cost stays the same. These
+10,000 queries read each of the database's 2,648 pages once; a database larger than
+memory reads more per query. On tmpfs the pages stay in memory, so this row measures
+the drive only when the database lives on one.
 
 ### Finding affected subscriptions
 
