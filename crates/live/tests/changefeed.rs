@@ -319,6 +319,23 @@ fn a_stream_behind_the_log_lags_and_a_reopen_forgets_the_log() {
 }
 
 #[test]
+fn closing_the_database_checkpoints_and_deletes_the_wal() {
+    let path = temp_db("close");
+    let db = LiveDb::open(&path).unwrap();
+    db.write(|tx| tx.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1)"))
+        .unwrap();
+    db.query("SELECT x FROM t", (), |row| row.get::<_, i64>(0))
+        .unwrap();
+    let exists = |suffix: &str| std::path::Path::new(&format!("{path}{suffix}")).exists();
+    assert!(exists("-wal"), "the open database writes through the WAL");
+    drop(db);
+    assert!(!exists("-wal") && !exists("-shm"));
+    let conn = sqlive::rusqlite::Connection::open(&path).unwrap();
+    let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(x, 1, "the commit reached the database file");
+}
+
+#[test]
 fn a_primary_key_collation_differs_from_its_column_collation() {
     let db = open(
         "key-collation",

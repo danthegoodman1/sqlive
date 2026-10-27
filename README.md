@@ -44,6 +44,8 @@ db.write(|tx| {
 connections (`readers`), how many events the log retains (`log_capacity`), the busy
 timeout, and the WAL checkpoint threshold (`checkpoint_pages`). SqLive puts the database
 in WAL mode with `synchronous = FULL` and keeps its version in a `_sqlive_meta` table.
+Dropping the `LiveDb` closes its writer last, so when no other connection has the
+database open, SQLite checkpoints the WAL into the database file and deletes it.
 
 ## Write
 
@@ -387,7 +389,7 @@ drive the first time a query needs it:
 
 | OS page cache emptied first | SqLive µs | rusqlite µs |
 | --- | ---: | ---: |
-| `query`, first of each room, 1 thread | 12.6–13.0 | 13.4–14.7 |
+| `query`, first of each room, 1 thread | 12.6–13.0 | 13.4–15.5 |
 
 The drive adds about 7 µs to each query, and SqLive's own cost stays the same. These
 10,000 queries read each of the database's 2,648 pages once; a database larger than

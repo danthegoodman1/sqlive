@@ -10,8 +10,10 @@
 //!
 //! Locks follow SQLite's five levels across the connections of one VFS, and
 //! the `xShm*` methods share WAL-index regions between them, so WAL mode works
-//! with a writer and several readers. File creation and deletion take effect
-//! at once and survive crashes.
+//! with a writer and several readers. A handle opened read-only takes only
+//! shared locks and never writes, like a read-only file descriptor, so a
+//! read-only connection that closes last leaves the WAL in place. File
+//! creation and deletion take effect at once and survive crashes.
 //!
 //! Time comes from a simulated clock that only `xSleep` advances, and
 //! `xRandomness` from the seed. SQLite seeds its own PRNG, which picks WAL
@@ -372,6 +374,7 @@ struct SimFile {
     handle: u64,
     generation: u64,
     lock: c_int,
+    read_only: bool,
     delete_on_close: bool,
     shm_mapped: bool,
 }
@@ -466,6 +469,7 @@ unsafe extern "C" fn x_open(
         handle,
         generation: state.generation,
         lock: ffi::SQLITE_LOCK_NONE,
+        read_only: flags & ffi::SQLITE_OPEN_READONLY != 0,
         delete_on_close: flags & ffi::SQLITE_OPEN_DELETEONCLOSE != 0,
         shm_mapped: false,
     };
@@ -654,7 +658,7 @@ unsafe extern "C" fn x_write(
     let file = unsafe { file(p) };
     let mut guard = file.state();
     let state = &mut *guard;
-    if file.generation != state.generation || state.frozen {
+    if file.generation != state.generation || state.frozen || file.read_only {
         return ffi::SQLITE_IOERR_WRITE;
     }
     state.stats.writes += 1;
@@ -687,7 +691,7 @@ unsafe extern "C" fn x_truncate(p: *mut ffi::sqlite3_file, size: i64) -> c_int {
     let file = unsafe { file(p) };
     let mut guard = file.state();
     let state = &mut *guard;
-    if file.generation != state.generation || state.frozen {
+    if file.generation != state.generation || state.frozen || file.read_only {
         return ffi::SQLITE_IOERR_TRUNCATE;
     }
     let size = size as usize;
@@ -764,6 +768,9 @@ unsafe extern "C" fn x_lock(p: *mut ffi::sqlite3_file, level: c_int) -> c_int {
     }
     if file.lock >= level {
         return ffi::SQLITE_OK;
+    }
+    if file.read_only && level > ffi::SQLITE_LOCK_SHARED {
+        return ffi::SQLITE_IOERR_LOCK;
     }
     let Some(name) = file.name() else {
         file.lock = level;
@@ -1060,6 +1067,31 @@ mod tests {
         assert_eq!(count(&reader), 2);
         drop((reader, other, writer));
         assert!(vfs.file_names().contains(&"db".to_owned()));
+    }
+
+    #[test]
+    fn the_last_connection_to_close_removes_the_wal_unless_it_is_read_only() {
+        let vfs = SimVfs::new(5, FaultConfig::none());
+        let writer = open(&vfs, "db");
+        writer
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let reader =
+            Connection::open_with_flags_and_vfs("db", OpenFlags::SQLITE_OPEN_READ_ONLY, vfs.name())
+                .unwrap();
+        let count: i64 = reader
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let wal = || vfs.file_names().contains(&"db-wal".to_owned());
+        drop(writer);
+        drop(reader);
+        assert!(wal(), "a read-only connection cannot checkpoint");
+        drop(open(&vfs, "db"));
+        assert!(
+            !wal(),
+            "a read-write connection checkpoints and deletes the WAL"
+        );
     }
 
     #[test]

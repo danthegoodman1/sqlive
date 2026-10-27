@@ -244,6 +244,13 @@ impl Readers {
         self.visit().find_map(|slot| crate::lock(slot).take())
     }
 
+    /// Closes every idle reader.
+    pub fn close(&self) {
+        for slot in &self.slots {
+            drop(crate::lock(slot).take());
+        }
+    }
+
     /// Keeps `reader` in the first empty slot, or closes it when every slot
     /// holds one.
     fn keep(&self, reader: Reader) {

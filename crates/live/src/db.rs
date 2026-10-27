@@ -366,6 +366,11 @@ impl Drop for Allowed<'_> {
 impl Drop for LiveDb {
     fn drop(&mut self) {
         self.log.close();
+        // The writer closes last, so when no other connection has the
+        // database open it checkpoints the WAL into the database file and
+        // deletes it. A read-only connection closing last leaves the WAL in
+        // place.
+        self.readers.close();
     }
 }
 

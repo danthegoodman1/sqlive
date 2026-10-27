@@ -82,25 +82,28 @@ fn pages(conn: &Connection) -> (i32, i32) {
     )
 }
 
-/// Moves every page into the database file and drops the file from the OS
-/// page cache, so the next reads come from the drive. Pages on tmpfs stay
-/// in memory.
+/// Drops the closed database from the OS page cache, so the next reads
+/// come from the drive. Pages on tmpfs stay in memory.
 #[cfg(target_os = "linux")]
-fn evict(path: &Path) -> sqlive::Result<()> {
+fn evict(path: &Path) {
     use std::os::fd::AsRawFd;
     unsafe extern "C" {
         fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
     }
     const POSIX_FADV_DONTNEED: i32 = 4;
-    // Queries read pages left in the WAL from the WAL, and the OS drops
-    // only pages already on the drive.
-    Connection::open(path)?.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    // A query would read pages left in the WAL from the WAL; the writer
+    // deletes it as the database closes.
+    let wal = format!("{}-wal", path.display());
+    assert!(
+        !Path::new(&wal).exists(),
+        "{wal} outlived the database's close"
+    );
+    // The OS drops only pages already on the drive.
     let file = std::fs::File::open(path).expect("the database");
     file.sync_all().expect("the database syncs");
     // SAFETY: the descriptor stays open for the call.
     let status = unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED) };
     assert_eq!(status, 0, "posix_fadvise");
-    Ok(())
 }
 
 /// The first query of each room, with the OS page cache emptied first and
@@ -112,7 +115,7 @@ fn cold(path: &Path) -> sqlive::Result<(Duration, Duration)> {
         (0..ROOMS as usize).for_each(query);
         started.elapsed()
     };
-    evict(path)?;
+    evict(path);
     let db = LiveDb::open_with(
         path.to_string_lossy(),
         Options {
@@ -124,7 +127,7 @@ fn cold(path: &Path) -> sqlive::Result<(Duration, Duration)> {
         black_box(db.query(QUERY, [room(i)], chat).expect("a query"));
     });
     drop(db);
-    evict(path)?;
+    evict(path);
     let plain = Connection::open(path)?;
     let plain = first_of_each(&|i| {
         black_box(plain_query(&plain, QUERY, [room(i)]).expect("a query"));

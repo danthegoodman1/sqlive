@@ -11,6 +11,7 @@
 //!   or fall behind, lag, and rebuild;
 //! - every published commit survives a crash, and after a restart each
 //!   replica either resumes or lags and rebuilds;
+//! - a clean close leaves no WAL behind;
 //! - a subscription that re-runs its query whenever its read set intersects
 //!   an event holds the same rows as the query run fresh, once it has
 //!   processed every event, whether it processes them at once or late and
@@ -257,6 +258,8 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
     }
     live.settle()
         .map_err(|message| format!("final check: {message}"))?;
+    live.close()
+        .map_err(|message| format!("final close: {message}"))?;
     live.summary.io = live.vfs.stats();
     live.summary.digest = live.trace.digest();
     Ok(live.summary)
@@ -320,6 +323,28 @@ impl Live {
         Ok(())
     }
 
+    /// Closes every connection, the read-only ones first. Fails if a handle
+    /// to the database outlives it.
+    fn drop_connections(&mut self) -> Result<(), String> {
+        self.oracle = None;
+        self.witness = None;
+        match self.db.take().map(Arc::into_inner) {
+            Some(None) => Err("a handle to the database outlived its close".into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Closes every connection and checks that the WAL is gone: the last
+    /// connection to close checkpoints it into the database and deletes it.
+    fn close(&mut self) -> Result<(), String> {
+        self.drop_connections()?;
+        let wal = format!("{DB}-wal");
+        if self.vfs.file_names().contains(&wal) {
+            return Err(format!("a clean close left {wal} behind"));
+        }
+        Ok(())
+    }
+
     /// Closes the database, cleanly or by crashing, reopens it, and checks
     /// that it is intact and that every published commit survived. Replicas
     /// keep their state and follow the reopened database from their version.
@@ -329,12 +354,10 @@ impl Live {
         self.vfs.set_faults(false);
         if crash {
             self.vfs.begin_crash();
-        }
-        self.oracle = None;
-        self.witness = None;
-        self.db = None;
-        if crash {
+            self.drop_connections()?;
             self.vfs.finish_crash();
+        } else {
+            self.close()?;
         }
         self.open()?;
         let integrity: String = self

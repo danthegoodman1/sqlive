@@ -448,6 +448,15 @@ MUTANTS = [
         "every table reads back with the first table's statement",
         [(DB, "Ok(match statements.entry(table.index) {", "Ok(match statements.entry(0) {")],
     ),
+    # Phase 11
+    (
+        "a closed database closes its readers after its writer",
+        [(DB, "self.readers.close();", "")],
+    ),
+    (
+        "read-only handles lock and write like read-write ones",
+        [(VFS, "read_only: flags & ffi::SQLITE_OPEN_READONLY != 0,", "read_only: false,")],
+    ),
 ]
 
 

@@ -15,7 +15,7 @@ Non-goals until a phase names them: writers in other processes, ATTACHed databas
 - The library starts no threads, reads no clocks and iterates only ordered collections. Events list changes in first-touch order. `clippy.toml` in `crates/live` and `crates/sim` enforces this, so a seed replays exactly.
 - Every feature ships with simulator coverage, a property that fails on a wrong answer, and a planted bug the simulator catches.
 - Build the smallest implementation that meets the phase gate.
-- Execution order: Phase 0 through Phase 10.
+- Execution order: Phase 0 through Phase 11.
 
 ## Testing Strategy
 
@@ -432,8 +432,44 @@ Status ledger:
 | Complete | Work | 10D: Threads | `Readers` in `read.rs`; `Log::reached` in `crates/live/src/log.rs`. Eight threads with memory statistics off: 421,577 to 962,398 queries/s; with them on, 52,732 to 703,957. |
 | Complete | Work | 10E: Read sets | `ColumnsRead`, `Recorded`, `TableRead::new` and `ReadSet::table` in `crates/live/src/read_set.rs`; `lowercase` in `schema.rs` for `ReadSetIndex::affected`. A chat-query read set: 2,164 to 718 bytes, 2,822 to 1,369 in a `ReadSetIndex`; `intersects` on every read set, 35 to 115 events/s; the index, 100,682 to 115,532. |
 | Complete | Work | 10F: Writes | `Capture::written`, `removed` and `touch` in `crates/live/src/capture.rs`; `net_changes`, `run_end`, `read_back` and `change` in `db.rs`; `Table::index` and `Table::select_range` in `schema.rs`; the writer's `PRAGMA schema_version` through `prepare_cached`. A 1,000-row update on tmpfs in a profiling loop: 1,057 to 515 µs; a 1,000-row insert, 1,489 to 1,040 µs. |
-| Complete | Doc | 10G: Published numbers | README "Performance", from the final tree, with a tmpfs table for writes, a rusqlite row that holds its statement, and where the query benchmark's pages come from: `pages` in `crates/bench/src/queries.rs` counts 23.4 per query from SQLite's page cache and 1.7 from the OS, and `cold` empties the OS page cache with `posix_fadvise` for a run that reads from the drive, 12.6–13.0 µs through SqLive and 13.4–14.7 through rusqlite. |
+| Complete | Doc | 10G: Published numbers | README "Performance", from the final tree, with a tmpfs table for writes, a rusqlite row that holds its statement, and where the query benchmark's pages come from: `pages` in `crates/bench/src/queries.rs` counts 23.4 per query from SQLite's page cache and 1.7 from the OS, and `cold` empties the OS page cache with `posix_fadvise` for a run that reads from the drive, 12.6–13.0 µs through SqLive and 13.4–15.5 through rusqlite. |
 | Complete | Test | Tests for the new paths | `a_named_parameter_left_unbound_is_null_on_every_run`, `a_query_runs_inside_another_querys_row_mapping` and `a_read_set_finds_its_tables_in_any_case` in `crates/live/tests/queries.rs`. `a_result_never_runs_ahead_of_the_log` caught "readers do not wait for a commit under way" in 6 of 20 runs before it checkpointed every commit, and 20 of 20 after. |
 | Complete | Test | Phase 10 planted bugs | `scripts/mutants` holds 90, 8 of them Phase 10; its full run caught 89. The miss, "a schema change keeps statements prepared under the old one", no longer planted a bug: a re-planned query prepares a fresh statement into its slot. The bug now also reuses the kept statement, and `a_window_finds_its_sort_key_after_a_column_before_it_is_dropped` catches it. The 13 bugs in `db.rs`, rerun after its last change: 13 of 13 caught. |
 | Complete | Gate | Code review | `/code-review high`, 8 findings. Fixed: kept statements release their bound values; one slot per text replaces a remove and reinsert, so a run allocates no key; `Log::latest` reads the atomic; a plan keeps only its parameter numbering, not the rewritten SQL; `ReadSetIndex::affected` looks tables up without allocating; this ledger. Answered: the slots keep seeds deterministic, since one thread visits them in the same cyclic order whatever its number (now in the `Readers` doc); and binding re-prepares only a parameter planning looked at, while `sqlite3_clear_bindings` re-prepares when planning looked at any, which the 1,000 against 2 re-prepares above show. |
 | Complete | Gate | Full gate | `scripts/check 10000` on the final tree: fmt, clippy and every test pass, 0 of 10,000 seeds failed. |
+
+## Phase 11: Clean Shutdown
+
+Goal:
+Closing a `LiveDb` leaves the database in one file: the writer closes last, checkpoints the WAL into the database file, and deletes it.
+
+Scope:
+- 11A Close order: `LiveDb`'s `Drop` closes the idle readers before the writer. SQLite checkpoints and deletes the WAL only when the last connection to close can take an exclusive lock, which a read-only file descriptor cannot.
+- 11B VFS fidelity: a handle the simulated VFS opens read-only takes only shared locks and never writes, as on disk.
+- 11C Simulator property: every clean close, at a reopen and at the end of a run, leaves no WAL.
+- 11D README: "Open a database" says what closing does.
+
+Out of scope:
+- A database another connection still holds open keeps its WAL, as SQLite does.
+
+Completion gate:
+The library test and the simulator property fail without the fix and pass with it; the 10,000-seed sweep has no failures; `scripts/mutants` catches both new planted bugs; `/code-review` findings are resolved.
+
+Testing plan:
+- `closing_the_database_checkpoints_and_deletes_the_wal` on disk.
+- `the_last_connection_to_close_removes_the_wal_unless_it_is_read_only` for the VFS.
+- The live harness's `close`, checked at each clean reopen and at the end of every run.
+- Planted bugs: readers closing after the writer, and read-only handles that lock and write.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 11A: Close order | `Readers::close` in `crates/live/src/read.rs`, called from `LiveDb`'s `Drop` in `db.rs`. On disk, a closed `LiveDb` left `-wal` and `-shm` files beside the database; now it leaves the database file alone, and the query benchmark's directory holds only `bench.db` after its run. |
+| Complete | Work | 11B: VFS fidelity | `SimFile::read_only` in `crates/sim/src/vfs.rs`: `x_lock` refuses levels above shared with `SQLITE_IOERR_LOCK`, and `x_write` and `x_truncate` refuse writes. Before this, the simulator passed 50 of 50 seeds against the unfixed library, since a read-only connection closing last could checkpoint. |
+| Complete | Test | 11C: Simulator property | `Live::close` in `crates/sim/src/live/mod.rs`. Against the unfixed library, every live seed of 0 to 19 failed with "a clean close left live.db-wal behind"; with the fix, 0 of 200 failed. |
+| Complete | Doc | 11D: README | "Open a database". |
+| Complete | Test | Tests | `closing_the_database_checkpoints_and_deletes_the_wal` in `crates/live/tests/changefeed.rs` fails without the fix; `the_last_connection_to_close_removes_the_wal_unless_it_is_read_only` in `vfs.rs`. |
+| Complete | Test | Phase 11 planted bugs | `scripts/mutants` holds 92, 2 of them Phase 11. With `--only`, after the unmutated code passed every layer: "a closed database closes its readers after its writer", caught by the library tests; "read-only handles lock and write like read-write ones", caught by the simulator's tests. |
+| Complete | Gate | Code review | `/code-review high`, 7 findings, no correctness bugs. Fixed: the cold benchmark's `evict` asserts the WAL is gone instead of assuming it; the `Drop` comment says "no other connection", as the README does; `Readers::close` empties each slot and keeps the pool's size; the live harness's `drop_connections` fails when a handle to the database outlives its close, and both restart paths share it. Answered: closing runs SQLite's own checkpoint on close, as dropping a plain rusqlite connection does; and the bug came from a disk measurement, not a seed, while every live seed catches it, those in `live_seeds_0_to_63_pass_and_replay` included. |
+| Complete | Gate | Full gate | `scripts/check 10000`: fmt, clippy and every test pass, 0 of 10,000 seeds failed. |
