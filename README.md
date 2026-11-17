@@ -8,8 +8,10 @@ columns, and key ranges the result depends on. Every committed write emits a
 SqLive reports what changed and what each query depends on. Your app tracks
 subscriptions and pushes updates to clients.
 
-Status: every phase in [`PLAN.md`](PLAN.md) is built and tested. SqLive is young and
-unpublished; expect the API to change.
+Status: Phases 0 to 11 in [`PLAN.md`](PLAN.md) are built and tested. Phases 12 to 14 are
+open, and Phase 12 lists query shapes whose read sets miss changes today, joins with
+`USING` or `NATURAL` among them. SqLive is young and unpublished; expect the API to
+change.
 
 ## Install
 

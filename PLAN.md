@@ -15,7 +15,7 @@ Non-goals until a phase names them: writers in other processes, ATTACHed databas
 - The library starts no threads, reads no clocks and iterates only ordered collections. Events list changes in first-touch order. `clippy.toml` in `crates/live` and `crates/sim` enforces this, so a seed replays exactly.
 - Every feature ships with simulator coverage, a property that fails on a wrong answer, and a planted bug the simulator catches.
 - Build the smallest implementation that meets the phase gate.
-- Execution order: Phase 0 through Phase 11.
+- Execution order: Phase 0 through Phase 14.
 
 ## Testing Strategy
 
@@ -473,3 +473,125 @@ Status ledger:
 | Complete | Test | Phase 11 planted bugs | `scripts/mutants` holds 92, 2 of them Phase 11. With `--only`, after the unmutated code passed every layer: "a closed database closes its readers after its writer", caught by the library tests; "read-only handles lock and write like read-write ones", caught by the simulator's tests. |
 | Complete | Gate | Code review | `/code-review high`, 7 findings, no correctness bugs. Fixed: the cold benchmark's `evict` asserts the WAL is gone instead of assuming it; the `Drop` comment says "no other connection", as the README does; `Readers::close` empties each slot and keeps the pool's size; the live harness's `drop_connections` fails when a handle to the database outlives its close, and both restart paths share it. Answered: closing runs SQLite's own checkpoint on close, as dropping a plain rusqlite connection does; and the bug came from a disk measurement, not a seed, while every live seed catches it, those in `live_seeds_0_to_63_pass_and_replay` included. |
 | Complete | Gate | Full gate | `scripts/check 10000`: fmt, clippy and every test pass, 0 of 10,000 seeds failed. |
+
+## Phase 12: Read-Set Soundness
+
+Goal:
+Every query gets a read set that covers the tables, columns and rows its result depends on, or a wider one. The simulator generates the query shapes that hid the gaps this phase closes.
+
+Scope:
+- 12A `USING` and `NATURAL` joins. SQLite resolves their join columns itself, so the authorizer reports a join column only where the SQL also names it, and reports a table only through a column the SQL names, or when the statement uses none of its columns. A statement that joins this way, in its own text or in a view it reads, takes its tables from the b-trees its bytecode opens (the `OpenRead` root pages of `EXPLAIN`, looked up in `sqlite_schema`), counts every column of each, and keeps its row filters. When a table it opens cannot be named, as for a virtual table, its read set intersects every commit.
+- 12B Window sort keys. `window_plan` looks through parentheses before it checks whether an `ORDER BY` name is a result alias, since SQLite drops them when it parses.
+- 12C `NaN` parameters. SQLite binds `NaN` as `NULL`, and the constraint plan reads the parameter the same way.
+- 12D Text encodings. `compare` orders text by its UTF-8 bytes, while a UTF-16 database orders `BINARY` text by UTF-16 code units. `open` returns `Error::Unsupported` unless `PRAGMA encoding` is UTF-8.
+- 12E Tables that change without row events. A read of a table-valued pragma function, of `dbstat`, or of a virtual table with neither shadow tables nor a content table, such as `fts5vocab`, intersects every commit.
+- 12F The **Conservative** guarantee covers what SQL determines. The README names what SQL leaves open, where a fresh run may differ without an intersecting event: row order without a complete `ORDER BY`, the rows a `LIMIT` keeps without one, a bare column in an aggregate, and functions that read the clock or draw random numbers.
+- 12G Simulator queries, each new shape from its own PRNG stream: unqualified column names; result aliases that take another column's name, in `ORDER BY` with and without parentheses and `COLLATE`; `USING` and `NATURAL` joins, inner and outer, direct and through views; `NaN` parameters.
+
+Out of scope:
+- Column-level reads for `USING` and `NATURAL` joins, which would count only the join columns.
+- Constraint read sets for UTF-16 databases.
+
+Completion gate:
+Each reproduction in the ledger intersects; all properties hold over a 10,000-seed sweep that includes the 12G shapes; `scripts/mutants` catches every Phase 12 planted bug; `/code-review` findings are resolved.
+
+Testing plan:
+- Unit tests, one per reproduction in the ledger, in `crates/live/tests/queries.rs` and `crates/live/tests/windows.rs`: the write changes the rows, and its event intersects the read set. A UTF-16 database fails to open.
+- Simulator: the Phase 4 live-result property and the Phase 6 index property over the 12G shapes.
+- Planted bugs: tables taken from the authorizer alone; a `USING` join that keeps column-level reads; a view's definition left unread; parentheses that hide an alias; `NaN` kept as a real; a UTF-16 database that opens; a pragma function with a row-level read set; a shadowless virtual table with a row-level read set.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 12A: `USING` and `NATURAL` joins | Missing: fix and tests. On 9dfea38, with `a(k, x)` and `b(k, y)`: `SELECT a.x FROM a JOIN b USING (k)` and `SELECT a.x FROM a NATURAL JOIN b` return the read set `a[x]`; `SELECT count(*) FROM a JOIN b USING (k)` returns an empty one; `SELECT x FROM v`, over `CREATE VIEW v AS SELECT a.x AS x FROM a JOIN b USING (k)`, returns `a[x]`. An `UPDATE` of the join column `k`, in `a` or in `b`, changes each result and intersects none of them. `EXPLAIN` of the join and of the view query lists `OpenRead` on the root pages of both `a` and `b`. |
+| Complete | Decision | 12A: what a `USING` or `NATURAL` statement falls back to | The owner chose, on 2026-11-17: tables from the bytecode with every column counted, so commits to other tables still skip. |
+| Incomplete | Work | 12B: Parenthesized `ORDER BY` aliases | Missing: fix and tests. With `t(a, b)` holding (1, 10), (2, 20) and (3, 30), `SELECT b AS a, a AS x FROM t ORDER BY (a) LIMIT 2` sorts by `b` and returns the read set `t[a, b] where (a IS NULL OR a <= 2)`; `INSERT INTO t VALUES (100, 5)` enters the window and skips. `ORDER BY (a) COLLATE BINARY` does the same; `ORDER BY "a"` already drops the window. |
+| Incomplete | Work | 12C: `NaN` parameters | Missing: fix and test. With `t(id INTEGER PRIMARY KEY, a REAL)`, `SELECT id FROM t WHERE a IS ?1` bound to `f64::NAN` returns the read set `t[a, id] where a IS NaN`; `INSERT INTO t VALUES (2, NULL)` adds a row to the result and skips. |
+| Incomplete | Work | 12D: UTF-16 databases | Missing: the check in `LiveDb::open_with` and a test. In a database created with `PRAGMA encoding = 'UTF-16le'` and `t(name TEXT)`, `SELECT name FROM t WHERE name < ?1` bound to `'a'` returns the read set `t[name] where name < 'a'`; inserting `'Ā'` (U+0100), which UTF-16LE orders before `'a'`, adds a row and skips. |
+| Complete | Decision | 12D: refuse UTF-16 databases, or open them and constrain text by equality alone | The owner chose, on 2026-11-17: refuse at `open`, since change detection also compares text by its UTF-8 bytes. |
+| Incomplete | Work | 12E: Pragma functions, `dbstat` and shadowless virtual tables | Missing: fix and tests. `SELECT user_version FROM pragma_user_version` skips a commit that runs `PRAGMA user_version = 7`; `SELECT page_count FROM pragma_page_count` and `SELECT sum(pgsize) FROM dbstat` skip a commit that inserts 2,000 rows; `SELECT term FROM vocab`, over `CREATE VIRTUAL TABLE vocab USING fts5vocab (docs, row)`, skips an insert into `docs`. |
+| Incomplete | Doc | 12F: The **Conservative** guarantee names what SQL leaves open | Missing: README wording. With `t(id INTEGER PRIMARY KEY, a, b, c)` and an index on `(b, c, a)`, `SELECT a FROM t WHERE b > 0 LIMIT 2` returns other rows after `UPDATE t SET c = 0 WHERE id = 3`, and its read set `t[a, b] where b > 0` skips the update. The simulator already limits only completely ordered queries (`order_and_limit` in `crates/sim/src/live/queries.rs`). |
+| Incomplete | Work | 12G: Simulator query shapes | Missing: the shapes. `crates/sim/src/live/queries.rs` qualifies every column with a table alias, joins only with `ON`, gives no result column another column's name, and binds no `NaN`, so every seed passes over the gaps above. |
+| Incomplete | Test | Unit tests, one per reproduction | Missing: tests in `crates/live/tests/queries.rs` and `crates/live/tests/windows.rs`. |
+| Incomplete | Test | Live-result and index properties over the 12G shapes | Missing: a summary over live seeds 0–299 that counts queries of each new shape. |
+| Incomplete | Test | Phase 12 planted bugs | Missing: the bugs in `scripts/mutants` and a run that catches each. |
+| Incomplete | Gate | 10,000-seed sweep | Missing: `scripts/check 10000` on the final tree. |
+| Incomplete | Gate | Code review | Missing: `/code-review high` with its findings resolved. |
+
+## Phase 13: Batch Events and Read-Set Size
+
+Goal:
+`ReadSetIndex::affected` takes time in proportion to an event's changes and the keys they reach, and a read set holds only the memory its constraints need.
+
+Scope:
+- 13A `affected` checks each candidate with `ReadSet::affected_by` against the change that found it, once per key, and keeps the version check `intersects` makes. Today it tests each candidate against the whole event, which costs the product of candidates and changes.
+- 13B `constrain` trims each conjunction's constraints to their length.
+- 13C `sqlive-bench index` measures events of 1, 100, 1,000 and 5,000 changes, and the README's index and memory tables carry the new numbers.
+
+Out of scope:
+- Recomputing an entry's registrations on removal in place of storing them.
+- Readers beyond the pool. Each opens a connection, loads the schema and prepares its statement for one query: 16 threads on 4 readers with a 50-table schema ran 331,000 chat queries a second, against 492,000 on 16 readers.
+
+Completion gate:
+The index properties pass; `sqlive-bench index` shows a 5,000-change event costing at most twice as much per change as a 1-change event; `scripts/mutants` catches every Phase 13 planted bug; `/code-review` findings are resolved.
+
+Testing plan:
+- `affected_matches_testing_every_read_set` gains transactions of several statements across both tables. `Live::check_index` already compares `affected` with `intersects` on every simulator event.
+- Planted bugs: a candidate accepted without its check; a candidate checked against an event's first change alone; the version check dropped.
+- `sqlive-bench index` and `sqlive-bench memory`.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 13A: `affected` checks a candidate against the change that found it | Missing: implementation. On 9dfea38, with 100,000 chat-query read sets over 10,000 rooms on tmpfs, one event inserting a chat into each of N rooms took 5.8 µs for N = 1, 845 µs for 100, 58.7 ms for 1,000 and 1.43 s for 5,000. A prototype took 6.4 µs, 786 µs, 8.0 ms and 37.9 ms, and passed both tests in `crates/live/tests/index.rs`. |
+| Incomplete | Work | 13B: Constraints trimmed to their length | Missing: implementation. A `Constraint` takes 128 bytes, and a `Vec` that grows by `push` starts at four. On a patched copy of 9dfea38, `shrink_to_fit` on each conjunction in `constrain` took a chat-query read set from 718 to 462 bytes, and from 1,369 to 1,113 in a `ReadSetIndex` (`sqlive-bench memory`). |
+| Incomplete | Work | 13C: Benchmark rows and README | Missing: batch-event rows in `crates/bench/src/index.rs` and the README's tables. |
+| Incomplete | Test | Index matches brute force on batch events | Missing: multi-statement transactions in `affected_matches_testing_every_read_set`. |
+| Incomplete | Test | Phase 13 planted bugs | Missing: the bugs in `scripts/mutants` and a run that catches each. |
+| Incomplete | Gate | Cost per change stays flat | Missing: `sqlive-bench index` output from the final tree. |
+| Incomplete | Gate | 10,000-seed sweep | Missing: `scripts/check 10000` on the final tree. |
+| Incomplete | Gate | Code review | Missing: `/code-review high` with its findings resolved. |
+
+## Phase 14: Bounded Event Memory
+
+Goal:
+The memory one transaction's event takes, and the memory the log retains, stay within bounds the options set, whatever a transaction writes.
+
+Scope:
+- 14A Log budget. `Options::log_bytes` bounds the size of the retained events beside `log_capacity`. `write` sizes an event as it builds the rows. The oldest events drop first, and streams behind them lag; the log always keeps its newest event, so a stream at the head receives it.
+- 14B Change cap. `Options::table_changes` caps the rows of one table a transaction records. Past the cap, capture releases what it recorded for the table and stops recording it, and the event names the table in `CommitEvent::whole_tables` and lists none of its rows. `intersects` returns true for a read set that reads a named table, and `ReadSetIndex::affected` returns every key registered under it.
+- 14C Simulator. Options draw a small cap and a small budget from their own stream. A replica reloads a named table from a dump, and subscriptions keep the live-result property.
+- 14D README: the options, the event's field, the **Complete** and **Net** guarantees, and a bulk-transaction row in the memory table.
+
+Out of scope:
+- Spilling events to disk.
+- Streaming a transaction's changes before it commits.
+
+Completion gate:
+All properties hold over a 10,000-seed sweep with the cap and budget drawn; `sqlive-bench memory` shows the log within its budget after bulk commits; `scripts/mutants` catches every Phase 14 planted bug; `/code-review` findings are resolved.
+
+Testing plan:
+- Unit tests in `crates/live/src/log.rs`: events drop by size, oldest first; the newest event stays; a stream behind the dropped events lags.
+- `crates/live/tests/changefeed.rs`: a table past the cap is named and lists no rows, while another table in the same transaction lists its rows; a read set on the named table intersects, and one on another table skips.
+- Simulator: the Phase 2 replica property and the Phase 4 live-result property with the cap and budget drawn.
+- Planted bugs: the budget ignored; the newest event dropped; rows recorded before the cap left in the event with the table unnamed; `intersects` blind to `whole_tables`; the index blind to `whole_tables`.
+- `sqlive-bench memory`: one 200,000-row insert, then three updates of all 200,000 rows.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 14A: Log budget | Missing: implementation. On 9dfea38 with default options and chat rows of a 60-byte body, one commit inserting 200,000 rows leaves 72 MB of Rust heap in the log, and each commit updating all 200,000 adds 110 MB: 401 MB after three, held until 4,096 later commits. |
+| Incomplete | Work | 14B: Change cap and `whole_tables` | Missing: implementation. Capture keeps each touched row's old values until the commit, and the event keeps each changed row's old and new values: about 360 bytes for an inserted chat row and 550 for an updated one. |
+| Complete | Decision | 14B: name the table, or set `schema_changed` | The owner chose, on 2026-11-17: `whole_tables`, so a bulk write to one table re-runs only the queries that read it. |
+| Complete | Decision | Defaults for `log_bytes` and `table_changes` | The owner chose, on 2026-11-17: 64 MiB and 10,000 rows; an app that replicates from events raises the cap. |
+| Incomplete | Work | 14C: Simulator cap, budget and replica reload | Missing: the options in `LiveOptions::from_seed` and the reload in `crates/sim/src/live/replica.rs`. |
+| Incomplete | Doc | 14D: README | Missing: the options, `whole_tables`, the reworded guarantees and the memory row. |
+| Incomplete | Test | Log and capture unit tests | Missing: tests in `crates/live/src/log.rs` and `crates/live/tests/changefeed.rs`. |
+| Incomplete | Test | Replica and live-result properties under the cap and budget | Missing: a summary over live seeds 0–299 that counts capped tables and events dropped by size. |
+| Incomplete | Test | Phase 14 planted bugs | Missing: the bugs in `scripts/mutants` and a run that catches each. |
+| Incomplete | Gate | The log stays within its budget | Missing: `sqlive-bench memory` output from the final tree. |
+| Incomplete | Gate | 10,000-seed sweep | Missing: `scripts/check 10000` on the final tree. |
+| Incomplete | Gate | Code review | Missing: `/code-review high` with its findings resolved. |
