@@ -19,7 +19,8 @@
 //!   writes;
 //! - a snapshot held across writes returns the rows of its version;
 //! - an index of every subscription's read set finds, for each event,
-//!   exactly the read sets that intersect it.
+//!   exactly the read sets that intersect it, both before the subscriptions
+//!   process the event and once their newer read sets are indexed.
 //!
 //! The oracle, a plain read-only connection, reads with fault injection
 //! suspended, so the checks themselves never fail on an injected error.
@@ -38,7 +39,7 @@ use crate::vfs::{FaultConfig, IoStats, SimVfs};
 use replica::{Dump, Replica, difference};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use schema::SchemaSpec;
-use sqlive::{Changes, LiveDb, Options, ReadSetIndex, Version};
+use sqlive::{Changes, CommitEvent, LiveDb, Options, ReadSetIndex, Version};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -127,6 +128,9 @@ pub struct LiveSummary {
     pub index_checks: u64,
     /// Read sets the index found across those events.
     pub index_hits: u64,
+    /// Times the index was checked against an event again, after read sets
+    /// that already reflect it joined the index.
+    pub index_rechecks: u64,
     pub io: IoStats,
     pub digest: u64,
 }
@@ -138,7 +142,7 @@ impl fmt::Display for LiveSummary {
             "{} writes ({} failed), {} statements ({} failed), {} events with {} changes ({} schema), \
              {} lags, {} rebuilds, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
              {} rolled back, \
-             {} subscription checks, {} queries ({} constrained, {} windowed, {} of every commit; by shape {:?}), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, {} index checks ({} hits), \
+             {} subscription checks, {} queries ({} constrained, {} windowed, {} of every commit; by shape {:?}), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, {} index checks ({} hits, {} of an earlier event), \
              I/O errors: {} read {} write {} sync {} busy, digest {:016x}",
             self.writes,
             self.failed_writes,
@@ -172,6 +176,7 @@ impl fmt::Display for LiveSummary {
             self.snapshot_checks,
             self.index_checks,
             self.index_hits,
+            self.index_rechecks,
             self.io.read_errors,
             self.io.write_errors,
             self.io.sync_errors,
@@ -219,6 +224,8 @@ struct Live {
     indexed: BTreeMap<u64, sqlive::ReadSet>,
     /// Every event, for checking the index.
     index_stream: Option<Changes>,
+    /// The last event the index was checked against.
+    last_indexed: Option<Arc<CommitEvent>>,
     oracle: Option<Connection>,
     /// A second read-only connection, which holds a read transaction beside
     /// a snapshot.
@@ -259,6 +266,7 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         index: ReadSetIndex::new(),
         indexed: BTreeMap::new(),
         index_stream: None,
+        last_indexed: None,
         oracle: None,
         witness: None,
         db: None,
@@ -575,6 +583,7 @@ impl Live {
             )?;
         }
         self.sync_index();
+        self.check_reflected()?;
         let latest = db.version();
         let oracle = self.oracle.as_ref().expect("open");
         let subscriptions = &self.subscriptions;
@@ -644,38 +653,57 @@ impl Live {
         Ok(())
     }
 
-    /// Checks every event since the last check against the index: it must
-    /// find exactly the read sets, as last indexed, that the event
-    /// intersects. Runs before subscriptions process the events, while their
-    /// read sets still predate them.
+    /// Checks every event since the last check against the index. Runs
+    /// before subscriptions process the events, while their read sets still
+    /// predate them.
     fn check_index(&mut self, db: &LiveDb) -> Result<(), String> {
         let stream = self.index_stream.as_mut().expect("open");
+        let mut events = Vec::new();
         while let Some(item) = stream.try_next() {
-            let event = match item {
-                Ok(event) => event,
+            match item {
+                Ok(event) => events.push(event),
                 Err(sqlive::Error::Lagged { .. }) => {
                     *stream = db.changes().map_err(|e| format!("index stream: {e}"))?;
                     break;
                 }
                 Err(e) => return Err(format!("index stream: {e}")),
-            };
-            let found: Vec<u64> = self.index.affected(&event).collect();
-            let expected: Vec<u64> = self
-                .indexed
-                .iter()
-                .filter(|(_, read_set)| read_set.intersects(&event))
-                .map(|(id, _)| *id)
-                .collect();
-            if found != expected {
-                return Err(format!(
-                    "the index found {found:?} for event {}, but {expected:?} intersect it: {event:?}",
-                    event.version
-                ));
             }
+        }
+        for event in events {
+            self.summary.index_hits += self.check_affected(&event)? as u64;
             self.summary.index_checks += 1;
-            self.summary.index_hits += found.len() as u64;
+            self.last_indexed = Some(event);
         }
         Ok(())
+    }
+
+    /// Checks the last event again, once read sets that already reflect it
+    /// are indexed: the index must leave those out.
+    fn check_reflected(&mut self) -> Result<(), String> {
+        if let Some(event) = self.last_indexed.clone() {
+            self.check_affected(&event)?;
+            self.summary.index_rechecks += 1;
+        }
+        Ok(())
+    }
+
+    /// Checks that the index finds exactly the read sets, as last indexed,
+    /// that `event` intersects, and returns how many.
+    fn check_affected(&self, event: &CommitEvent) -> Result<usize, String> {
+        let found: Vec<u64> = self.index.affected(event).collect();
+        let expected: Vec<u64> = self
+            .indexed
+            .iter()
+            .filter(|(_, read_set)| read_set.intersects(event))
+            .map(|(id, _)| *id)
+            .collect();
+        if found != expected {
+            return Err(format!(
+                "the index found {found:?} for event {}, but {expected:?} intersect it: {event:?}",
+                event.version
+            ));
+        }
+        Ok(found.len())
     }
 
     /// Indexes each subscription's held read set, replacing older ones and

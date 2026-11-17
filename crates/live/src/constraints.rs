@@ -179,10 +179,15 @@ impl Conjunction {
 impl Filter {
     /// Rows meeting any of `conjunctions`; any row when one of them is
     /// empty.
-    pub(crate) fn any_of(conjunctions: Vec<Conjunction>) -> Filter {
+    pub(crate) fn any_of(mut conjunctions: Vec<Conjunction>) -> Filter {
         if conjunctions.is_empty() || conjunctions.iter().any(|c| c.constraints.is_empty()) {
             Filter::All
         } else {
+            // A read set outlives its query, so it keeps no spare room.
+            for conjunction in &mut conjunctions {
+                conjunction.constraints.shrink_to_fit();
+            }
+            conjunctions.shrink_to_fit();
             Filter::AnyOf(conjunctions)
         }
     }
@@ -418,7 +423,7 @@ impl Pending {
                 }
             }
             Test::OneOf(terms) => {
-                let mut values = Vec::new();
+                let mut values = Vec::with_capacity(terms.len());
                 for term in terms {
                     let value = constant(term)?;
                     if !matches!(value, Value::Null) {

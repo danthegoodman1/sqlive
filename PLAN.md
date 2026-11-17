@@ -531,34 +531,36 @@ Goal:
 `ReadSetIndex::affected` takes time in proportion to an event's changes and the keys they reach, and a read set holds only the memory its constraints need.
 
 Scope:
-- 13A `affected` checks each candidate with `ReadSet::affected_by` against the change that found it, once per key, and keeps the version check `intersects` makes. Today it tests each candidate against the whole event, which costs the product of candidates and changes.
-- 13B `constrain` trims each conjunction's constraints to their length.
+- 13A `affected` checks each candidate with `ReadSet::affected_by` against the change that found it, after the version check `intersects` makes. A key registered under a whole table is checked once, against the table's changes, until one affects it.
+- 13B `Filter::any_of`, which builds each read set's filter, trims the conjunctions and their constraints to their length.
 - 13C `sqlive-bench index` measures events of 1, 100, 1,000 and 5,000 changes, and the README's index and memory tables carry the new numbers.
 
 Out of scope:
 - Recomputing an entry's registrations on removal in place of storing them.
 - Readers beyond the pool. Each opens a connection, loads the schema and prepares its statement for one query: 16 threads on 4 readers with a 50-table schema ran 331,000 chat queries a second, against 492,000 on 16 readers.
+- Keys registered under a whole table that an event leaves unaffected: each checks every change to the table, so the cost is their product. That covers updates to columns such a key leaves unread, and rows that fail a filter with no equality or bound to register under.
+- One definition for the event-level rules of `intersects` and `affected`. The index finds keys through its registrations where `intersects` tests one read set, so each states the rules in its own terms; the simulator and `affected_matches_testing_every_read_set` compare the two on every event.
 
 Completion gate:
 The index properties pass; `sqlive-bench index` shows a 5,000-change event costing at most twice as much per change as a 1-change event; `scripts/mutants` catches every Phase 13 planted bug; `/code-review` findings are resolved.
 
 Testing plan:
-- `affected_matches_testing_every_read_set` gains transactions of several statements across both tables. `Live::check_index` already compares `affected` with `intersects` on every simulator event.
-- Planted bugs: a candidate accepted without its check; a candidate checked against an event's first change alone; the version check dropped.
+- `affected_matches_testing_every_read_set` gains transactions of several statements across both tables, and checks events that some read sets already reflect. The simulator compares `affected` with `intersects` on every event, before the subscriptions process it and again once their newer read sets are indexed.
+- Planted bugs: a candidate accepted without its check; a candidate checked against an event's first change alone; a whole-table key checked against the first change alone; the version check dropped; constraints left with spare room.
 - `sqlive-bench index` and `sqlive-bench memory`.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 13A: `affected` checks a candidate against the change that found it | Missing: implementation. On 9dfea38, with 100,000 chat-query read sets over 10,000 rooms on tmpfs, one event inserting a chat into each of N rooms took 5.8 µs for N = 1, 845 µs for 100, 58.7 ms for 1,000 and 1.43 s for 5,000. A prototype took 6.4 µs, 786 µs, 8.0 ms and 37.9 ms, and passed both tests in `crates/live/tests/index.rs`. |
-| Incomplete | Work | 13B: Constraints trimmed to their length | Missing: implementation. A `Constraint` takes 128 bytes, and a `Vec` that grows by `push` starts at four. On a patched copy of 9dfea38, `shrink_to_fit` on each conjunction in `constrain` took a chat-query read set from 718 to 462 bytes, and from 1,369 to 1,113 in a `ReadSetIndex` (`sqlive-bench memory`). |
-| Incomplete | Work | 13C: Benchmark rows and README | Missing: batch-event rows in `crates/bench/src/index.rs` and the README's tables. |
-| Incomplete | Test | Index matches brute force on batch events | Missing: multi-statement transactions in `affected_matches_testing_every_read_set`. |
-| Incomplete | Test | Phase 13 planted bugs | Missing: the bugs in `scripts/mutants` and a run that catches each. |
-| Incomplete | Gate | Cost per change stays flat | Missing: `sqlive-bench index` output from the final tree. |
-| Incomplete | Gate | 10,000-seed sweep | Missing: `scripts/check 10000` on the final tree. |
-| Incomplete | Gate | Code review | Missing: `/code-review high` with its findings resolved. |
+| Complete | Work | 13A: `affected` checks a candidate against the change that found it | `ReadSetIndex::affected` and `changed` in `crates/live/src/index.rs`. On 9dfea38, with 100,000 chat-query read sets over 10,000 rooms on tmpfs, one event inserting a chat into each of N rooms took 5.8 µs for N = 1, 845 µs for 100, 58.7 ms for 1,000 and 1.43 s for 5,000, each looked up repeatedly. Now, looking each event up once: 8.6 µs, 849 µs, 8.2 ms and 41.0 ms. |
+| Complete | Work | 13B: Constraints trimmed to their length | `Filter::any_of` in `crates/live/src/constraints.rs`. A `Constraint` takes 128 bytes, and a `Vec` that grows by `push` starts at four. A chat-query read set went from 718 to 390 bytes, and from 1,369 to 1,041 in a `ReadSetIndex`; `query` still takes 6.1 µs (`sqlive-bench queries`). An `IN` list takes room for the values it was given. `a_read_set_keeps_no_spare_room_for_its_constraints` in `crates/live/tests/windows.rs`. |
+| Complete | Work | 13C: Benchmark rows and README | `crates/bench/src/index.rs` looks up 2,000, 20, 2 and 2 events of 1, 100, 1,000 and 5,000 changes, each event once, over rooms the lookups before it left alone. README "Many live queries", "Finding affected subscriptions" and "Memory". |
+| Complete | Test | Index matches brute force on batch events | `affected_matches_testing_every_read_set` in `crates/live/tests/index.rs`: a third of its transactions run two to seven statements across both tables, and each step also looks up an earlier event that some read sets already reflect. It asserts over 100 events of several changes. |
+| Complete | Test | Phase 13 planted bugs | `scripts/mutants` holds 111, 5 of them Phase 13. With `--only`, after the unmutated code passed every layer, the library tests caught each one. With `--layers sim,seeds`, the simulator's tests caught the four that return wrong keys; the fifth wastes memory. |
+| Complete | Gate | Cost per change stays flat | `sqlive-bench index` on the final tree: 8.6 µs per change in a 1-change event, 8.5 in 100, 8.2 in 1,000 and 8.2 in 5,000. `sqlive-bench memory`: 37.2 MB for 100,000 read sets held alone, 99.3 MB in a `ReadSetIndex`. |
+| Complete | Gate | 10,000-seed sweep | `scripts/check 10000`: fmt, clippy and every test pass, 0 of 10,000 seeds failed. |
+| Complete | Gate | Code review | `/code-review high`, 8 findings, no correctness bugs. Fixed: `affected` tests a key's version before it checks the key against changes, so a read set that already reflects an event costs one comparison; a change's candidates are deduplicated; the simulator checks the index again once newer read sets join it (`Live::check_reflected`), which catches the dropped version check; an `IN` list's values take exact room; readers alone load the views that join by column name; the benchmark's comments match what it measures; the README and "Out of scope" state where an event costs keys times changes. Answered under "Out of scope": the index and `intersects` each state the event-level rules. |
 
 ## Phase 14: Bounded Event Memory
 

@@ -4,7 +4,7 @@
 use crate::compare::{Affinity, Collation};
 use rusqlite::Connection;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The table that holds the database's version.
@@ -52,9 +52,6 @@ pub(crate) struct Schema {
     /// `PRAGMA schema_version` when loaded.
     pub version: i64,
     tables: BTreeMap<String, Arc<Table>>,
-    /// Lowercase names of the views that join tables by column name, in
-    /// their own definition or through a view they name.
-    pub views_joined_by_name: BTreeSet<String>,
 }
 
 /// Quotes an identifier for SQL.
@@ -92,11 +89,7 @@ impl Schema {
             let table = load_table(conn, &name, index, without_rowid, strict)?;
             tables.insert(name.to_ascii_lowercase(), Arc::new(table));
         }
-        Ok(Schema {
-            version,
-            tables,
-            views_joined_by_name: crate::deps::views_joined_by_name(conn)?,
-        })
+        Ok(Schema { version, tables })
     }
 }
 

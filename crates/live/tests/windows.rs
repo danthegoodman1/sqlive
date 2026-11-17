@@ -5,7 +5,7 @@ mod common;
 
 use common::open;
 use sqlive::rusqlite::{ToSql, named_params};
-use sqlive::{CommitEvent, LiveDb, QueryParams, ReadSet};
+use sqlive::{CommitEvent, Filter, LiveDb, QueryParams, ReadSet};
 
 /// The event a write publishes.
 fn commit(db: &LiveDb, sql: &str) -> CommitEvent {
@@ -460,4 +460,35 @@ fn an_order_by_column_in_parentheses_bounds_its_window() {
             "{sql}"
         );
     }
+}
+
+#[test]
+fn a_read_set_keeps_no_spare_room_for_its_constraints() {
+    let db = chats();
+    let windowed = read_set(
+        &db,
+        "SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10",
+        [1],
+    );
+    let Some(Filter::AnyOf(conjunctions)) = windowed.tables().map(|t| t.filter()).next() else {
+        panic!("a constrained table: {windowed}");
+    };
+    assert_eq!(conjunctions.capacity(), conjunctions.len());
+    for conjunction in conjunctions {
+        assert_eq!(conjunction.constraints.len(), 2);
+        assert_eq!(conjunction.constraints.capacity(), 2);
+    }
+    // A list keeps room for the values it holds, less the `NULL`s it drops.
+    let listed = read_set(
+        &db,
+        "SELECT * FROM chats WHERE room IN (?1, ?2, NULL)",
+        [1, 2],
+    );
+    let Some(Filter::AnyOf(conjunctions)) = listed.tables().map(|t| t.filter()).next() else {
+        panic!("a constrained table: {listed}");
+    };
+    let sqlive::Condition::OneOf(rooms) = &conjunctions[0].constraints[0].condition else {
+        panic!("a list of rooms: {listed}");
+    };
+    assert_eq!((rooms.len(), rooms.capacity()), (2, 3));
 }

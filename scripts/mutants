@@ -468,7 +468,7 @@ MUTANTS = [
     ),
     (
         "a view's join by column name goes unseen",
-        [(DEPS, "if !explains && joins_by_name(sql, &schema.views_joined_by_name) {",
+        [(DEPS, "if !explains && joins_by_name(sql, views) {",
           "if !explains && joins_by_name(sql, &BTreeSet::new()) {")],
     ),
     (
@@ -518,6 +518,30 @@ MUTANTS = [
         "a common table expression's name reads as a table-valued function",
         [(DEPS, "every_commit |= is_function && !PURE_FUNCTIONS.contains(&key.as_str());",
           "every_commit |= !PURE_FUNCTIONS.contains(&key.as_str());")],
+    ),
+    # Phase 13
+    (
+        "the index accepts a candidate without checking its change",
+        [(INDEX, "&& self.predates(key, event) && self.entries[key].read_set.affected_by(change) {",
+          "&& self.predates(key, event) {")],
+    ),
+    (
+        "the index checks a candidate against an event's first change alone",
+        [(INDEX, "&& self.predates(key, event) && self.entries[key].read_set.affected_by(change) {",
+          "&& self.predates(key, event) && self.entries[key].read_set.affected_by(&event.changes[0]) {")],
+    ),
+    (
+        "keys that read a whole table check only an event's first change to it",
+        [(INDEX, "changes.iter().any(|change| read_set.affected_by(change))",
+          "changes.iter().take(1).any(|change| read_set.affected_by(change))")],
+    ),
+    (
+        "the index finds read sets that already reflect an event",
+        [(INDEX, "self.entries[key].read_set.version() < event.version }", "true }")],
+    ),
+    (
+        "read sets keep their constraints' spare room",
+        [(CONSTRAINTS, "for conjunction in &mut conjunctions { conjunction.constraints.shrink_to_fit(); } conjunctions.shrink_to_fit();", "")],
     ),
 ]
 

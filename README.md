@@ -8,9 +8,9 @@ columns, and key ranges the result depends on. Every committed write emits a
 SqLive reports what changed and what each query depends on. Your app tracks
 subscriptions and pushes updates to clients.
 
-Status: Phases 0 to 12 in [`PLAN.md`](PLAN.md) are built and tested. Phases 13 and 14,
-which speed up large events and bound the memory events take, are open. SqLive is young
-and unpublished; expect the API to change.
+Status: Phases 0 to 13 in [`PLAN.md`](PLAN.md) are built and tested. Phase 14, which
+bounds the memory events take, is open. SqLive is young and unpublished; expect the API
+to change.
 
 ## Install
 
@@ -204,7 +204,8 @@ commit, but `ReadSetIndex` does that bookkeeping for you. Store each query's rea
 under a key you choose, such as a subscription id, and `affected(&event)` returns the
 keys whose queries the commit may change. It looks them up by the read sets'
 constraints instead of testing each one: with 100,000 subscriptions it handles about
-115,000 events a second, against 115 for calling `intersects` on each
+115,000 events a second, against 112 for calling `intersects` on each, and a larger
+event costs in proportion to its changes and the read sets each one reaches
 ([Performance](#performance)).
 
 One stream of changes then serves every query:
@@ -422,10 +423,25 @@ inserts one chat into one room, which affects that room's ten subscriptions.
 
 | Method | Events per second | Affected per event |
 | --- | ---: | ---: |
-| `ReadSetIndex::affected` | 115,532 | 10 |
-| `intersects` on every read set | 115 | 10 |
+| `ReadSetIndex::affected` | 114,812 | 10 |
+| `intersects` on every read set | 112 | 10 |
 
-Building the 100,000 read sets, one query each, took 0.57 s.
+Building the 100,000 read sets, one query each, took 0.55 s.
+
+A transaction that inserts a chat into each of many rooms publishes one event.
+`affected` checks each change against the read sets that change reaches, here the
+ten of its room, so the cost per change stays level:
+
+| Changes in one event | µs per event | µs per change | Affected per event |
+| ---: | ---: | ---: | ---: |
+| 1 | 8.6 | 8.6 | 10 |
+| 100 | 849 | 8.5 | 1,000 |
+| 1,000 | 8,167 | 8.2 | 10,000 |
+| 5,000 | 41,015 | 8.2 | 50,000 |
+
+A change reaches a read set through an equality or a bound on one of the table's
+columns. A read set with neither, such as a full scan, is reached by every change to
+its table, and is checked against them until one affects it.
 
 ### Memory
 
@@ -434,8 +450,8 @@ Rust heap measured with a counting allocator; SQLite's heap with
 
 | Held | Count | Rust heap | Per item |
 | --- | ---: | ---: | ---: |
-| Chat-query read sets, held alone | 100,000 | 68.5 MB | 718 bytes |
-| Chat-query read sets in a `ReadSetIndex` | 100,000 | 130.6 MB | 1,369 bytes |
+| Chat-query read sets, held alone | 100,000 | 37.2 MB | 390 bytes |
+| Chat-query read sets in a `ReadSetIndex` | 100,000 | 99.3 MB | 1,041 bytes |
 | Retained events, each inserting one chat | 4,096 | 3.0 MB | 777 bytes |
 
 SQLite's own heap, page caches included, held 4.2 MB. A result hash adds 32 bytes per

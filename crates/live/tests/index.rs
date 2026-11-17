@@ -101,8 +101,18 @@ fn write(rng: &mut Rng) -> (String, Vec<Value>) {
 }
 
 fn commit(db: &LiveDb, sql: &str, params: &[Value]) -> CommitEvent {
+    commit_all(db, &[(sql.to_owned(), params.to_vec())])
+}
+
+/// The event of one transaction that runs every statement.
+fn commit_all(db: &LiveDb, statements: &[(String, Vec<Value>)]) -> CommitEvent {
     let ((), version) = db
-        .write(|tx| tx.execute(sql, params_from_iter(params)).map(|_| ()))
+        .write(|tx| {
+            for (sql, params) in statements {
+                tx.execute(sql, params_from_iter(params))?;
+            }
+            Ok(())
+        })
         .unwrap();
     let event = db
         .changes_since(version - 1)
@@ -127,7 +137,8 @@ fn affected_matches_testing_every_read_set() {
     }
     let mut index = ReadSetIndex::new();
     let mut brute: BTreeMap<u32, ReadSet> = BTreeMap::new();
-    let (mut events, mut hits) = (0, 0);
+    let (mut events, mut hits, mut batches, mut already_seen) = (0, 0, 0, 0);
+    let mut earlier: Option<CommitEvent> = None;
     for step in 0..2000 {
         match rng.below(10) {
             // Subscribe, or re-run a subscription and replace its read set.
@@ -143,24 +154,49 @@ fn affected_matches_testing_every_read_set() {
                 assert_eq!(index.remove(&key).is_some(), brute.remove(&key).is_some());
             }
             _ => {
-                let (sql, params) = write(&mut rng);
-                let event = commit(&db, &sql, &params);
-                let expected: Vec<u32> = brute
-                    .iter()
-                    .filter(|(_, read_set)| read_set.intersects(&event))
-                    .map(|(key, _)| *key)
-                    .collect();
+                // One statement, or a transaction of several across both
+                // tables.
+                let statements: Vec<(String, Vec<Value>)> = match rng.below(3) {
+                    0 => (0..2 + rng.below(6)).map(|_| write(&mut rng)).collect(),
+                    _ => vec![write(&mut rng)],
+                };
+                let event = commit_all(&db, &statements);
+                let intersecting = |event: &CommitEvent| -> Vec<u32> {
+                    brute
+                        .iter()
+                        .filter(|(_, read_set)| read_set.intersects(event))
+                        .map(|(key, _)| *key)
+                        .collect()
+                };
                 let found: Vec<u32> = index.affected(&event).collect();
-                assert_eq!(found, expected, "step {step}: {event:?}");
+                assert_eq!(found, intersecting(&event), "step {step}: {event:?}");
                 events += 1;
                 hits += found.len();
+                batches += usize::from(event.changes.len() > 1);
+                // An event some read sets already reflect affects only the
+                // older ones.
+                if let Some(earlier) = &earlier {
+                    let expected = intersecting(earlier);
+                    let found: Vec<u32> = index.affected(earlier).collect();
+                    assert_eq!(found, expected, "step {step}: {earlier:?}");
+                    already_seen += brute
+                        .values()
+                        .filter(|read_set| read_set.version() >= earlier.version)
+                        .count();
+                }
+                if rng.below(8) == 0 || earlier.is_none() {
+                    earlier = Some(event);
+                }
             }
         }
         assert_eq!(index.len(), brute.len());
     }
     let schema = commit(&db, "CREATE TABLE v (x)", &[]);
     assert_eq!(index.affected(&schema).count(), index.len());
-    assert!(events > 500 && hits > 0, "{events} events, {hits} hits");
+    assert!(
+        events > 500 && hits > 0 && batches > 100 && already_seen > 0,
+        "{events} events, {hits} hits, {batches} batches, {already_seen} read sets past an event"
+    );
 }
 
 #[test]

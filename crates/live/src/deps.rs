@@ -6,7 +6,6 @@
 //! bytecode opens, and every column of each counts.
 
 use crate::read_set::Recorded;
-use crate::schema::Schema;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, OptionalExtension};
 use sqlite3_parser::lexer::Scanner;
@@ -75,7 +74,8 @@ const PURE_FUNCTIONS: [&str; 4] = ["json_each", "json_tree", "jsonb_each", "json
 
 /// Completes the reads the authorizer recorded while SQLite prepared `sql`,
 /// and returns whether every commit counts, whatever rows it changes.
-/// `explains` is set for an `EXPLAIN`, which reads no rows.
+/// `views` names the views that join by column name, and `explains` is set
+/// for an `EXPLAIN`, which reads no rows.
 ///
 /// - A view drops out, since the authorizer reports its base tables too.
 /// - A virtual table adds its shadow tables, which hold its rows and carry
@@ -91,7 +91,7 @@ const PURE_FUNCTIONS: [&str; 4] = ["json_each", "json_tree", "jsonb_each", "json
 pub(crate) fn resolve(
     conn: &Connection,
     sql: &str,
-    schema: &Schema,
+    views: &BTreeSet<String>,
     explains: bool,
     reads: &mut Reads,
 ) -> rusqlite::Result<bool> {
@@ -154,7 +154,7 @@ pub(crate) fn resolve(
             }
         }
     }
-    if !explains && joins_by_name(sql, &schema.views_joined_by_name) {
+    if !explains && joins_by_name(sql, views) {
         every_commit |= !add_opened(conn, sql, reads)?;
         for read in reads.values_mut() {
             read.record_every_column();
