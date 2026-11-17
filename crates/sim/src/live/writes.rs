@@ -72,6 +72,35 @@ pub fn value(prng: &mut Prng, column: &ColumnSpec, strict: bool) -> Value {
     }
 }
 
+/// Words for the full-text tables, some of them values tables hold too.
+const WORDS: [&str; 5] = ["a", "b", "ab", "x", "c"];
+
+pub fn word(prng: &mut Prng) -> Value {
+    Value::Text((*prng.pick(&WORDS)).to_owned())
+}
+
+/// A write to the full-text tables: a document added, replaced or removed,
+/// or a row for `words_log`.
+pub fn full_text_statement(prng: &mut Prng) -> Statement {
+    let text = |prng: &mut Prng| {
+        let words: Vec<&str> = (0..prng.range(1..=3)).map(|_| *prng.pick(&WORDS)).collect();
+        Value::Text(words.join(" "))
+    };
+    let (sql, params) = match prng.below(7) {
+        0..=2 => ("INSERT INTO docs (c0) VALUES (?)", vec![text(prng)]),
+        3 => (
+            "INSERT OR REPLACE INTO docs (rowid, c0) VALUES (?, ?)",
+            vec![key_value(prng), text(prng)],
+        ),
+        4 | 5 => ("DELETE FROM docs WHERE rowid = ?", vec![key_value(prng)]),
+        _ => ("INSERT INTO words_log (c0) VALUES (?)", vec![text(prng)]),
+    };
+    Statement {
+        sql: sql.to_owned(),
+        params,
+    }
+}
+
 fn key_value(prng: &mut Prng) -> Value {
     Value::Integer(prng.range(1..=10) as i64)
 }

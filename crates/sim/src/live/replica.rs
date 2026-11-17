@@ -4,7 +4,12 @@
 //! Replica tables have no types or constraints, so values stay exactly as the
 //! events carry them, but key columns keep their collations, so a `WITHOUT
 //! ROWID` key matches rows the way the real table does. Each applied change
-//! must touch exactly the rows it claims to.
+//! must touch exactly the rows it claims to. A virtual table's shadow tables
+//! replicate as the tables they are.
+//!
+//! When an event names a table whole, the replica reads the table again at
+//! whatever version the database has reached, keeps following the stream,
+//! and skips the table's rows in events at or below that version.
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
@@ -30,11 +35,12 @@ fn quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// The user tables of the main database, as SQLite reports them.
+/// The user tables of the main database, shadow tables included, as SQLite
+/// reports them.
 pub fn shapes(conn: &Connection) -> rusqlite::Result<Vec<Shape>> {
     let mut list = conn.prepare(
         "SELECT name, wr FROM pragma_table_list
-         WHERE schema = 'main' AND type = 'table'
+         WHERE schema = 'main' AND type IN ('table', 'shadow')
            AND substr(name, 1, 7) <> 'sqlite_' AND name <> '_sqlive_meta'
          ORDER BY name",
     )?;
@@ -215,6 +221,20 @@ pub fn read(conn: &Connection) -> rusqlite::Result<(Version, Vec<Shape>, Dump)> 
     })
 }
 
+/// The database's version and the rows of the tables named, read in one
+/// transaction.
+pub fn read_tables(
+    conn: &Connection,
+    names: &[String],
+) -> rusqlite::Result<(Version, Vec<Shape>, Dump)> {
+    read_at(conn, |version| {
+        let mut shapes = shapes(conn)?;
+        shapes.retain(|shape| names.iter().any(|n| n.eq_ignore_ascii_case(&shape.name)));
+        let dump = dump(conn, &shapes, "rowid")?;
+        Ok((version, shapes, dump))
+    })
+}
+
 pub struct Replica {
     pub name: &'static str,
     conn: Connection,
@@ -223,6 +243,15 @@ pub struct Replica {
     stream: Option<Changes>,
     /// The replica must reload from the database before it can continue.
     pub stale: bool,
+    /// Tables the last event named whole, which the replica reloads before
+    /// it applies another event.
+    pub reload: Vec<String>,
+    /// The version each reloaded table's rows are of, by lowercase name,
+    /// while the replica is behind it: the table already reflects the
+    /// events at or below that version.
+    reloaded: BTreeMap<String, Version>,
+    /// The most rows of one table an event may list.
+    limit: usize,
 }
 
 #[derive(Debug, Default)]
@@ -231,10 +260,14 @@ pub struct Drained {
     pub changes: u64,
     pub lagged: bool,
     pub schema_changed: bool,
+    /// Tables the events named whole.
+    pub whole_tables: u64,
 }
 
 impl Replica {
-    pub fn new(name: &'static str) -> Replica {
+    /// A replica of a database whose events list at most `limit` rows of
+    /// one table.
+    pub fn new(name: &'static str, limit: usize) -> Replica {
         Replica {
             name,
             conn: Connection::open_in_memory().expect("an in-memory database"),
@@ -242,6 +275,9 @@ impl Replica {
             version: 0,
             stream: None,
             stale: true,
+            reload: Vec::new(),
+            reloaded: BTreeMap::new(),
+            limit,
         }
     }
 
@@ -261,6 +297,67 @@ impl Replica {
             )
         })?);
         self.stale = false;
+        self.reload.clear();
+        self.reloaded.clear();
+        Ok(())
+    }
+
+    /// Replaces the rows of each table the last event named whole with
+    /// `dump`'s, read at `version` from tables of `shapes`. Returns false,
+    /// changing nothing, if a table has changed shape since, as it has when
+    /// a schema change lies ahead in the stream.
+    pub fn reload_from(
+        &mut self,
+        version: Version,
+        shapes: &[Shape],
+        dump: &Dump,
+    ) -> Result<bool, String> {
+        let known = |name: &str, shapes: &[Shape]| {
+            shapes
+                .iter()
+                .find(|shape| shape.name.eq_ignore_ascii_case(name))
+                .cloned()
+        };
+        let mut tables = Vec::new();
+        for name in &self.reload {
+            match (known(name, &self.shapes), known(name, shapes)) {
+                (Some(held), Some(read)) if held == read => tables.push(held),
+                _ => return Ok(false),
+            }
+        }
+        for shape in tables {
+            let reloaded = self
+                .conn
+                .execute_batch(&format!("DELETE FROM {}", quote(&shape.name)))
+                .and_then(|()| self.insert_rows(&shape, &dump[&shape.name]));
+            reloaded.map_err(|e| format!("{} replica reloading {}: {e}", self.name, shape.name))?;
+            if version > self.version {
+                self.reloaded
+                    .insert(shape.name.to_ascii_lowercase(), version);
+            }
+        }
+        self.reload.clear();
+        Ok(true)
+    }
+
+    /// Whether `table` was reloaded at `version` or later, so its rows
+    /// already reflect an event of that version.
+    fn reflects(&self, table: &str, version: Version) -> bool {
+        self.reloaded
+            .get(&table.to_ascii_lowercase())
+            .is_some_and(|reloaded| *reloaded >= version)
+    }
+
+    fn insert_rows(&self, shape: &Shape, rows: &[Vec<Value>]) -> rusqlite::Result<()> {
+        let width = shape.columns.len() + usize::from(!shape.without_rowid);
+        let marks = vec!["?"; width].join(", ");
+        let mut insert = self.conn.prepare(&format!(
+            "INSERT INTO {} VALUES ({marks})",
+            quote(&shape.name)
+        ))?;
+        for row in rows {
+            insert.execute(params_from_iter(row))?;
+        }
         Ok(())
     }
 
@@ -289,14 +386,7 @@ impl Replica {
                 quote(&shape.name),
                 columns.join(", ")
             ))?;
-            let marks = vec!["?"; columns.len()].join(", ");
-            let mut insert = self.conn.prepare(&format!(
-                "INSERT INTO {} VALUES ({marks})",
-                quote(&shape.name)
-            ))?;
-            for row in &dump[&shape.name] {
-                insert.execute(params_from_iter(row))?;
-            }
+            self.insert_rows(shape, &dump[&shape.name])?;
         }
         Ok(())
     }
@@ -322,10 +412,11 @@ impl Replica {
         dump(&self.conn, &self.shapes, "_rowid")
     }
 
-    /// Applies up to `budget` events that have committed.
+    /// Applies up to `budget` events that have committed, stopping at one
+    /// that names a table whole.
     pub fn drain(&mut self, budget: usize) -> Result<Drained, String> {
         let mut drained = Drained::default();
-        while drained.events < budget as u64 && !self.stale {
+        while drained.events < budget as u64 && !self.stale && self.reload.is_empty() {
             let Some(stream) = self.stream.as_mut() else {
                 break;
             };
@@ -340,6 +431,7 @@ impl Replica {
                     drained.events += 1;
                     drained.changes += event.changes.len() as u64;
                     drained.schema_changed |= event.schema_changed;
+                    drained.whole_tables += event.whole_tables.len() as u64;
                     self.apply(&event)?;
                 }
             }
@@ -359,7 +451,30 @@ impl Replica {
             self.stale = true;
             return Ok(());
         }
+        let mut listed: BTreeMap<String, usize> = BTreeMap::new();
         for change in &event.changes {
+            if event
+                .whole_tables
+                .iter()
+                .any(|table| table.eq_ignore_ascii_case(&change.table))
+            {
+                return Err(format!(
+                    "event {} names {} whole and lists its row {change:?}",
+                    event.version, change.table
+                ));
+            }
+            let rows = listed.entry(change.table.to_ascii_lowercase()).or_default();
+            *rows += 1;
+            if *rows > self.limit {
+                return Err(format!(
+                    "event {} lists more than {} rows of {}",
+                    event.version, self.limit, change.table
+                ));
+            }
+            // A table reloaded at a later version already holds the change.
+            if self.reflects(&change.table, event.version) {
+                continue;
+            }
             self.apply_change(change).map_err(|e| {
                 format!(
                     "{} replica applying {change:?} from event {}: {e}",
@@ -367,6 +482,14 @@ impl Replica {
                 )
             })?;
         }
+        self.reload = event
+            .whole_tables
+            .iter()
+            .filter(|table| !self.reflects(table, event.version))
+            .cloned()
+            .collect();
+        self.reloaded
+            .retain(|_, reloaded| *reloaded > event.version);
         Ok(())
     }
 

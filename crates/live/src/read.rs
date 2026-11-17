@@ -14,7 +14,7 @@ use crate::schema::Schema;
 use rusqlite::types::Value;
 use rusqlite::{Connection, Statement};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,9 +40,12 @@ pub(crate) struct Reader {
     /// while `statements` borrow it. `Drop` frees it.
     conn: NonNull<Connection>,
     slot: Slot,
-    /// The schema cookie `schema` and the caches were loaded under.
+    /// The schema cookie `schema`, `views_joined_by_name` and the caches
+    /// were loaded under.
     cookie: i64,
     schema: Arc<Schema>,
+    /// Lowercase names of the views that join tables by column name.
+    views_joined_by_name: BTreeSet<String>,
     /// What each query text reads, recorded under `cookie`.
     cache: RefCell<BTreeMap<String, Arc<Cached>>>,
     /// A slot for each query text in `cache`, holding its statement,
@@ -74,6 +77,8 @@ impl Drop for Reader {
 struct Cached {
     /// The tables the text reads, in order of their lowercase names.
     reads: Box<[Arc<ColumnsRead>]>,
+    /// The text reads something that changes without row events.
+    every_commit: bool,
     /// How the text numbers its parameters, and its constraint plan;
     /// `None` when SQLite numbers the parameters differently.
     planned: Option<(Parameters, Plan)>,
@@ -90,6 +95,7 @@ impl Reader {
             slot,
             cookie: -1,
             schema: Arc::new(Schema::default()),
+            views_joined_by_name: BTreeSet::new(),
             cache: RefCell::new(BTreeMap::new()),
             statements: RefCell::new(BTreeMap::new()),
             hash_buffer: RefCell::new(Vec::new()),
@@ -101,12 +107,16 @@ impl Reader {
         unsafe { self.conn.as_ref() }
     }
 
-    /// Forgets each query text's reads and statement. Statements prepared
-    /// under an older schema report its columns until their first step
-    /// prepares them again.
-    fn forget(&mut self) {
+    /// Loads the schema that `cookie` marks, and forgets each query text's
+    /// reads and statement. Statements prepared under an older schema
+    /// report its columns until their first step prepares them again.
+    fn reload(&mut self, cookie: i64) -> rusqlite::Result<()> {
+        self.schema = Arc::new(Schema::load(self.conn())?);
+        self.views_joined_by_name = deps::views_joined_by_name(self.conn())?;
         self.cache.get_mut().clear();
         self.statements.get_mut().clear();
+        self.cookie = cookie;
+        Ok(())
     }
 
     /// Starts a read transaction and returns its version and schema cookie.
@@ -159,7 +169,9 @@ impl Reader {
         }
         let (prepared, mut reads) = deps::collect(&self.slot, || conn.prepare(sql));
         let statement = prepared?;
-        deps::resolve(conn, &mut reads)?;
+        let explains = statement.is_explain() != 0;
+        let every_commit =
+            deps::resolve(conn, sql, &self.views_joined_by_name, explains, &mut reads)?;
         let planned = constraints::number_parameters(sql)
             .filter(|n| n.agrees(&statement))
             .map(|numbered| {
@@ -180,6 +192,7 @@ impl Reader {
             });
         let cached = Arc::new(Cached {
             reads: reads.into_values().map(|read| read.finish()).collect(),
+            every_commit,
             planned,
             boundary_column,
         });
@@ -286,16 +299,11 @@ impl LiveDb {
                 // published; a result's version must be one the log has
                 // reached, so `changes_since` can follow it.
                 self.log.catch_up(version);
-                if schema != reader.cookie {
-                    match Schema::load(reader.conn()) {
-                        Ok(loaded) => reader.schema = Arc::new(loaded),
-                        Err(e) => {
-                            self.release(reader);
-                            return Err(e.into());
-                        }
-                    }
-                    reader.forget();
-                    reader.cookie = schema;
+                if schema != reader.cookie
+                    && let Err(e) = reader.reload(schema)
+                {
+                    self.release(reader);
+                    return Err(e.into());
                 }
                 Ok(Snapshot {
                     db: self,
@@ -431,7 +439,7 @@ impl Snapshot<'_> {
         Ok(QueryResult {
             rows: out,
             version: self.version,
-            read_set: ReadSet::new(self.version, tables),
+            read_set: ReadSet::new(self.version, tables, cached.every_commit),
             hash,
             unchanged,
         })

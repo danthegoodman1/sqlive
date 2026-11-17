@@ -5,7 +5,7 @@ mod common;
 
 use common::open;
 use sqlive::rusqlite::{ToSql, named_params};
-use sqlive::{CommitEvent, LiveDb, QueryParams, ReadSet};
+use sqlive::{CommitEvent, Filter, LiveDb, QueryParams, ReadSet};
 
 /// The event a write publishes.
 fn commit(db: &LiveDb, sql: &str) -> CommitEvent {
@@ -411,4 +411,84 @@ fn a_window_finds_its_sort_key_after_a_column_before_it_is_dropped() {
             "t[c, d, id] where c >= 20"
         );
     }
+}
+
+#[test]
+fn an_order_by_name_that_is_a_result_alias_bounds_no_window() {
+    // Each query sorts by `b`, which its result calls `a`.
+    for order in [
+        "a",
+        "\"a\"",
+        "(a)",
+        "((a))",
+        "(a) COLLATE BINARY",
+        "(a COLLATE BINARY)",
+        "(a) DESC",
+    ] {
+        let db = open(
+            "alias",
+            "CREATE TABLE t (a, b); INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+        );
+        let sql = format!("SELECT b AS a, a AS x FROM t ORDER BY {order} LIMIT 2");
+        let pairs =
+            |row: &sqlive::rusqlite::Row<'_>| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?));
+        let before = db.query(&sql, (), pairs).unwrap();
+        assert_eq!(before.read_set.to_string(), "t[a, b]", "{sql}");
+        // By `b`, the new row sorts first or last; by `a`, the other way.
+        let event = commit(&db, "INSERT INTO t VALUES (100, 5), (0, 500)");
+        let after = db.query(&sql, (), pairs).unwrap();
+        assert_ne!(before.rows, after.rows, "{sql}");
+        assert!(before.read_set.intersects(&event), "{sql}");
+    }
+}
+
+#[test]
+fn an_order_by_column_in_parentheses_bounds_its_window() {
+    let db = open(
+        "parentheses",
+        "CREATE TABLE t (a, b); INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+    );
+    for (order, bound) in [
+        ("(a)", "(a IS NULL OR a <= 2)"),
+        ("((a)) COLLATE BINARY", "(a IS NULL OR a <= 2)"),
+        ("(a COLLATE NOCASE)", "(a IS NULL OR a COLLATE NOCASE <= 2)"),
+    ] {
+        let sql = format!("SELECT a, b AS y FROM t ORDER BY {order} LIMIT 2");
+        assert_eq!(
+            read_set(&db, &sql, ()).to_string(),
+            format!("t[a, b] where {bound}"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_read_set_keeps_no_spare_room_for_its_constraints() {
+    let db = chats();
+    let windowed = read_set(
+        &db,
+        "SELECT * FROM chats WHERE room = ?1 ORDER BY created_at DESC LIMIT 10",
+        [1],
+    );
+    let Some(Filter::AnyOf(conjunctions)) = windowed.tables().map(|t| t.filter()).next() else {
+        panic!("a constrained table: {windowed}");
+    };
+    assert_eq!(conjunctions.capacity(), conjunctions.len());
+    for conjunction in conjunctions {
+        assert_eq!(conjunction.constraints.len(), 2);
+        assert_eq!(conjunction.constraints.capacity(), 2);
+    }
+    // A list keeps room for the values it holds, less the `NULL`s it drops.
+    let listed = read_set(
+        &db,
+        "SELECT * FROM chats WHERE room IN (?1, ?2, NULL)",
+        [1, 2],
+    );
+    let Some(Filter::AnyOf(conjunctions)) = listed.tables().map(|t| t.filter()).next() else {
+        panic!("a constrained table: {listed}");
+    };
+    let sqlive::Condition::OneOf(rooms) = &conjunctions[0].constraints[0].condition else {
+        panic!("a list of rooms: {listed}");
+    };
+    assert_eq!((rooms.len(), rooms.capacity()), (2, 3));
 }

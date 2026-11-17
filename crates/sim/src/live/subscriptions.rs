@@ -3,7 +3,7 @@
 //! intersects an event. The harness checks each caught-up subscription
 //! against the same query run fresh on the oracle.
 
-use super::queries::QuerySpec;
+use super::queries::{QuerySpec, Shape};
 use crate::prng::Prng;
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
@@ -40,6 +40,9 @@ pub struct Subscription {
     pub held: Option<Held>,
     pub stream: Option<Changes>,
     pub buffer: Vec<Arc<CommitEvent>>,
+    /// The error of the last query that failed, for a subscription that
+    /// never catches up.
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +61,10 @@ pub struct Tally {
     pub constrained: u64,
     /// Results whose read set bounds a `LIMIT` window.
     pub windowed: u64,
+    /// Results whose read set every commit intersects.
+    pub every_commit: u64,
+    /// Results of each query shape, in the order of `Shape::ALL`.
+    pub shapes: [u64; Shape::ALL.len()],
 }
 
 impl Tally {
@@ -67,7 +74,8 @@ impl Tally {
         self.ended += u64::from(matches!(error, Error::SnapshotEnded));
     }
 
-    fn count(&mut self, read_set: &ReadSet) {
+    /// Counts a query's result.
+    pub fn count(&mut self, shape: Shape, read_set: &ReadSet) {
         let conditions = || {
             read_set.tables().flat_map(|table| match table.filter() {
                 Filter::All => &[][..],
@@ -75,6 +83,11 @@ impl Tally {
             })
         };
         self.queries += 1;
+        self.every_commit += u64::from(read_set.every_commit());
+        self.shapes[Shape::ALL
+            .iter()
+            .position(|s| *s == shape)
+            .expect("a listed shape")] += 1;
         self.constrained += u64::from(conditions().next().is_some());
         self.windowed += u64::from(conditions().any(|conjunction| {
             conjunction
@@ -118,6 +131,7 @@ impl Subscription {
             held: None,
             stream: None,
             buffer: Vec::new(),
+            last_error: None,
         }
     }
 
@@ -133,11 +147,12 @@ impl Subscription {
             Ok(result) => result,
             Err(e) => {
                 tally.failed(&e);
+                self.last_error = Some(e.to_string());
                 return Ok(false);
             }
         };
         self.follow_from(db, result.version)?;
-        tally.count(&result.read_set);
+        tally.count(self.query.shape, &result.read_set);
         self.held = Some(Held {
             rows: result.rows,
             columns,
@@ -164,6 +179,7 @@ impl Subscription {
             Ok(result) => result,
             Err(e) => {
                 tally.failed(&e);
+                self.last_error = Some(e.to_string());
                 return Ok(false);
             }
         };
@@ -183,7 +199,7 @@ impl Subscription {
             if self.query.ordered
                 && columns.is_some()
                 && columns == held.columns
-                && same_rows(&held.rows, &result.rows, true)
+                && same_rows(&held.rows, &result.rows, true, self.query.open)
             {
                 return Err(format!(
                     "subscription {}: a re-run at version {} reported a change but returned \
@@ -194,7 +210,7 @@ impl Subscription {
             (result.rows, columns)
         };
         self.follow_from(db, result.version)?;
-        tally.count(&result.read_set);
+        tally.count(self.query.shape, &result.read_set);
         self.held = Some(Held {
             rows,
             columns,
@@ -348,18 +364,19 @@ fn row_order(a: &[Value], b: &[Value]) -> Ordering {
         .unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 
-/// Whether two results hold the same rows: in the same order when the query
-/// orders them completely, as multisets otherwise.
-pub fn same_rows(a: &Rows, b: &Rows, ordered: bool) -> bool {
+/// Whether two results hold the same rows, leaving out each row's first
+/// `open` columns: in the same order when the query orders them completely,
+/// as multisets otherwise.
+pub fn same_rows(a: &Rows, b: &Rows, ordered: bool, open: usize) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    if ordered {
-        return a.iter().zip(b).all(|(x, y)| row_order(x, y).is_eq());
+    let compared = |row: &'_ Vec<Value>| row.get(open..).unwrap_or_default().to_vec();
+    let mut a: Vec<Vec<Value>> = a.iter().map(compared).collect();
+    let mut b: Vec<Vec<Value>> = b.iter().map(compared).collect();
+    if !ordered {
+        a.sort_by(|x, y| row_order(x, y));
+        b.sort_by(|x, y| row_order(x, y));
     }
-    let mut a: Vec<&Vec<Value>> = a.iter().collect();
-    let mut b: Vec<&Vec<Value>> = b.iter().collect();
-    a.sort_by(|x, y| row_order(x, y));
-    b.sort_by(|x, y| row_order(x, y));
     a.iter().zip(&b).all(|(x, y)| row_order(x, y).is_eq())
 }

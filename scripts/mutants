@@ -185,7 +185,7 @@ MUTANTS = [
     ),
     (
         "virtual tables do not reach their shadow tables",
-        [(DEPS, 'if found != "virtual" {', "if true {")],
+        [(DEPS, 'Some("virtual") => {', 'Some("virtual") if false => {')],
     ),
     (
         "a cached query keeps its reads after a schema change",
@@ -456,6 +456,131 @@ MUTANTS = [
     (
         "read-only handles lock and write like read-write ones",
         [(VFS, "read_only: flags & ffi::SQLITE_OPEN_READONLY != 0,", "read_only: false,")],
+    ),
+    # Phase 12
+    (
+        "a join by column name takes its tables from the authorizer alone",
+        [(DEPS, "every_commit |= !add_opened(conn, sql, reads)?;", "")],
+    ),
+    (
+        "a join by column name keeps column-level reads",
+        [(DEPS, "for read in reads.values_mut() { read.record_every_column(); }", "")],
+    ),
+    (
+        "a view's join by column name goes unseen",
+        [(DEPS, "if !explains && joins_by_name(sql, views) {",
+          "if !explains && joins_by_name(sql, &BTreeSet::new()) {")],
+    ),
+    (
+        "a view that names a joining view does not join by column name",
+        [(DEPS, "!joined.contains(name) && joins_by_name(definition, &joined)",
+          "!joined.contains(name) && joins_by_name(definition, &BTreeSet::new())")],
+    ),
+    (
+        "a join by column name with a virtual table names what it can",
+        [(DEPS, '"VOpen" => named = false,', '"VOpen" => {}')],
+    ),
+    (
+        "parentheses hide an ORDER BY alias",
+        [(CONSTRAINTS, "if let Expr::Id(id) = bare(&first.expr)", "if let Expr::Id(id) = &first.expr")],
+    ),
+    (
+        "a NaN parameter stays a real",
+        [(CONSTRAINTS, "Value::Real(real) if real.is_nan() => Value::Null,", "")],
+    ),
+    (
+        "a UTF-16 database opens",
+        [(DB, 'if encoding != "UTF-8" {', 'if false && encoding != "UTF-8" {')],
+    ),
+    (
+        "a pragma function reads no more than its own rows",
+        [(DEPS, "every_commit |= is_function && !PURE_FUNCTIONS.contains(&key.as_str());", "")],
+    ),
+    (
+        "a virtual table without shadow tables reads no more than its own rows",
+        [(DEPS, "every_commit |= tables.is_empty();", "")],
+    ),
+    (
+        "a full-text table's content view reads as a table",
+        [(DEPS, 'every_commit |= !matches!(content_kind.as_deref(), Some("table" | "shadow"));', "")],
+    ),
+    (
+        "a virtual table takes the shadow tables of one whose name extends its own",
+        [(DEPS, ".is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(&name))",
+          ".is_some_and(|(owner, _)| owner.to_ascii_lowercase().starts_with(&key))")],
+    ),
+    (
+        "recording stops before the version bump makes virtual tables write",
+        [(DB, "let version = bump_version(&tx, after)?; let captured = recording.finish();",
+          "let captured = recording.finish(); let version = bump_version(&tx, after)?;")],
+    ),
+    (
+        "a common table expression's name reads as a table-valued function",
+        [(DEPS, "every_commit |= is_function && !PURE_FUNCTIONS.contains(&key.as_str());",
+          "every_commit |= !PURE_FUNCTIONS.contains(&key.as_str());")],
+    ),
+    # Phase 13
+    (
+        "the index accepts a candidate without checking its change",
+        [(INDEX, "&& self.predates(key, event) && self.entries[key].read_set.affected_by(change) {",
+          "&& self.predates(key, event) {")],
+    ),
+    (
+        "the index checks a candidate against an event's first change alone",
+        [(INDEX, "&& self.predates(key, event) && self.entries[key].read_set.affected_by(change) {",
+          "&& self.predates(key, event) && self.entries[key].read_set.affected_by(&event.changes[0]) {")],
+    ),
+    (
+        "keys that read a whole table check only an event's first change to it",
+        [(INDEX, "changes.iter().any(|change| read_set.affected_by(change))",
+          "changes.iter().take(1).any(|change| read_set.affected_by(change))")],
+    ),
+    (
+        "the index finds read sets that already reflect an event",
+        [(INDEX, "self.entries[key].read_set.version() < event.version }", "true }")],
+    ),
+    (
+        "read sets keep their constraints' spare room",
+        [(CONSTRAINTS, "for conjunction in &mut conjunctions { conjunction.constraints.shrink_to_fit(); } conjunctions.shrink_to_fit();", "")],
+    ),
+    # Phase 14
+    (
+        "the log ignores its byte budget",
+        [(LOG, "|| (state.bytes > state.budget && state.events.len() > 1)", "")],
+    ),
+    (
+        "the log drops its newest event when it passes the budget",
+        [(LOG, "(state.bytes > state.budget && state.events.len() > 1)",
+          "(state.bytes > state.budget && !state.events.is_empty())")],
+    ),
+    (
+        "a table past the cap goes unnamed",
+        [(CAPTURE, ".filter(|(_, rows)| *rows > self.limit) .map(|(table, _)| table.name.clone())",
+          ".filter(|_| false) .map(|(table, _)| table.name.clone())")],
+    ),
+    (
+        "a table past the cap is named whole and keeps its earlier rows",
+        [(CAPTURE, "is_none_or(|(_, rows)| *rows <= limit)", "is_none_or(|_| true)")],
+    ),
+    (
+        "the change cap records one row past it",
+        [(CAPTURE, "if *rows > self.limit {", "if *rows > self.limit + 1 {")],
+    ),
+    (
+        "the change cap counts rows across transactions",
+        [(CAPTURE, "self.counts.clear();", "")],
+    ),
+    (
+        "intersects ignores the tables an event names whole",
+        [(READ_SET, "|| event.whole_tables.iter().any(|table| self.reads_rows_of(table))", "")],
+    ),
+    (
+        "the index ignores the tables an event names whole",
+        [(INDEX, "for table in &event.whole_tables {", "for table in event.whole_tables.iter().take(0) {")],
+    ),
+    (
+        "a whole table reaches only the index keys that read every row",
+        [(INDEX, "self.whole.iter().chain(columns)", "self.whole.iter().chain(columns.take(0))")],
     ),
 ]
 

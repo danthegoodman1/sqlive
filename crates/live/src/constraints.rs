@@ -179,10 +179,15 @@ impl Conjunction {
 impl Filter {
     /// Rows meeting any of `conjunctions`; any row when one of them is
     /// empty.
-    pub(crate) fn any_of(conjunctions: Vec<Conjunction>) -> Filter {
+    pub(crate) fn any_of(mut conjunctions: Vec<Conjunction>) -> Filter {
         if conjunctions.is_empty() || conjunctions.iter().any(|c| c.constraints.is_empty()) {
             Filter::All
         } else {
+            // A read set outlives its query, so it keeps no spare room.
+            for conjunction in &mut conjunctions {
+                conjunction.constraints.shrink_to_fit();
+            }
+            conjunctions.shrink_to_fit();
             Filter::AnyOf(conjunctions)
         }
     }
@@ -191,6 +196,21 @@ impl Filter {
         match self {
             Filter::All => true,
             Filter::AnyOf(conjunctions) => conjunctions.iter().any(|c| c.matches(row)),
+        }
+    }
+
+    /// Whether some row could meet the filter. No row meets one whose every
+    /// conjunction holds a condition nothing meets, as `x = NULL` and
+    /// `LIMIT 0` leave.
+    pub(crate) fn admits_rows(&self) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::AnyOf(conjunctions) => conjunctions.iter().any(|conjunction| {
+                conjunction
+                    .constraints
+                    .iter()
+                    .all(|c| !matches!(c.condition, Condition::Never))
+            }),
         }
     }
 }
@@ -418,7 +438,7 @@ impl Pending {
                 }
             }
             Test::OneOf(terms) => {
-                let mut values = Vec::new();
+                let mut values = Vec::with_capacity(terms.len());
                 for term in terms {
                     let value = constant(term)?;
                     if !matches!(value, Value::Null) {
@@ -547,15 +567,20 @@ impl Numbered {
 }
 
 impl Parameters {
-    /// Each parameter's value by index, as bound: `NULL` where unbound.
+    /// Each parameter's value by index, as SQLite holds it once bound:
+    /// `NULL` where unbound, and `NULL` for a `NaN`.
     pub fn values(&self, bound: &ParamValues) -> Vec<Option<Value>> {
+        let held = |value: &Value| match value {
+            Value::Real(real) if real.is_nan() => Value::Null,
+            other => other.clone(),
+        };
         let mut values = vec![Some(Value::Null); self.count];
         for (slot, value) in values.iter_mut().zip(&bound.positional) {
-            *slot = Some(value.clone());
+            *slot = Some(held(value));
         }
         for (name, value) in &bound.named {
             if let Some(&index) = self.named.get(name) {
-                values[index - 1] = Some(value.clone());
+                values[index - 1] = Some(held(value));
             }
         }
         values
@@ -1090,12 +1115,10 @@ fn has_subquery(expr: &Expr<'_>) -> bool {
 /// Whether an expression names a column and nothing more, so it cannot
 /// hide an aggregate.
 fn is_plain_column(expr: &Expr<'_>) -> bool {
-    match expr {
-        Expr::Id(_) | Expr::Name(_) | Expr::Qualified(..) | Expr::DoublyQualified(..) => true,
-        Expr::Collate(inner, _) => is_plain_column(inner),
-        Expr::Parenthesized(list) => list.len() == 1 && is_plain_column(&list[0]),
-        _ => false,
-    }
+    matches!(
+        bare(expr),
+        Expr::Id(_) | Expr::Name(_) | Expr::Qualified(..) | Expr::DoublyQualified(..)
+    )
 }
 
 /// A plain table of the main database that a `FROM` clause names, or
@@ -1155,6 +1178,15 @@ fn occurrences<'s>(from: &FromClause<'_>, schema: &'s Schema) -> Option<Vec<Occu
         }
     }
     Some(out)
+}
+
+/// The expression inside any parentheses and `COLLATE`s.
+fn bare<'a, 'b>(expr: &'a Expr<'b>) -> &'a Expr<'b> {
+    match expr {
+        Expr::Parenthesized(inner) if inner.len() == 1 => bare(&inner[0]),
+        Expr::Collate(inner, _) => bare(inner),
+        other => other,
+    }
 }
 
 fn result_alias_named(columns: &[ResultColumn<'_>], name: &str) -> bool {
@@ -1271,12 +1303,9 @@ fn window_plan(
         Some(offset) => Some(term(offset)?),
         None => None,
     };
-    let (inner, collation) = match &first.expr {
-        Expr::Collate(inner, name) => (&**inner, Some(Collation::from_name(&unquote(name)?))),
-        expr => (expr, None),
-    };
-    // SQLite resolves a bare name in ORDER BY to a result alias first.
-    if let Expr::Id(id) = inner
+    // SQLite resolves a bare name in ORDER BY to a result alias first, and
+    // looks through parentheses and `COLLATE` to find the name.
+    if let Expr::Id(id) = bare(&first.expr)
         && result_alias_named(columns, &unquote(id.0)?)
     {
         return None;
@@ -1284,8 +1313,8 @@ fn window_plan(
     let Operand::Column {
         occurrence,
         column,
-        collation: None,
-    } = context.operand(inner)?
+        collation,
+    } = context.operand(&first.expr)?
     else {
         return None;
     };

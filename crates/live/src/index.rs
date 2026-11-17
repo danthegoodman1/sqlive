@@ -5,15 +5,17 @@
 //! constraint: an equality goes in a map keyed by SQLite's equality key under
 //! its collation, a bound goes in a map ordered by SQLite's comparison, and a
 //! table without a usable constraint goes in the table's bucket. A change's
-//! old and new rows look up each indexed column, and every candidate is then
-//! checked with [`ReadSet::intersects`], so the index only narrows the work.
+//! old and new rows look up each indexed column, and each candidate is then
+//! checked with [`ReadSet::affected_by`] against that change, so the index
+//! only narrows the work, and an event costs in proportion to its changes
+//! and the keys they reach.
 //!
 //! A two-sided range registers under its lower bound, so a value above many
 //! such ranges finds each of them as a candidate.
 
 use crate::compare::{Collation, EqKey, compare, eq_key};
 use crate::constraints::{Condition, Conjunction, Constraint, Filter};
-use crate::event::{CommitEvent, Row};
+use crate::event::{CommitEvent, Row, RowChange};
 use crate::read_set::ReadSet;
 use crate::schema::lowercase;
 use rusqlite::types::{Value, ValueRef};
@@ -244,30 +246,99 @@ impl<K: Ord + Clone> ReadSetIndex<K> {
 
     /// The keys whose read sets `event` intersects, in key order.
     pub fn affected<'a>(&'a self, event: &'a CommitEvent) -> impl Iterator<Item = K> + 'a {
-        let candidates: Box<dyn Iterator<Item = &K>> = if event.schema_changed {
-            Box::new(self.entries.keys())
+        let found: Box<dyn Iterator<Item = &K> + 'a> = if event.schema_changed {
+            Box::new(self.entries.keys().filter(|key| self.predates(key, event)))
         } else {
-            let mut found: BTreeSet<&K> = self.every_commit.iter().collect();
-            for change in &event.changes {
-                let Some(index) = self.tables.get(lowercase(&change.table).as_ref()) else {
-                    continue;
-                };
-                found.extend(&index.whole);
-                for ((column, collation), keys) in &index.columns {
-                    for row in [&change.old, &change.new].into_iter().flatten() {
-                        keys.candidates(row, column, collation, &mut found);
-                    }
+            Box::new(self.changed(event).into_iter())
+        };
+        found.cloned()
+    }
+
+    /// Whether `key`'s result is older than `event`; a newer one already
+    /// reflects it.
+    fn predates(&self, key: &K, event: &CommitEvent) -> bool {
+        self.entries[key].read_set.version() < event.version
+    }
+
+    /// The keys older than `event` that every commit affects, or that one
+    /// of its changes does.
+    fn changed<'a>(&'a self, event: &'a CommitEvent) -> BTreeSet<&'a K> {
+        let mut found: BTreeSet<&K> = self
+            .every_commit
+            .iter()
+            .filter(|key| self.predates(key, event))
+            .collect();
+        // A table the event names whole affects each key registered under
+        // it whose result reads the table's rows.
+        for table in &event.whole_tables {
+            if let Some(index) = self.tables.get(lowercase(table).as_ref()) {
+                found.extend(index.keys().filter(|key| {
+                    self.predates(key, event) && self.entries[*key].read_set.reads_rows_of(table)
+                }));
+            }
+        }
+        // Each changed table's keys that depend on any of its rows, with
+        // the table's changes.
+        let mut whole: BTreeMap<&str, (&BTreeSet<K>, Vec<&RowChange>)> = BTreeMap::new();
+        let mut candidates: Vec<&K> = Vec::new();
+        for change in &event.changes {
+            let Some((table, index)) = self.tables.get_key_value(lowercase(&change.table).as_ref())
+            else {
+                continue;
+            };
+            if !index.whole.is_empty() {
+                let (_, changes) = whole
+                    .entry(table)
+                    .or_insert_with(|| (&index.whole, Vec::new()));
+                changes.push(change);
+            }
+            for ((column, collation), keys) in &index.columns {
+                for row in [&change.old, &change.new].into_iter().flatten() {
+                    keys.candidates(row, column, collation, &mut candidates);
                 }
             }
-            Box::new(found.into_iter())
-        };
-        candidates
-            .filter(|key| self.entries[*key].read_set.intersects(event))
-            .cloned()
+            // The old and new rows, and several columns, can find one key.
+            candidates.sort_unstable();
+            candidates.dedup();
+            for key in candidates.drain(..) {
+                if !found.contains(key)
+                    && self.predates(key, event)
+                    && self.entries[key].read_set.affected_by(change)
+                {
+                    found.insert(key);
+                }
+            }
+        }
+        for (keys, changes) in whole.into_values() {
+            for key in keys {
+                let read_set = &self.entries[key].read_set;
+                if !found.contains(key)
+                    && self.predates(key, event)
+                    && changes.iter().any(|change| read_set.affected_by(change))
+                {
+                    found.insert(key);
+                }
+            }
+        }
+        found
     }
 }
 
 impl<K: Ord + Clone> TableIndex<K> {
+    /// Every key registered under the table, some of them more than once.
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        let columns = self.columns.values().flat_map(|column| {
+            column
+                .equal
+                .values()
+                .chain(column.from.values())
+                .chain(column.upto.values())
+                .chain([&column.null])
+                .flatten()
+        });
+        self.whole.iter().chain(columns)
+    }
+
     fn column(&mut self, column: &ColumnKey) -> &mut ColumnIndex<K> {
         self.columns
             .entry(column.clone())
@@ -361,7 +432,7 @@ impl<K: Ord> ColumnIndex<K> {
         row: &Row,
         column: &str,
         collation: &Collation,
-        found: &mut BTreeSet<&'a K>,
+        found: &mut Vec<&'a K>,
     ) {
         let value = match row.get(column) {
             // A row without the column, or text that converted lossily, may

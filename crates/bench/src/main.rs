@@ -25,12 +25,15 @@ struct Counting;
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
 static HELD: AtomicUsize = AtomicUsize::new(0);
+/// The most bytes held since the last `reset_peak`.
+static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let block = unsafe { System.alloc(layout) };
         if !block.is_null() && COUNTING.load(Ordering::Relaxed) {
-            HELD.fetch_add(layout.size(), Ordering::Relaxed);
+            let held = HELD.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK.fetch_max(held, Ordering::Relaxed);
         }
         block
     }
@@ -45,8 +48,11 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, block: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let moved = unsafe { System.realloc(block, layout, size) };
         if !moved.is_null() && COUNTING.load(Ordering::Relaxed) {
-            HELD.fetch_add(size, Ordering::Relaxed);
+            // The old block is gone by now, so the peak counts the new one
+            // alone.
+            let held = HELD.fetch_add(size, Ordering::Relaxed) + size - layout.size();
             HELD.fetch_sub(layout.size(), Ordering::Relaxed);
+            PEAK.fetch_max(held, Ordering::Relaxed);
         }
         moved
     }
@@ -58,6 +64,15 @@ static ALLOCATOR: Counting = Counting;
 /// Bytes the Rust heap holds.
 pub fn heap() -> usize {
     HELD.load(Ordering::Relaxed)
+}
+
+/// The most bytes the Rust heap has held since `reset_peak`.
+pub fn peak() -> usize {
+    PEAK.load(Ordering::Relaxed)
+}
+
+pub fn reset_peak() {
+    PEAK.store(heap(), Ordering::Relaxed);
 }
 
 /// Bytes SQLite's own allocator holds, page caches included.

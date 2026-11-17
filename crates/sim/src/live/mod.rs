@@ -8,7 +8,12 @@
 //! - nothing a write does is visible to other connections before it commits;
 //! - replicas built only from commit events match a dump of the database
 //!   whenever they have caught up, whether they follow every event at once
-//!   or fall behind, lag, and rebuild;
+//!   or fall behind, lag, and rebuild; a replica reloads each table an
+//!   event names whole, at whatever version the database has reached, and
+//!   applies the rows the event lists for the rest; no event lists more
+//!   rows of a table than the cap allows;
+//! - a replica that holds every commit receives the next one, whatever the
+//!   log's bounds;
 //! - every published commit survives a crash, and after a restart each
 //!   replica either resumes or lags and rebuilds;
 //! - a clean close leaves no WAL behind;
@@ -19,7 +24,8 @@
 //!   writes;
 //! - a snapshot held across writes returns the rows of its version;
 //! - an index of every subscription's read set finds, for each event,
-//!   exactly the read sets that intersect it.
+//!   exactly the read sets that intersect it, both before the subscriptions
+//!   process the event and once their newer read sets are indexed.
 //!
 //! The oracle, a plain read-only connection, reads with fault injection
 //! suspended, so the checks themselves never fail on an injected error.
@@ -38,7 +44,7 @@ use crate::vfs::{FaultConfig, IoStats, SimVfs};
 use replica::{Dump, Replica, difference};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use schema::SchemaSpec;
-use sqlive::{Changes, LiveDb, Options, ReadSetIndex, Version};
+use sqlive::{Changes, CommitEvent, LiveDb, Options, ReadSetIndex, Version};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -51,6 +57,10 @@ const DB: &str = "live.db";
 pub struct LiveOptions {
     pub steps: u64,
     pub log_capacity: usize,
+    /// The bytes of events the log retains.
+    pub log_bytes: usize,
+    /// The rows of one table an event lists.
+    pub table_changes: usize,
     pub checkpoint_pages: u32,
     /// How often the lagging replica catches up, per step.
     pub lazy_drain: f64,
@@ -72,9 +82,12 @@ impl LiveOptions {
     pub fn from_seed(seed: u64) -> LiveOptions {
         let mut prng = Prng::stream(seed, "live options");
         let mut subscriptions = Prng::stream(seed, "live subscriptions");
+        let mut bounds = Prng::stream(seed, "live event bounds");
         LiveOptions {
             steps: prng.range(50..=250),
             log_capacity: *prng.pick(&[1, 4, 32, 4096]),
+            log_bytes: *bounds.pick(&[1_500, 30_000, 64 << 20, 64 << 20]),
+            table_changes: *bounds.pick(&[3, 20, 10_000, 10_000]),
             checkpoint_pages: *prng.pick(&[2, 50, 1000]),
             lazy_drain: *prng.pick(&[0.02, 0.1, 0.5]),
             schema_change: *prng.pick(&[0.0, 0.01, 0.03]),
@@ -83,7 +96,18 @@ impl LiveOptions {
             reopen: *prng.pick(&[0.0, 0.01]),
             peek: *prng.pick(&[0.05, 0.3]),
             faults: FaultConfig::from_prng(&mut prng),
-            schema: schema::generate(&mut Prng::stream(seed, "live schema")),
+            schema: {
+                let mut schema = schema::generate(&mut Prng::stream(seed, "live schema"));
+                schema.join_views = schema::join_views(
+                    &mut Prng::stream(seed, "live schema join views"),
+                    &schema.tables,
+                );
+                schema.full_text = schema::full_text(
+                    &mut Prng::stream(seed, "live schema full text"),
+                    &schema.tables,
+                );
+                schema
+            },
             subscriptions: subscriptions.range(1..=8),
             snapshot: *subscriptions.pick(&[0.02, 0.1]),
         }
@@ -101,6 +125,10 @@ pub struct LiveSummary {
     pub schema_events: u64,
     pub lagged: u64,
     pub rebuilds: u64,
+    /// Tables that events named whole, as the replicas received them.
+    pub whole_tables: u64,
+    /// Times a replica reloaded the tables an event named whole.
+    pub reloads: u64,
     pub checks: u64,
     pub skipped_checks: u64,
     pub peeks: u64,
@@ -116,6 +144,9 @@ pub struct LiveSummary {
     pub index_checks: u64,
     /// Read sets the index found across those events.
     pub index_hits: u64,
+    /// Times the index was checked against an event again, after read sets
+    /// that already reflect it joined the index.
+    pub index_rechecks: u64,
     pub io: IoStats,
     pub digest: u64,
 }
@@ -125,9 +156,9 @@ impl fmt::Display for LiveSummary {
         write!(
             f,
             "{} writes ({} failed), {} statements ({} failed), {} events with {} changes ({} schema), \
-             {} lags, {} rebuilds, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
+             {} lags, {} rebuilds, {} whole tables with {} reloads, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
              {} rolled back, \
-             {} subscription checks, {} queries ({} constrained, {} windowed), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, {} index checks ({} hits), \
+             {} subscription checks, {} queries ({} constrained, {} windowed, {} of every commit; by shape {:?}), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, {} index checks ({} hits, {} of an earlier event), \
              I/O errors: {} read {} write {} sync {} busy, digest {:016x}",
             self.writes,
             self.failed_writes,
@@ -138,6 +169,8 @@ impl fmt::Display for LiveSummary {
             self.schema_events,
             self.lagged,
             self.rebuilds,
+            self.whole_tables,
+            self.reloads,
             self.checks,
             self.skipped_checks,
             self.peeks,
@@ -149,6 +182,8 @@ impl fmt::Display for LiveSummary {
             self.subscriptions.queries,
             self.subscriptions.constrained,
             self.subscriptions.windowed,
+            self.subscriptions.every_commit,
+            self.subscriptions.shapes,
             self.subscriptions.intersected,
             self.subscriptions.tested,
             self.subscriptions.reruns,
@@ -159,6 +194,7 @@ impl fmt::Display for LiveSummary {
             self.snapshot_checks,
             self.index_checks,
             self.index_hits,
+            self.index_rechecks,
             self.io.read_errors,
             self.io.write_errors,
             self.io.sync_errors,
@@ -184,6 +220,10 @@ struct Live {
     /// Query shapes added after the first, drawn apart so existing seeds
     /// keep their queries.
     query_shapes: Prng,
+    /// The shapes added after those, each from its own stream.
+    more_shapes: queries::Shapes,
+    /// Writes to the full-text tables.
+    full_text: Prng,
     trace: Trace,
     serial: u64,
     summary: LiveSummary,
@@ -202,6 +242,8 @@ struct Live {
     indexed: BTreeMap<u64, sqlive::ReadSet>,
     /// Every event, for checking the index.
     index_stream: Option<Changes>,
+    /// The last event the index was checked against.
+    last_indexed: Option<Arc<CommitEvent>>,
     oracle: Option<Connection>,
     /// A second read-only connection, which holds a read transaction beside
     /// a snapshot.
@@ -229,22 +271,27 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         restarts: Prng::stream(seed, "live restarts"),
         queries: Prng::stream(seed, "live queries"),
         query_shapes: Prng::stream(seed, "live query shapes"),
+        more_shapes: queries::Shapes::from_seed(seed),
+        full_text: Prng::stream(seed, "live full text writes"),
         trace: Trace::new(verbose),
         serial: 0,
         summary: LiveSummary::default(),
         unknown: false,
         published: 0,
-        replicas: vec![Replica::new("eager"), Replica::new("lazy")],
+        replicas: Vec::new(),
         subscriptions: Vec::new(),
         next_subscription: 0,
         index: ReadSetIndex::new(),
         indexed: BTreeMap::new(),
         index_stream: None,
+        last_indexed: None,
         oracle: None,
         witness: None,
         db: None,
         vfs,
     };
+    let cap = live.options.table_changes;
+    live.replicas = vec![Replica::new("eager", cap), Replica::new("lazy", cap)];
     live.start()?;
     live.vfs.set_faults(true);
     for step in 0..live.options.steps {
@@ -287,6 +334,8 @@ impl Live {
             vfs: Some(self.vfs.name().to_owned()),
             readers: 2,
             log_capacity: self.options.log_capacity,
+            log_bytes: self.options.log_bytes,
+            table_changes: self.options.table_changes,
             busy_timeout: Duration::from_secs(5),
             checkpoint_pages: self.options.checkpoint_pages,
         };
@@ -395,12 +444,20 @@ impl Live {
     }
 
     fn step(&mut self) -> Result<(), String> {
+        let mut restarted = true;
         if self.restarts.chance(self.options.crash) {
             self.restart(true)?;
         } else if self.restarts.chance(self.options.reopen) {
             self.restart(false)?;
+        } else {
+            restarted = false;
         }
         let db = self.db.clone().expect("open");
+        // The log keeps its newest event, so a replica that holds every
+        // commit so far receives this step's.
+        let before = db.version();
+        let eager = &self.replicas[0];
+        let current = !restarted && !self.unknown && !eager.stale && eager.version == before;
         let hold = if self.queries.chance(self.options.snapshot) {
             self.hold(&db)?
         } else {
@@ -416,7 +473,12 @@ impl Live {
         if let Some(hold) = hold {
             self.check_hold(hold)?;
         }
-        self.catch_up(0)?;
+        let lagged = self.catch_up(0)?;
+        if lagged && current && !self.unknown && db.version() == before + 1 {
+            return Err(format!(
+                "the eager replica held version {before} and lagged on the next commit"
+            ));
+        }
         if self.prng.chance(self.options.lazy_drain) {
             self.catch_up(1)?;
         }
@@ -435,7 +497,12 @@ impl Live {
                 subscription
             }
             None => {
-                let query = queries::query(&mut self.queries, &mut self.query_shapes, &self.schema);
+                let query = queries::query(
+                    &mut self.queries,
+                    &mut self.query_shapes,
+                    &mut self.more_shapes,
+                    &self.schema,
+                );
                 let kind = *self.queries.pick(&[Kind::Eager, Kind::Lagging]);
                 Subscription::new(id, query, kind)
             }
@@ -455,7 +522,12 @@ impl Live {
     /// across this step's write. `None` if an injected fault stopped the
     /// snapshot.
     fn hold<'d>(&mut self, db: &'d LiveDb) -> Result<Option<Hold<'d>>, String> {
-        let query = queries::query(&mut self.queries, &mut self.query_shapes, &self.schema);
+        let query = queries::query(
+            &mut self.queries,
+            &mut self.query_shapes,
+            &mut self.more_shapes,
+            &self.schema,
+        );
         let snapshot = match db.snapshot() {
             Ok(snapshot) => snapshot,
             Err(e) => {
@@ -506,7 +578,7 @@ impl Live {
                 return Ok(());
             }
         };
-        if held.version != version || !same_rows(&held.rows, &expected, query.ordered) {
+        if held.version != version || !same_rows(&held.rows, &expected, query.ordered, query.open) {
             return Err(format!(
                 "a snapshot at version {version} returned version {} and rows {:?} for {} {:?}; \
                  the witness read {expected:?}",
@@ -546,6 +618,7 @@ impl Live {
             )?;
         }
         self.sync_index();
+        self.check_reflected()?;
         let latest = db.version();
         let oracle = self.oracle.as_ref().expect("open");
         let subscriptions = &self.subscriptions;
@@ -573,16 +646,32 @@ impl Live {
             ));
         };
         if settle && found.len() != self.subscriptions.len() {
+            let behind: Vec<String> = self
+                .subscriptions
+                .iter()
+                .filter(|subscription| !subscription.caught_up(latest))
+                .map(|subscription| {
+                    format!(
+                        "subscription {}: {} {:?}, whose last failure was {:?}",
+                        subscription.id,
+                        subscription.query.sql,
+                        subscription.query.params,
+                        subscription.last_error
+                    )
+                })
+                .collect();
             return Err(format!(
-                "{} of {} subscriptions caught up with faults off",
+                "{} of {} subscriptions caught up with faults off; behind: {}",
                 found.len(),
-                self.subscriptions.len()
+                self.subscriptions.len(),
+                behind.join("; ")
             ));
         }
         for (i, expected) in found {
             let subscription = &self.subscriptions[i];
             let held = subscription.held.as_ref().expect("caught up");
-            if !same_rows(&held.rows, &expected, subscription.query.ordered) {
+            let query = &subscription.query;
+            if !same_rows(&held.rows, &expected, query.ordered, query.open) {
                 return Err(format!(
                     "subscription {} ({:?}) at version {latest} holds {:?} from version {}, \
                      but {} {:?} returns {expected:?}; read set {}",
@@ -600,38 +689,57 @@ impl Live {
         Ok(())
     }
 
-    /// Checks every event since the last check against the index: it must
-    /// find exactly the read sets, as last indexed, that the event
-    /// intersects. Runs before subscriptions process the events, while their
-    /// read sets still predate them.
+    /// Checks every event since the last check against the index. Runs
+    /// before subscriptions process the events, while their read sets still
+    /// predate them.
     fn check_index(&mut self, db: &LiveDb) -> Result<(), String> {
         let stream = self.index_stream.as_mut().expect("open");
+        let mut events = Vec::new();
         while let Some(item) = stream.try_next() {
-            let event = match item {
-                Ok(event) => event,
+            match item {
+                Ok(event) => events.push(event),
                 Err(sqlive::Error::Lagged { .. }) => {
                     *stream = db.changes().map_err(|e| format!("index stream: {e}"))?;
                     break;
                 }
                 Err(e) => return Err(format!("index stream: {e}")),
-            };
-            let found: Vec<u64> = self.index.affected(&event).collect();
-            let expected: Vec<u64> = self
-                .indexed
-                .iter()
-                .filter(|(_, read_set)| read_set.intersects(&event))
-                .map(|(id, _)| *id)
-                .collect();
-            if found != expected {
-                return Err(format!(
-                    "the index found {found:?} for event {}, but {expected:?} intersect it: {event:?}",
-                    event.version
-                ));
             }
+        }
+        for event in events {
+            self.summary.index_hits += self.check_affected(&event)? as u64;
             self.summary.index_checks += 1;
-            self.summary.index_hits += found.len() as u64;
+            self.last_indexed = Some(event);
         }
         Ok(())
+    }
+
+    /// Checks the last event again, once read sets that already reflect it
+    /// are indexed: the index must leave those out.
+    fn check_reflected(&mut self) -> Result<(), String> {
+        if let Some(event) = self.last_indexed.clone() {
+            self.check_affected(&event)?;
+            self.summary.index_rechecks += 1;
+        }
+        Ok(())
+    }
+
+    /// Checks that the index finds exactly the read sets, as last indexed,
+    /// that `event` intersects, and returns how many.
+    fn check_affected(&self, event: &CommitEvent) -> Result<usize, String> {
+        let found: Vec<u64> = self.index.affected(event).collect();
+        let expected: Vec<u64> = self
+            .indexed
+            .iter()
+            .filter(|(_, read_set)| read_set.intersects(event))
+            .map(|(id, _)| *id)
+            .collect();
+        if found != expected {
+            return Err(format!(
+                "the index found {found:?} for event {}, but {expected:?} intersect it: {event:?}",
+                event.version
+            ));
+        }
+        Ok(found.len())
     }
 
     /// Indexes each subscription's held read set, replacing older ones and
@@ -672,7 +780,19 @@ impl Live {
     }
 
     fn write(&mut self) -> Result<(), String> {
-        let txn = writes::transaction(&mut self.prng, &self.schema);
+        let mut txn = writes::transaction(&mut self.prng, &self.schema);
+        // A statement that writes a full-text table runs with fault
+        // injection suspended. After a read error inside an insert, FTS5
+        // keeps the row and size totals it failed to load, and stores them
+        // at the next commit, where the integrity check finds them wrong;
+        // plain SQLite does the same.
+        let mut full_text_at = None;
+        if self.schema.full_text.is_some() && self.full_text.chance(0.4) {
+            let at = self.full_text.index(txn.statements.len() + 1);
+            txn.statements
+                .insert(at, writes::full_text_statement(&mut self.full_text));
+            full_text_at = Some(at);
+        }
         let before = self.db().version();
         let peeks: Vec<bool> = txn
             .statements
@@ -693,8 +813,13 @@ impl Live {
         let mut finished = false;
         let (oracle, vfs) = (self.oracle(), &self.vfs);
         let result = self.db().write(|tx| {
-            for (statement, peek) in txn.statements.iter().zip(&peeks) {
-                let outcome = tx.execute(&statement.sql, params_from_iter(&statement.params));
+            for (i, (statement, peek)) in txn.statements.iter().zip(&peeks).enumerate() {
+                let execute = || tx.execute(&statement.sql, params_from_iter(&statement.params));
+                let outcome = if full_text_at == Some(i) {
+                    vfs.quietly(execute)
+                } else {
+                    execute()
+                };
                 let failed = outcome.is_err();
                 // Checked after each statement, before a later `SAVEPOINT`
                 // can open a new transaction.
@@ -842,8 +967,10 @@ impl Live {
     }
 
     /// Applies every committed event to replica `i`, rebuilding it when it
-    /// lags or sees a schema change, then compares it with the database.
-    fn catch_up(&mut self, i: usize) -> Result<(), String> {
+    /// lags or sees a schema change and reloading the tables an event names
+    /// whole, then compares it with the database. Returns whether it lagged.
+    fn catch_up(&mut self, i: usize) -> Result<bool, String> {
+        let mut lagged = false;
         loop {
             if self.replicas[i].stale {
                 self.rebuild(i)?;
@@ -852,16 +979,44 @@ impl Live {
             self.summary.events += drained.events;
             self.summary.changes += drained.changes;
             self.summary.schema_events += u64::from(drained.schema_changed);
+            self.summary.whole_tables += drained.whole_tables;
             if drained.lagged {
+                lagged = true;
                 self.summary.lagged += 1;
                 self.trace
                     .record(format_args!("{} replica lagged", self.replicas[i].name));
             }
-            if !self.replicas[i].stale {
+            if !self.replicas[i].reload.is_empty() {
+                self.reload(i)?;
+            } else if !self.replicas[i].stale {
                 break;
             }
         }
-        self.check(i)
+        self.check(i)?;
+        Ok(lagged)
+    }
+
+    /// Reloads the tables the replica's last event named whole, at the
+    /// version the database has reached. A table whose shape has changed
+    /// since the event waits for the schema change ahead in the stream, and
+    /// the replica rebuilds.
+    fn reload(&mut self, i: usize) -> Result<(), String> {
+        let (oracle, replica) = (self.oracle.as_ref().expect("open"), &mut self.replicas[i]);
+        let (version, shapes, dump) = self
+            .vfs
+            .quietly(|| replica::read_tables(oracle, &replica.reload))
+            .map_err(|e| format!("oracle read: {e}"))?;
+        self.trace.record(format_args!(
+            "{} replica at {} reloads {:?} at {version}",
+            replica.name, replica.version, replica.reload
+        ));
+        if replica.reload_from(version, &shapes, &dump)? {
+            self.summary.reloads += 1;
+        } else {
+            replica.reload.clear();
+            replica.stale = true;
+        }
+        Ok(())
     }
 
     fn check(&mut self, i: usize) -> Result<(), String> {
