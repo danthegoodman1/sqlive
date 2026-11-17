@@ -8,7 +8,12 @@
 //! - nothing a write does is visible to other connections before it commits;
 //! - replicas built only from commit events match a dump of the database
 //!   whenever they have caught up, whether they follow every event at once
-//!   or fall behind, lag, and rebuild;
+//!   or fall behind, lag, and rebuild; a replica reloads each table an
+//!   event names whole, at whatever version the database has reached, and
+//!   applies the rows the event lists for the rest; no event lists more
+//!   rows of a table than the cap allows;
+//! - a replica that holds every commit receives the next one, whatever the
+//!   log's bounds;
 //! - every published commit survives a crash, and after a restart each
 //!   replica either resumes or lags and rebuilds;
 //! - a clean close leaves no WAL behind;
@@ -52,6 +57,10 @@ const DB: &str = "live.db";
 pub struct LiveOptions {
     pub steps: u64,
     pub log_capacity: usize,
+    /// The bytes of events the log retains.
+    pub log_bytes: usize,
+    /// The rows of one table an event lists.
+    pub table_changes: usize,
     pub checkpoint_pages: u32,
     /// How often the lagging replica catches up, per step.
     pub lazy_drain: f64,
@@ -73,9 +82,12 @@ impl LiveOptions {
     pub fn from_seed(seed: u64) -> LiveOptions {
         let mut prng = Prng::stream(seed, "live options");
         let mut subscriptions = Prng::stream(seed, "live subscriptions");
+        let mut bounds = Prng::stream(seed, "live event bounds");
         LiveOptions {
             steps: prng.range(50..=250),
             log_capacity: *prng.pick(&[1, 4, 32, 4096]),
+            log_bytes: *bounds.pick(&[1_500, 30_000, 64 << 20, 64 << 20]),
+            table_changes: *bounds.pick(&[3, 20, 10_000, 10_000]),
             checkpoint_pages: *prng.pick(&[2, 50, 1000]),
             lazy_drain: *prng.pick(&[0.02, 0.1, 0.5]),
             schema_change: *prng.pick(&[0.0, 0.01, 0.03]),
@@ -113,6 +125,10 @@ pub struct LiveSummary {
     pub schema_events: u64,
     pub lagged: u64,
     pub rebuilds: u64,
+    /// Tables that events named whole, as the replicas received them.
+    pub whole_tables: u64,
+    /// Times a replica reloaded the tables an event named whole.
+    pub reloads: u64,
     pub checks: u64,
     pub skipped_checks: u64,
     pub peeks: u64,
@@ -140,7 +156,7 @@ impl fmt::Display for LiveSummary {
         write!(
             f,
             "{} writes ({} failed), {} statements ({} failed), {} events with {} changes ({} schema), \
-             {} lags, {} rebuilds, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
+             {} lags, {} rebuilds, {} whole tables with {} reloads, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
              {} rolled back, \
              {} subscription checks, {} queries ({} constrained, {} windowed, {} of every commit; by shape {:?}), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, {} index checks ({} hits, {} of an earlier event), \
              I/O errors: {} read {} write {} sync {} busy, digest {:016x}",
@@ -153,6 +169,8 @@ impl fmt::Display for LiveSummary {
             self.schema_events,
             self.lagged,
             self.rebuilds,
+            self.whole_tables,
+            self.reloads,
             self.checks,
             self.skipped_checks,
             self.peeks,
@@ -260,7 +278,7 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         summary: LiveSummary::default(),
         unknown: false,
         published: 0,
-        replicas: vec![Replica::new("eager"), Replica::new("lazy")],
+        replicas: Vec::new(),
         subscriptions: Vec::new(),
         next_subscription: 0,
         index: ReadSetIndex::new(),
@@ -272,6 +290,8 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         db: None,
         vfs,
     };
+    let cap = live.options.table_changes;
+    live.replicas = vec![Replica::new("eager", cap), Replica::new("lazy", cap)];
     live.start()?;
     live.vfs.set_faults(true);
     for step in 0..live.options.steps {
@@ -314,6 +334,8 @@ impl Live {
             vfs: Some(self.vfs.name().to_owned()),
             readers: 2,
             log_capacity: self.options.log_capacity,
+            log_bytes: self.options.log_bytes,
+            table_changes: self.options.table_changes,
             busy_timeout: Duration::from_secs(5),
             checkpoint_pages: self.options.checkpoint_pages,
         };
@@ -422,12 +444,20 @@ impl Live {
     }
 
     fn step(&mut self) -> Result<(), String> {
+        let mut restarted = true;
         if self.restarts.chance(self.options.crash) {
             self.restart(true)?;
         } else if self.restarts.chance(self.options.reopen) {
             self.restart(false)?;
+        } else {
+            restarted = false;
         }
         let db = self.db.clone().expect("open");
+        // The log keeps its newest event, so a replica that holds every
+        // commit so far receives this step's.
+        let before = db.version();
+        let eager = &self.replicas[0];
+        let current = !restarted && !self.unknown && !eager.stale && eager.version == before;
         let hold = if self.queries.chance(self.options.snapshot) {
             self.hold(&db)?
         } else {
@@ -443,7 +473,12 @@ impl Live {
         if let Some(hold) = hold {
             self.check_hold(hold)?;
         }
-        self.catch_up(0)?;
+        let lagged = self.catch_up(0)?;
+        if lagged && current && !self.unknown && db.version() == before + 1 {
+            return Err(format!(
+                "the eager replica held version {before} and lagged on the next commit"
+            ));
+        }
         if self.prng.chance(self.options.lazy_drain) {
             self.catch_up(1)?;
         }
@@ -543,7 +578,7 @@ impl Live {
                 return Ok(());
             }
         };
-        if held.version != version || !same_rows(&held.rows, &expected, query.ordered) {
+        if held.version != version || !same_rows(&held.rows, &expected, query.ordered, query.open) {
             return Err(format!(
                 "a snapshot at version {version} returned version {} and rows {:?} for {} {:?}; \
                  the witness read {expected:?}",
@@ -635,7 +670,8 @@ impl Live {
         for (i, expected) in found {
             let subscription = &self.subscriptions[i];
             let held = subscription.held.as_ref().expect("caught up");
-            if !same_rows(&held.rows, &expected, subscription.query.ordered) {
+            let query = &subscription.query;
+            if !same_rows(&held.rows, &expected, query.ordered, query.open) {
                 return Err(format!(
                     "subscription {} ({:?}) at version {latest} holds {:?} from version {}, \
                      but {} {:?} returns {expected:?}; read set {}",
@@ -931,8 +967,10 @@ impl Live {
     }
 
     /// Applies every committed event to replica `i`, rebuilding it when it
-    /// lags or sees a schema change, then compares it with the database.
-    fn catch_up(&mut self, i: usize) -> Result<(), String> {
+    /// lags or sees a schema change and reloading the tables an event names
+    /// whole, then compares it with the database. Returns whether it lagged.
+    fn catch_up(&mut self, i: usize) -> Result<bool, String> {
+        let mut lagged = false;
         loop {
             if self.replicas[i].stale {
                 self.rebuild(i)?;
@@ -941,16 +979,44 @@ impl Live {
             self.summary.events += drained.events;
             self.summary.changes += drained.changes;
             self.summary.schema_events += u64::from(drained.schema_changed);
+            self.summary.whole_tables += drained.whole_tables;
             if drained.lagged {
+                lagged = true;
                 self.summary.lagged += 1;
                 self.trace
                     .record(format_args!("{} replica lagged", self.replicas[i].name));
             }
-            if !self.replicas[i].stale {
+            if !self.replicas[i].reload.is_empty() {
+                self.reload(i)?;
+            } else if !self.replicas[i].stale {
                 break;
             }
         }
-        self.check(i)
+        self.check(i)?;
+        Ok(lagged)
+    }
+
+    /// Reloads the tables the replica's last event named whole, at the
+    /// version the database has reached. A table whose shape has changed
+    /// since the event waits for the schema change ahead in the stream, and
+    /// the replica rebuilds.
+    fn reload(&mut self, i: usize) -> Result<(), String> {
+        let (oracle, replica) = (self.oracle.as_ref().expect("open"), &mut self.replicas[i]);
+        let (version, shapes, dump) = self
+            .vfs
+            .quietly(|| replica::read_tables(oracle, &replica.reload))
+            .map_err(|e| format!("oracle read: {e}"))?;
+        self.trace.record(format_args!(
+            "{} replica at {} reloads {:?} at {version}",
+            replica.name, replica.version, replica.reload
+        ));
+        if replica.reload_from(version, &shapes, &dump)? {
+            self.summary.reloads += 1;
+        } else {
+            replica.reload.clear();
+            replica.stale = true;
+        }
+        Ok(())
     }
 
     fn check(&mut self, i: usize) -> Result<(), String> {

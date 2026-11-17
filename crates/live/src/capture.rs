@@ -4,8 +4,9 @@
 //! from triggers, foreign-key cascades and `REPLACE` conflict resolution. For
 //! each row, keyed by rowid or by primary key under the key's collations,
 //! the capture keeps the stored values the row held before the transaction,
-//! read the first time the transaction touches it. `write` reads the
-//! touched rows back before committing to find what changed.
+//! read the first time the transaction touches it, up to a limit of rows
+//! for each table. `write` reads the touched rows back before committing to
+//! find what changed, and names each table that passed the limit.
 //!
 //! Values stay exactly as SQLite holds them, text bytes included, so change
 //! detection and row identity never depend on how text converts to a Rust
@@ -16,7 +17,7 @@ use crate::schema::{META_TABLE, Schema, Table};
 use rusqlite::hooks::{PreUpdateCase, PreUpdateNewValueAccessor, PreUpdateOldValueAccessor};
 use rusqlite::types::{ToSqlOutput, Value, ValueRef};
 use rusqlite::{Connection, ToSql};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// A value exactly as SQLite stores it.
@@ -120,6 +121,14 @@ pub(crate) struct Capture {
     /// Each touched row of a `WITHOUT ROWID` table, by the table's index in
     /// `schema` and the primary key's equality keys.
     seen_keys: BTreeSet<(usize, Vec<EqKey>)>,
+    /// The most rows of one table a transaction records.
+    limit: usize,
+    /// Each touched table with the rows the transaction has touched in it,
+    /// by the table's index in `schema`. A table with more rows than
+    /// `limit` is whole: its rows are released and no longer recorded.
+    counts: BTreeMap<usize, (Arc<Table>, usize)>,
+    /// Touches of whole tables that `touched` still holds.
+    released: usize,
     /// A change the schema could not account for, such as one to a table
     /// created inside the transaction.
     unaccounted: bool,
@@ -127,28 +136,48 @@ pub(crate) struct Capture {
 
 pub(crate) struct Captured {
     pub touched: Vec<Touch>,
+    /// The tables that passed the limit, in name order.
+    pub whole_tables: Vec<String>,
     pub unaccounted: bool,
 }
 
 impl Capture {
-    /// Starts recording a transaction's changes against `schema`.
-    pub fn begin(&mut self, schema: Arc<Schema>) {
+    /// Starts recording a transaction's changes against `schema`, up to
+    /// `limit` rows of each table.
+    pub fn begin(&mut self, schema: Arc<Schema>, limit: usize) {
         self.schema = Some(schema);
+        self.limit = limit;
+        self.clear();
         self.touched.clear();
-        self.seen_rowids.clear();
-        self.seen_keys.clear();
         self.unaccounted = false;
     }
 
     /// Stops recording and hands over what was recorded.
     pub fn finish(&mut self) -> Captured {
         self.schema = None;
-        self.seen_rowids.clear();
-        self.seen_keys.clear();
+        if self.released > 0 {
+            self.compact();
+        }
+        let whole_tables = self
+            .counts
+            .values()
+            .filter(|(_, rows)| *rows > self.limit)
+            .map(|(table, _)| table.name.clone())
+            .collect();
+        self.clear();
         Captured {
             touched: std::mem::take(&mut self.touched),
+            whole_tables,
             unaccounted: std::mem::take(&mut self.unaccounted),
         }
+    }
+
+    /// Forgets which rows and tables the transaction touched.
+    fn clear(&mut self) {
+        self.seen_rowids.clear();
+        self.seen_keys.clear();
+        self.counts.clear();
+        self.released = 0;
     }
 
     fn on_change(&mut self, db: &str, table: &str, case: &PreUpdateCase) {
@@ -162,6 +191,10 @@ impl Capture {
             self.unaccounted = true;
             return;
         };
+        let whole = |(_, rows): &(Arc<Table>, usize)| *rows > self.limit;
+        if self.counts.get(&info.index).is_some_and(whole) {
+            return;
+        }
         let recorded = match case {
             PreUpdateCase::Insert(new) => self.written(&info, new),
             PreUpdateCase::Delete(old) => self.removed(&info, old),
@@ -239,6 +272,20 @@ impl Capture {
             )),
         };
         if first_touch {
+            let (_, rows) = self
+                .counts
+                .entry(table.index)
+                .or_insert_with(|| (table.clone(), 0));
+            *rows += 1;
+            if *rows > self.limit {
+                // The table is whole from here on, and the rows recorded
+                // for it, one for each touch up to the limit, go.
+                self.released += self.limit;
+                if self.released > self.touched.len() / 2 {
+                    self.compact();
+                }
+                return Some(());
+            }
             self.touched.push(Touch {
                 table: table.clone(),
                 key,
@@ -246,6 +293,18 @@ impl Capture {
             });
         }
         Some(())
+    }
+
+    /// Drops the touches of whole tables. It runs once they make up half of
+    /// `touched`, so its passes cost in proportion to the touches recorded.
+    fn compact(&mut self) {
+        let (counts, limit) = (&self.counts, self.limit);
+        self.touched.retain(|touch| {
+            counts
+                .get(&touch.table.index)
+                .is_none_or(|(_, rows)| *rows <= limit)
+        });
+        self.released = 0;
     }
 }
 

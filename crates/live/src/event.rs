@@ -2,6 +2,7 @@
 
 use rusqlite::types::Value;
 use std::fmt;
+use std::mem::size_of;
 use std::sync::Arc;
 
 /// A commit's position in the database's history. Each successful `write`
@@ -15,9 +16,33 @@ pub struct CommitEvent {
     /// The transaction changed the schema, or ran `VACUUM`, which can
     /// renumber rowids. `changes` is then empty: reload what you hold.
     pub schema_changed: bool,
-    /// One entry per changed row, in the order the transaction first
-    /// touched each row.
+    /// One entry per changed row of each table outside `whole_tables`, in
+    /// the order the transaction first touched each row.
     pub changes: Vec<RowChange>,
+    /// Tables the transaction touched more rows of than
+    /// [`crate::Options::table_changes`] allows, in name order. `changes`
+    /// lists none of their rows: reload what you hold of each.
+    pub whole_tables: Vec<String>,
+}
+
+impl CommitEvent {
+    /// The memory the event holds, which the log's budget counts.
+    pub(crate) fn bytes(&self) -> usize {
+        let rows = |row: &Option<Row>| row.as_ref().map_or(0, Row::bytes);
+        size_of::<CommitEvent>()
+            + self.changes.capacity() * size_of::<RowChange>()
+            + self
+                .changes
+                .iter()
+                .map(|change| change.table.capacity() + rows(&change.old) + rows(&change.new))
+                .sum::<usize>()
+            + self.whole_tables.capacity() * size_of::<String>()
+            + self
+                .whole_tables
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+    }
 }
 
 /// One row's net change within a transaction.
@@ -73,6 +98,21 @@ impl Row {
         self.columns
             .iter()
             .position(|c| c.eq_ignore_ascii_case(column))
+    }
+
+    /// The memory the row's values hold. Every row of a table shares its
+    /// column names.
+    fn bytes(&self) -> usize {
+        self.values.capacity() * size_of::<Value>()
+            + self
+                .values
+                .iter()
+                .map(|value| match value {
+                    Value::Text(text) => text.capacity(),
+                    Value::Blob(blob) => blob.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>()
     }
 }
 

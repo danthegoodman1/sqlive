@@ -198,6 +198,21 @@ impl Filter {
             Filter::AnyOf(conjunctions) => conjunctions.iter().any(|c| c.matches(row)),
         }
     }
+
+    /// Whether some row could meet the filter. No row meets one whose every
+    /// conjunction holds a condition nothing meets, as `x = NULL` and
+    /// `LIMIT 0` leave.
+    pub(crate) fn admits_rows(&self) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::AnyOf(conjunctions) => conjunctions.iter().any(|conjunction| {
+                conjunction
+                    .constraints
+                    .iter()
+                    .all(|c| !matches!(c.condition, Condition::Never))
+            }),
+        }
+    }
 }
 
 impl fmt::Display for Filter {

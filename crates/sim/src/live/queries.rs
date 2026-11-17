@@ -17,6 +17,9 @@ pub struct QuerySpec {
     /// The `ORDER BY` fixes every row's position, so results compare in
     /// order; otherwise they compare as multisets.
     pub ordered: bool,
+    /// Leading result columns whose values SQL leaves open, as it leaves a
+    /// group's value to be any member's. Results compare without them.
+    pub open: usize,
     pub shape: Shape,
 }
 
@@ -97,6 +100,11 @@ impl Shapes {
             _ => query,
         }
     }
+}
+
+/// Whether a view's first column is the value of a group.
+fn groups(view: &str) -> bool {
+    view.contains(" GROUP BY ")
 }
 
 /// A column as a query names it: under the table's alias, or bare when the
@@ -353,6 +361,7 @@ fn listing(prng: &mut Prng, schema: &SchemaSpec, alias: &str) -> QuerySpec {
         sql,
         params,
         ordered: true,
+        open: 0,
         shape: Shape::Qualified,
     }
 }
@@ -376,6 +385,7 @@ fn one_table(prng: &mut Prng, extra: &mut Prng, table: &TableSpec, alias: &str) 
         sql,
         params,
         ordered: ordered || aggregate,
+        open: 0,
         shape: Shape::Qualified,
     }
 }
@@ -435,6 +445,7 @@ fn order_by_name(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
         sql,
         params,
         ordered: true,
+        open: 0,
         shape: Shape::OrderByName,
     }
 }
@@ -450,6 +461,7 @@ fn named_join(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
             sql: format!("SELECT {columns} FROM j{view}"),
             params: Vec::new(),
             ordered: columns != "*",
+            open: usize::from(columns == "*" && groups(&schema.join_views[view])),
             shape,
         };
     }
@@ -488,6 +500,7 @@ fn named_join(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
         ordered: columns == "count(*) AS n",
         sql,
         params,
+        open: 0,
         shape,
     }
 }
@@ -515,6 +528,7 @@ fn nan(prng: &mut Prng, schema: &SchemaSpec) -> QuerySpec {
         sql,
         params,
         ordered: false,
+        open: 0,
         shape: Shape::Nan,
     }
 }
@@ -531,6 +545,7 @@ fn engine_state(prng: &mut Prng) -> QuerySpec {
         sql: sql.to_owned(),
         params: Vec::new(),
         ordered: true,
+        open: 0,
         shape: Shape::EngineState,
     }
 }
@@ -567,6 +582,7 @@ fn first_query(prng: &mut Prng, extra: &mut Prng, schema: &SchemaSpec) -> QueryS
                 sql,
                 params,
                 ordered: false,
+                open: 0,
                 shape,
             }
         }
@@ -591,6 +607,7 @@ fn first_query(prng: &mut Prng, extra: &mut Prng, schema: &SchemaSpec) -> QueryS
                 sql,
                 params,
                 ordered: false,
+                open: 0,
                 shape,
             }
         }
@@ -606,13 +623,17 @@ fn first_query(prng: &mut Prng, extra: &mut Prng, schema: &SchemaSpec) -> QueryS
                 sql,
                 params,
                 ordered: false,
+                open: 1,
                 shape,
             }
         }
         // A view, or a CTE over the table.
         _ => {
+            let mut open = 0;
             let sql = if !schema.views.is_empty() && prng.chance(0.5) {
-                format!("SELECT * FROM v{}", prng.index(schema.views.len()))
+                let view = prng.index(schema.views.len());
+                open = usize::from(groups(&schema.views[view]));
+                format!("SELECT * FROM v{view}")
             } else {
                 let mut inner = format!("SELECT * FROM {} AS a", table.name);
                 if let Some(f) = filter(prng, Some(&mut *extra), table, "a", &mut params) {
@@ -624,6 +645,7 @@ fn first_query(prng: &mut Prng, extra: &mut Prng, schema: &SchemaSpec) -> QueryS
                 sql,
                 params,
                 ordered: false,
+                open,
                 shape,
             }
         }
@@ -670,6 +692,7 @@ fn full_text(prng: &mut Prng, schema: &SchemaSpec, tables: &FullText) -> QuerySp
         sql,
         params,
         ordered,
+        open: 0,
         shape: Shape::FullText,
     }
 }

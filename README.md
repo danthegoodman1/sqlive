@@ -8,9 +8,8 @@ columns, and key ranges the result depends on. Every committed write emits a
 SqLive reports what changed and what each query depends on. Your app tracks
 subscriptions and pushes updates to clients.
 
-Status: Phases 0 to 13 in [`PLAN.md`](PLAN.md) are built and tested. Phase 14, which
-bounds the memory events take, is open. SqLive is young and unpublished; expect the API
-to change.
+Status: every phase in [`PLAN.md`](PLAN.md) is built and tested. SqLive is young and
+unpublished; expect the API to change.
 
 ## Install
 
@@ -42,13 +41,15 @@ db.write(|tx| {
 ```
 
 `LiveDb::open_with(path, Options { .. })` sets the VFS, the number of pooled read
-connections (`readers`), how many events the log retains (`log_capacity`), the busy
-timeout, and the WAL checkpoint threshold (`checkpoint_pages`). SqLive puts the database
-in WAL mode with `synchronous = FULL` and keeps its version in a `_sqlive_meta` table.
-The database must store text as UTF-8, SQLite's default: SqLive compares text by its
-UTF-8 bytes, so `open` returns `Error::Unsupported` for a UTF-16 database.
-Dropping the `LiveDb` closes its writer last, so when no other connection has the
-database open, SQLite checkpoints the WAL into the database file and deletes it.
+connections (`readers`), how many events the log retains and how many bytes of them
+(`log_capacity`, `log_bytes`), how many rows of one table an event lists
+(`table_changes`), the busy timeout, and the WAL checkpoint threshold
+(`checkpoint_pages`). SqLive puts the database in WAL mode with `synchronous = FULL`
+and keeps its version in a `_sqlive_meta` table. The database must store text as
+UTF-8, SQLite's default: SqLive compares text by its UTF-8 bytes, so `open` returns
+`Error::Unsupported` for a UTF-16 database. Dropping the `LiveDb` closes its writer
+last, so when no other connection has the database open, SQLite checkpoints the WAL
+into the database file and deletes it.
 
 ## Write
 
@@ -68,6 +69,9 @@ let (todo_id, version) = db.write(|tx| {
 - The closure receives a `rusqlite::Transaction`. Run any SQL; changes made by
   triggers and foreign-key cascades appear in the commit event.
 - `write` owns `BEGIN` and `COMMIT`. Use `SAVEPOINT` for nested work.
+- A transaction that touches more than `table_changes` rows of one table, 10,000 by
+  default, publishes the table's name in place of its rows
+  ([React to changes](#react-to-changes)).
 - Return `Err` to roll back. A rolled-back transaction emits no event.
 - SQLite can roll a transaction back on its own, after an I/O error or an
   `OR ROLLBACK` conflict, and run later statements each in a transaction of its own.
@@ -153,7 +157,9 @@ subqueries and joins. Some reads widen it:
 already in the retained log. Commits that land between your query and your
 subscription are therefore included. Iterating blocks until the next commit and ends
 when the database closes; `try_next()` returns at once. A `v` that has not committed
-yet is an `Error::FutureVersion`.
+yet is an `Error::FutureVersion`. The log retains its newest `log_capacity` events,
+4,096 by default, within `log_bytes` bytes, 64 MiB by default; a stream that falls
+behind them yields `Error::Lagged`.
 
 ```rust
 let first = db.query(SQL, [5], to_todo)?;
@@ -194,8 +200,17 @@ CommitEvent {
         RowChange { table: "todos", op: Insert, rowid: Some(519), old: None,
                     new: Some({id: 519, list_id: 5, title: 'Buy milk', done: 0}) },
     ],
+    whole_tables: [],
 }
 ```
+
+An event lists at most `table_changes` rows of one table. A transaction that touches
+more, as a backfill does, would otherwise hold every row's old and new values in
+memory, so its event names the table in `whole_tables` and lists none of the table's
+rows. `intersects` returns true for every read set that reads rows of a named table.
+If you build state from events, read a named table again in a snapshot, keep
+following the stream, and skip that table's rows in events at or below the
+snapshot's version. To list every row, set `table_changes` to `usize::MAX`.
 
 ## Many live queries
 
@@ -244,20 +259,24 @@ either `Filter::All` or `Filter::AnyOf` conjunctions of
 `Constraint { column, collation, condition }`. `Constraint::matches(row)` applies
 SQLite's comparison rules (storage class, collation, `NULL` handling) for you. An
 update counts when it changes a column the table's `columns()` list, or any column
-when `every_column()` is set.
+when `every_column()` is set. A table in an event's `whole_tables` affects each read
+set whose `reads_rows_of(table)` is true.
 
 ## Guarantees
 
 - **Complete:** every committed row change made through `write` appears in its
-  transaction's event. Versions have no gaps.
+  transaction's event, as a row or, once the transaction touches more than
+  `table_changes` rows of the table, under the table's name in `whole_tables`.
+  Versions have no gaps.
 - **Net:** each event lists one change per row: the first old value and the final new
   value.
 - **Conservative:** `intersects` returns false only when a change cannot affect what
   SQL determines of the result. It may return true for a change that leaves the result
   the same. Where SQL leaves a result open, a fresh run can differ with no intersecting
-  event: the order of rows without a complete `ORDER BY`, the rows a `LIMIT` keeps
-  without one, a bare column in an aggregate query, which SQLite takes from a row of
-  its choosing, and functions that read the clock or draw random numbers.
+  event: the order of rows without a complete `ORDER BY`; the rows a `LIMIT` keeps
+  without one; a bare column in an aggregate query, which SQLite takes from a row of
+  its choosing, as it takes a group's value where a collation makes different values
+  equal; and functions that read the clock or draw random numbers.
 - **Hashes:** a `ResultHash` covers the result's column names, then each row in order,
   and each value in it with its storage class (reals by their bits). Any difference in
   a column name, a value, a storage class, the row order or the row count changes it.
@@ -268,6 +287,9 @@ when `every_column()` is set.
   may rename an unnamed expression, such as `count(*)`, between releases, so name
   computed columns with `AS` to keep their hashes stable. A query without a complete
   `ORDER BY` can return the same rows in another order, which counts as a change.
+- **Bounded:** an event holds at most `table_changes` rows of each table. The log holds
+  at most `log_capacity` events and `log_bytes` bytes of them, and always its newest
+  event, whatever its size.
 - **Durable:** a published event's transaction survives a crash. A commit that
   reported an error can still reappear after a crash, without an event; streams from
   before it lag.
@@ -294,9 +316,9 @@ when `every_column()` is set.
 ## How it works
 
 - The **preupdate hook** on the writer connection records each touched row, with its
-  old values the first time. Before `COMMIT`, `write` reads those rows back to compute
-  net changes, reading a run of consecutive rowids in one range scan, then publishes
-  the event once the commit succeeds.
+  old values the first time, up to `table_changes` rows of a table. Before `COMMIT`,
+  `write` reads those rows back to compute net changes, reading a run of consecutive
+  rowids in one range scan, then publishes the event once the commit succeeds.
 - A snapshot can see a commit a moment before its event is published. It then waits
   for the publish, so `changes_since(result.version)` always succeeds.
 - The **authorizer** reports every table and column a query reads, through views,
@@ -452,10 +474,24 @@ Rust heap measured with a counting allocator; SQLite's heap with
 | --- | ---: | ---: | ---: |
 | Chat-query read sets, held alone | 100,000 | 37.2 MB | 390 bytes |
 | Chat-query read sets in a `ReadSetIndex` | 100,000 | 99.3 MB | 1,041 bytes |
-| Retained events, each inserting one chat | 4,096 | 3.0 MB | 777 bytes |
+| Retained events, each inserting one chat | 4,096 | 1.7 MB | 433 bytes |
 
 SQLite's own heap, page caches included, held 4.2 MB. A result hash adds 32 bytes per
 subscription.
+
+Bulk writes are where events grow. One transaction inserts 200,000 chats, and three
+more update every one of them:
+
+| Options | Peak Rust heap | Left in the log |
+| --- | ---: | ---: |
+| Default: 10,000 rows of a table in an event, 64 MiB of events | 3.0 MB | 4 events, under 1 KB |
+| Every row listed (`table_changes: usize::MAX`) | 216 MB | 97 MB |
+| Every row listed and no log budget (`log_bytes: usize::MAX`) | 374 MB | 353 MB |
+
+With the defaults, each of the four events names `chats` in `whole_tables`. With every
+row listed, an update's event takes 97 MB, and the log keeps it, as its newest event,
+though it passes the 64 MiB budget. The cap counts rows, so an app whose rows are
+large sets a lower one.
 
 A query text's tables and columns live once on each reader connection, and every read
 set the text returns shares them. A read set holds its own filter: here the room and

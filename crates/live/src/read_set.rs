@@ -243,15 +243,27 @@ impl ReadSet {
 
     /// Whether `event` may have changed the query's result. False for an
     /// event at or below the read set's version, which the result already
-    /// reflects; true for a schema change, and for every commit when
-    /// [`ReadSet::every_commit`] is set.
+    /// reflects; true for a schema change, for every commit when
+    /// [`ReadSet::every_commit`] is set, and for an event that names whole
+    /// a table the result reads rows of.
     pub fn intersects(&self, event: &CommitEvent) -> bool {
         if event.version <= self.version {
             return false;
         }
         event.schema_changed
             || self.every_commit
+            || event
+                .whole_tables
+                .iter()
+                .any(|table| self.reads_rows_of(table))
             || event.changes.iter().any(|change| self.affected_by(change))
+    }
+
+    /// Whether the result may depend on some row of `table`, so an event
+    /// that names the table whole counts.
+    pub fn reads_rows_of(&self, table: &str) -> bool {
+        self.table(table)
+            .is_some_and(|table| table.filter.admits_rows())
     }
 
     /// Whether one row change may have changed the query's result.

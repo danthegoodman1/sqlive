@@ -1,14 +1,17 @@
 //! Memory: the Rust heap each chat subscription's read set takes in a
-//! `ReadSetIndex`, the heap each event takes in the retained log, and
-//! SQLite's own heap.
+//! `ReadSetIndex`, the heap each event takes in the retained log, the heap
+//! bulk transactions take while they run and leave in the log, and SQLite's
+//! own heap.
 
-use crate::{BODY, CHATS, QUERY, fill, fresh_dir, heap, sqlite_heap};
-use sqlive::{LiveDb, ReadSetIndex};
+use crate::{BODY, CHATS, QUERY, fill, fresh_dir, heap, peak, reset_peak, sqlite_heap};
+use sqlive::{LiveDb, Options, ReadSetIndex};
 
 const ROOMS: i64 = 10_000;
 const SUBSCRIPTIONS: u32 = 100_000;
 /// The default log capacity, so the log ends full.
 const EVENTS: usize = 4_096;
+/// Rows each bulk transaction writes.
+const BULK: i64 = 200_000;
 
 fn megabytes(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
@@ -85,5 +88,54 @@ pub fn run() -> sqlive::Result<()> {
         status_kb("VmHWM:").unwrap_or(0) as f64 / 1024.0
     );
     drop(index);
+    drop(db);
+
+    println!(
+        "\n| One {BULK}-row insert, then three updates of every row | Peak Rust heap | Left in the log |"
+    );
+    println!("| --- | ---: | ---: |");
+    let unbounded = Options {
+        log_bytes: usize::MAX,
+        table_changes: usize::MAX,
+        ..Options::default()
+    };
+    let listed = Options {
+        table_changes: usize::MAX,
+        ..Options::default()
+    };
+    for (label, options) in [
+        ("Default options", Options::default()),
+        ("Every row listed (`table_changes: usize::MAX`)", listed),
+        ("Every row listed, and no log budget", unbounded),
+    ] {
+        let (peak, left) = bulk(options)?;
+        println!(
+            "| {label} | {:.1} MB | {:.1} MB |",
+            megabytes(peak),
+            megabytes(left)
+        );
+    }
     Ok(())
+}
+
+/// The most Rust heap four bulk transactions hold while they run, and what
+/// they leave in the log.
+fn bulk(options: Options) -> sqlive::Result<(usize, usize)> {
+    let dir = fresh_dir("memory-bulk");
+    let db = LiveDb::open_with(dir.join("bench.db").to_string_lossy(), options)?;
+    db.write(|tx| tx.execute_batch(CHATS))?;
+    let before = heap();
+    reset_peak();
+    db.write(|tx| {
+        let mut insert =
+            tx.prepare("INSERT INTO chats (room, created_at, body) VALUES (?1, ?2, ?3)")?;
+        for i in 0..BULK {
+            insert.execute((i % ROOMS, i, BODY))?;
+        }
+        Ok(())
+    })?;
+    for _ in 0..3 {
+        db.write(|tx| tx.execute("UPDATE chats SET created_at = created_at + 1", []))?;
+    }
+    Ok((peak() - before, heap() - before))
 }

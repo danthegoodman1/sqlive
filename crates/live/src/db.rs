@@ -25,6 +25,13 @@ pub struct Options {
     pub readers: usize,
     /// Commit events the log retains for [`LiveDb::changes_since`].
     pub log_capacity: usize,
+    /// Bytes of commit events the log retains, beside `log_capacity`. The
+    /// oldest events drop first, and the newest stays whatever its size.
+    pub log_bytes: usize,
+    /// Rows of one table a transaction's event lists. A transaction that
+    /// touches more names the table in [`CommitEvent::whole_tables`] and
+    /// lists none of its rows, which bounds the memory a bulk write takes.
+    pub table_changes: usize,
     pub busy_timeout: Duration,
     /// WAL pages after which a commit checkpoints (`wal_autocheckpoint`).
     pub checkpoint_pages: u32,
@@ -36,6 +43,8 @@ impl Default for Options {
             vfs: None,
             readers: 4,
             log_capacity: 4096,
+            log_bytes: 64 << 20,
+            table_changes: 10_000,
             busy_timeout: Duration::from_secs(5),
             checkpoint_pages: 1000,
         }
@@ -131,7 +140,11 @@ impl LiveDb {
         let flag = rolled_back.clone();
         conn.rollback_hook(Some(move || flag.store(true, Ordering::Relaxed)))?;
         let moved = schema.version != meta.schema;
-        let log = Arc::new(Log::new(meta.version, options.log_capacity));
+        let log = Arc::new(Log::new(
+            meta.version,
+            options.log_capacity,
+            options.log_bytes,
+        ));
         let readers = Readers::new(options.readers);
         let db = LiveDb {
             path,
@@ -277,7 +290,7 @@ impl LiveDb {
         if before != schema.version {
             *schema = Arc::new(Schema::load(&tx)?);
         }
-        let recording = Recording::begin(capture, schema.clone());
+        let recording = Recording::begin(capture, schema.clone(), self.options.table_changes);
         let value = {
             let _caller = CallerScope::enter(internal);
             f(&tx)
@@ -292,15 +305,21 @@ impl LiveDb {
         let version = bump_version(&tx, after)?;
         let captured = recording.finish();
         let schema_changed = schema_changed || captured.unaccounted;
-        let (changes, reloaded) = if schema_changed {
-            (Vec::new(), Some(Arc::new(Schema::load(&tx)?)))
+        // A schema change already tells every consumer to reload.
+        let (changes, whole_tables, reloaded) = if schema_changed {
+            (Vec::new(), Vec::new(), Some(Arc::new(Schema::load(&tx)?)))
         } else {
-            (net_changes(&tx, captured.touched)?, None)
+            (
+                net_changes(&tx, captured.touched)?,
+                captured.whole_tables,
+                None,
+            )
         };
         let event = CommitEvent {
             version,
             schema_changed,
             changes,
+            whole_tables,
         };
         if ended(rolled_back, &tx) {
             return Err(Error::RolledBack);
@@ -386,8 +405,8 @@ impl Drop for LiveDb {
 struct Recording<'a>(&'a Mutex<Capture>);
 
 impl<'a> Recording<'a> {
-    fn begin(capture: &'a Mutex<Capture>, schema: Arc<Schema>) -> Recording<'a> {
-        crate::lock(capture).begin(schema);
+    fn begin(capture: &'a Mutex<Capture>, schema: Arc<Schema>, limit: usize) -> Recording<'a> {
+        crate::lock(capture).begin(schema, limit);
         Recording(capture)
     }
 
@@ -568,6 +587,8 @@ fn net_changes(conn: &Connection, mut touched: Vec<Touch>) -> Result<Vec<RowChan
         }
         start = end;
     }
+    // The log retains the changes, so they keep no spare room.
+    changes.shrink_to_fit();
     Ok(changes)
 }
 

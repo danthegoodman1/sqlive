@@ -1,7 +1,8 @@
 //! SqLive: live queries for SQLite.
 //!
 //! Every [`LiveDb::write`] publishes a [`CommitEvent`] with the net row
-//! changes of its transaction. Queries return their rows with a read set: the
+//! changes of its transaction, or the name of each table it changed more
+//! rows of than an event lists. Queries return their rows with a read set: the
 //! tables, columns, and key ranges the result depends on. An app re-runs a
 //! query when its read set intersects an event.
 

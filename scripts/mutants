@@ -543,6 +543,45 @@ MUTANTS = [
         "read sets keep their constraints' spare room",
         [(CONSTRAINTS, "for conjunction in &mut conjunctions { conjunction.constraints.shrink_to_fit(); } conjunctions.shrink_to_fit();", "")],
     ),
+    # Phase 14
+    (
+        "the log ignores its byte budget",
+        [(LOG, "|| (state.bytes > state.budget && state.events.len() > 1)", "")],
+    ),
+    (
+        "the log drops its newest event when it passes the budget",
+        [(LOG, "(state.bytes > state.budget && state.events.len() > 1)",
+          "(state.bytes > state.budget && !state.events.is_empty())")],
+    ),
+    (
+        "a table past the cap goes unnamed",
+        [(CAPTURE, ".filter(|(_, rows)| *rows > self.limit) .map(|(table, _)| table.name.clone())",
+          ".filter(|_| false) .map(|(table, _)| table.name.clone())")],
+    ),
+    (
+        "a table past the cap is named whole and keeps its earlier rows",
+        [(CAPTURE, "is_none_or(|(_, rows)| *rows <= limit)", "is_none_or(|_| true)")],
+    ),
+    (
+        "the change cap records one row past it",
+        [(CAPTURE, "if *rows > self.limit {", "if *rows > self.limit + 1 {")],
+    ),
+    (
+        "the change cap counts rows across transactions",
+        [(CAPTURE, "self.counts.clear();", "")],
+    ),
+    (
+        "intersects ignores the tables an event names whole",
+        [(READ_SET, "|| event.whole_tables.iter().any(|table| self.reads_rows_of(table))", "")],
+    ),
+    (
+        "the index ignores the tables an event names whole",
+        [(INDEX, "for table in &event.whole_tables {", "for table in event.whole_tables.iter().take(0) {")],
+    ),
+    (
+        "a whole table reaches only the index keys that read every row",
+        [(INDEX, "self.whole.iter().chain(columns)", "self.whole.iter().chain(columns.take(0))")],
+    ),
 ]
 
 

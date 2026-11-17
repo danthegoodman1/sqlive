@@ -268,6 +268,15 @@ impl<K: Ord + Clone> ReadSetIndex<K> {
             .iter()
             .filter(|key| self.predates(key, event))
             .collect();
+        // A table the event names whole affects each key registered under
+        // it whose result reads the table's rows.
+        for table in &event.whole_tables {
+            if let Some(index) = self.tables.get(lowercase(table).as_ref()) {
+                found.extend(index.keys().filter(|key| {
+                    self.predates(key, event) && self.entries[*key].read_set.reads_rows_of(table)
+                }));
+            }
+        }
         // Each changed table's keys that depend on any of its rows, with
         // the table's changes.
         let mut whole: BTreeMap<&str, (&BTreeSet<K>, Vec<&RowChange>)> = BTreeMap::new();
@@ -316,6 +325,20 @@ impl<K: Ord + Clone> ReadSetIndex<K> {
 }
 
 impl<K: Ord + Clone> TableIndex<K> {
+    /// Every key registered under the table, some of them more than once.
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        let columns = self.columns.values().flat_map(|column| {
+            column
+                .equal
+                .values()
+                .chain(column.from.values())
+                .chain(column.upto.values())
+                .chain([&column.null])
+                .flatten()
+        });
+        self.whole.iter().chain(columns)
+    }
+
     fn column(&mut self, column: &ColumnKey) -> &mut ColumnIndex<K> {
         self.columns
             .entry(column.clone())

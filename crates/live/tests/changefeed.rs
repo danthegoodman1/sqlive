@@ -3,7 +3,7 @@
 mod common;
 
 use common::{open, temp_db};
-use sqlive::{CommitEvent, Error, LiveDb, Op, Options, Value};
+use sqlive::{CommitEvent, Error, LiveDb, Op, Options, ReadSetIndex, Value};
 
 /// The next event, which must already have committed.
 fn next(stream: &mut sqlive::Changes) -> CommitEvent {
@@ -482,4 +482,154 @@ fn statements_after_an_automatic_rollback_do_not_commit() {
             .0;
         assert_eq!(rows, 1, "{after}: neither 2 nor 3 committed");
     }
+}
+
+/// A database that lists at most three rows of a table in one event.
+fn capped(name: &str) -> LiveDb {
+    let options = Options {
+        table_changes: 3,
+        ..Options::default()
+    };
+    let db = LiveDb::open_with(temp_db(name), options).unwrap();
+    db.write(|tx| {
+        tx.execute_batch(
+            "CREATE TABLE big (id INTEGER PRIMARY KEY, a);
+             CREATE TABLE small (id INTEGER PRIMARY KEY, a);
+             CREATE TABLE keyed (k TEXT PRIMARY KEY, a) WITHOUT ROWID;
+             CREATE TABLE other (x);",
+        )
+    })
+    .unwrap();
+    db
+}
+
+#[test]
+fn a_table_past_the_change_cap_is_named_whole_and_lists_no_rows() {
+    let db = capped("cap");
+    let read_set = |sql: &str| db.query(sql, (), |_| Ok(())).unwrap().read_set;
+    let on_big = read_set("SELECT a FROM big WHERE id = 100");
+    let on_keyed = read_set("SELECT a FROM keyed WHERE k > 'x' ORDER BY k LIMIT 2");
+    let on_small = read_set("SELECT a FROM small WHERE id = 100");
+    let on_no_rows = read_set("SELECT a FROM big WHERE id = NULL");
+    let on_no_rows_of_one_key = read_set("SELECT a FROM big WHERE id = 100 AND a = NULL");
+    let on_other = read_set("SELECT x FROM other");
+    let mut stream = db.changes().unwrap();
+    db.write(|tx| {
+        tx.execute_batch(
+            "INSERT INTO big VALUES (1, 'a'), (2, 'b'), (3, 'c');
+             INSERT INTO small VALUES (1, 'a'), (2, 'b'), (3, 'c');
+             INSERT INTO keyed VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4);
+             INSERT INTO big VALUES (4, 'd');
+             UPDATE big SET a = 'z' WHERE id = 1;",
+        )
+    })
+    .unwrap();
+    let event = next(&mut stream);
+    assert_eq!(event.whole_tables, ["big", "keyed"]);
+    assert_eq!(
+        summary(&event),
+        [
+            ("small".into(), Op::Insert, Some(1)),
+            ("small".into(), Op::Insert, Some(2)),
+            ("small".into(), Op::Insert, Some(3)),
+        ],
+        "a table at the cap lists its rows, and one past it lists none"
+    );
+    assert!(
+        on_big.intersects(&event),
+        "a filter cannot rule out unlisted rows"
+    );
+    assert!(on_keyed.intersects(&event));
+    assert!(
+        !on_small.intersects(&event),
+        "its listed rows fail the filter"
+    );
+    assert!(
+        !on_no_rows.intersects(&event),
+        "its result depends on no row"
+    );
+    assert!(!on_no_rows_of_one_key.intersects(&event));
+    assert!(!on_other.intersects(&event));
+
+    let mut index = ReadSetIndex::new();
+    let read_sets = [
+        on_big,
+        on_keyed,
+        on_small,
+        on_no_rows,
+        on_no_rows_of_one_key,
+        on_other,
+    ];
+    for (key, read_set) in read_sets.into_iter().enumerate() {
+        index.insert(key, read_set);
+    }
+    assert_eq!(index.affected(&event).collect::<Vec<_>>(), [0, 1]);
+
+    // Each transaction counts its rows afresh.
+    db.write(|tx| tx.execute_batch("INSERT INTO big VALUES (5, 'e')"))
+        .unwrap();
+    let event = next(&mut stream);
+    assert!(event.whole_tables.is_empty());
+    assert_eq!(summary(&event), [("big".into(), Op::Insert, Some(5))]);
+}
+
+#[test]
+fn a_capped_table_stays_whole_through_rollbacks_and_names_nothing_under_a_schema_change() {
+    let db = capped("cap-edges");
+    let mut stream = db.changes().unwrap();
+    // The savepoint undoes the rows, but the table's count stands.
+    db.write(|tx| {
+        tx.execute_batch(
+            "SAVEPOINT s;
+             INSERT INTO big VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+             ROLLBACK TO s;
+             INSERT INTO other VALUES (1);",
+        )
+    })
+    .unwrap();
+    let event = next(&mut stream);
+    assert_eq!(event.whole_tables, ["big"]);
+    assert_eq!(summary(&event), [("other".into(), Op::Insert, Some(1))]);
+    // A schema change already tells every consumer to reload.
+    db.write(|tx| {
+        tx.execute_batch(
+            "INSERT INTO big VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+             CREATE TABLE more (y);",
+        )
+    })
+    .unwrap();
+    let event = next(&mut stream);
+    assert!(event.schema_changed);
+    assert!(event.whole_tables.is_empty() && event.changes.is_empty());
+}
+
+#[test]
+fn the_log_drops_its_oldest_events_past_its_byte_budget() {
+    let options = Options {
+        log_bytes: 4_000,
+        ..Options::default()
+    };
+    let db = LiveDb::open_with(temp_db("budget"), options).unwrap();
+    db.write(|tx| tx.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body)"))
+        .unwrap();
+    let start = db.version();
+    let mut head = db.changes().unwrap();
+    for _ in 0..3 {
+        db.write(|tx| tx.execute("INSERT INTO t (body) VALUES (?1)", ["x".repeat(1_500)]))
+            .unwrap();
+    }
+    assert!(
+        matches!(
+            db.changes_since(start).unwrap().try_next(),
+            Some(Err(Error::Lagged { .. }))
+        ),
+        "three events of 1,500 bytes pass a 4,000-byte budget"
+    );
+    let mut recent = db.changes_since(start + 1).unwrap();
+    assert_eq!(next(&mut recent).version, start + 2);
+    assert_eq!(next(&mut recent).version, start + 3);
+    assert!(
+        matches!(head.try_next(), Some(Err(Error::Lagged { .. }))),
+        "a stream that fell behind the budget lags"
+    );
 }

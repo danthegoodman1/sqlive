@@ -199,7 +199,7 @@ impl Subscription {
             if self.query.ordered
                 && columns.is_some()
                 && columns == held.columns
-                && same_rows(&held.rows, &result.rows, true)
+                && same_rows(&held.rows, &result.rows, true, self.query.open)
             {
                 return Err(format!(
                     "subscription {}: a re-run at version {} reported a change but returned \
@@ -364,18 +364,19 @@ fn row_order(a: &[Value], b: &[Value]) -> Ordering {
         .unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 
-/// Whether two results hold the same rows: in the same order when the query
-/// orders them completely, as multisets otherwise.
-pub fn same_rows(a: &Rows, b: &Rows, ordered: bool) -> bool {
+/// Whether two results hold the same rows, leaving out each row's first
+/// `open` columns: in the same order when the query orders them completely,
+/// as multisets otherwise.
+pub fn same_rows(a: &Rows, b: &Rows, ordered: bool, open: usize) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    if ordered {
-        return a.iter().zip(b).all(|(x, y)| row_order(x, y).is_eq());
+    let compared = |row: &'_ Vec<Value>| row.get(open..).unwrap_or_default().to_vec();
+    let mut a: Vec<Vec<Value>> = a.iter().map(compared).collect();
+    let mut b: Vec<Vec<Value>> = b.iter().map(compared).collect();
+    if !ordered {
+        a.sort_by(|x, y| row_order(x, y));
+        b.sort_by(|x, y| row_order(x, y));
     }
-    let mut a: Vec<&Vec<Value>> = a.iter().collect();
-    let mut b: Vec<&Vec<Value>> = b.iter().collect();
-    a.sort_by(|x, y| row_order(x, y));
-    b.sort_by(|x, y| row_order(x, y));
     a.iter().zip(&b).all(|(x, y)| row_order(x, y).is_eq())
 }

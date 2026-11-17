@@ -15,11 +15,18 @@ pub(crate) struct Log {
 }
 
 struct LogState {
-    /// The events after `base`, through `latest`.
-    events: VecDeque<Arc<CommitEvent>>,
+    /// The events after `base`, through `latest`, each with its size in
+    /// bytes.
+    events: VecDeque<(Arc<CommitEvent>, usize)>,
     base: Version,
     latest: Version,
+    /// The most events the log retains.
     capacity: usize,
+    /// The bytes of events the log retains; it keeps its newest event
+    /// whatever its size.
+    budget: usize,
+    /// The bytes of the retained events.
+    bytes: usize,
     /// Bumped when the log loses track of the database; every stream opened
     /// before then lags.
     epoch: u64,
@@ -30,13 +37,15 @@ struct LogState {
 }
 
 impl Log {
-    pub fn new(latest: Version, capacity: usize) -> Log {
+    pub fn new(latest: Version, capacity: usize, budget: usize) -> Log {
         Log {
             state: Mutex::new(LogState {
                 events: VecDeque::new(),
                 base: latest,
                 latest,
                 capacity: capacity.max(1),
+                budget,
+                bytes: 0,
                 epoch: 0,
                 committing: false,
                 closed: false,
@@ -51,18 +60,27 @@ impl Log {
     }
 
     pub fn publish(&self, event: CommitEvent) {
+        // Sized before the lock, since sizing reads every row.
+        let size = event.bytes();
         let mut state = crate::lock(&self.state);
         if event.version != state.latest + 1 {
             // The database moved without the log: no stream can continue.
-            state.events.clear();
+            state.forget();
             state.base = event.version - 1;
             state.epoch += 1;
         }
         state.latest = event.version;
         self.reached.store(state.latest, Ordering::Release);
-        state.events.push_back(Arc::new(event));
-        while state.events.len() > state.capacity {
-            state.events.pop_front();
+        state.bytes += size;
+        state.events.push_back((Arc::new(event), size));
+        // The oldest events drop first, and the newest always stays, so a
+        // stream at the head receives it.
+        while state.events.len() > state.capacity
+            || (state.bytes > state.budget && state.events.len() > 1)
+        {
+            if let Some((_, dropped)) = state.events.pop_front() {
+                state.bytes -= dropped;
+            }
             state.base += 1;
         }
         drop(state);
@@ -73,7 +91,7 @@ impl Log {
     /// database reports. Every open stream lags.
     pub fn reset(&self, latest: Version) {
         let mut state = crate::lock(&self.state);
-        state.events.clear();
+        state.forget();
         state.base = latest;
         state.latest = latest;
         self.reached.store(latest, Ordering::Release);
@@ -105,7 +123,7 @@ impl Log {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         if version > state.latest {
-            state.events.clear();
+            state.forget();
             state.base = version;
             state.latest = version;
             self.reached.store(version, Ordering::Release);
@@ -146,6 +164,14 @@ impl Log {
             epoch: state.epoch,
             done: false,
         }
+    }
+}
+
+impl LogState {
+    /// Drops every retained event.
+    fn forget(&mut self) {
+        self.events.clear();
+        self.bytes = 0;
     }
 }
 
@@ -209,7 +235,8 @@ impl Changes {
             }));
         }
         if self.next <= state.latest {
-            let event = state.events[(self.next - state.base - 1) as usize].clone();
+            let (event, _) = &state.events[(self.next - state.base - 1) as usize];
+            let event = event.clone();
             self.next += 1;
             return Poll::Ready(Ok(event));
         }
@@ -254,12 +281,75 @@ mod tests {
             version,
             schema_changed: false,
             changes: Vec::new(),
+            whole_tables: Vec::new(),
         }
+    }
+
+    /// An event that names a table, which gives it a size to count.
+    fn sized(version: Version, table: &str) -> (CommitEvent, usize) {
+        let event = CommitEvent {
+            whole_tables: vec![table.to_owned()],
+            ..event(version)
+        };
+        let bytes = event.bytes();
+        (event, bytes)
+    }
+
+    #[test]
+    fn events_drop_by_size_oldest_first() {
+        let (_, small) = sized(1, "t");
+        // Room for two small events and part of a third.
+        let log = Arc::new(Log::new(0, 8, small * 2 + small / 2));
+        let mut behind = log.since(0).unwrap();
+        log.publish(sized(1, "t").0);
+        let mut current = log.since(1).unwrap();
+        for v in 2..=3 {
+            log.publish(sized(v, "t").0);
+        }
+        assert!(matches!(
+            behind.try_next(),
+            Some(Err(Error::Lagged {
+                requested: 0,
+                oldest: 1
+            }))
+        ));
+        assert_eq!(current.try_next().unwrap().unwrap().version, 2);
+        assert_eq!(current.try_next().unwrap().unwrap().version, 3);
+    }
+
+    #[test]
+    fn the_newest_event_stays_whatever_its_size() {
+        let (_, small) = sized(1, "t");
+        let log = Arc::new(Log::new(0, 8, small));
+        let mut head = log.from_latest();
+        let name = "a table with a name longer than the whole budget ".repeat(8);
+        log.publish(sized(1, &name).0);
+        assert_eq!(head.try_next().unwrap().unwrap().version, 1);
+        // The next event drops it, and the log's size follows what it
+        // holds.
+        log.publish(sized(2, "t").0);
+        assert!(matches!(
+            log.since(0).unwrap().try_next(),
+            Some(Err(Error::Lagged { .. }))
+        ));
+        assert_eq!(head.try_next().unwrap().unwrap().version, 2);
+        log.publish(sized(3, "t").0);
+        assert!(
+            matches!(
+                log.since(1).unwrap().try_next(),
+                Some(Err(Error::Lagged { .. }))
+            ),
+            "one small event fills the budget"
+        );
+        assert_eq!(
+            log.since(2).unwrap().try_next().unwrap().unwrap().version,
+            3
+        );
     }
 
     #[test]
     fn a_stream_yields_events_after_its_version_in_order() {
-        let log = Arc::new(Log::new(10, 8));
+        let log = Arc::new(Log::new(10, 8, usize::MAX));
         for v in 11..=14 {
             log.publish(event(v));
         }
@@ -273,7 +363,7 @@ mod tests {
 
     #[test]
     fn a_stream_behind_the_log_lags_once() {
-        let log = Arc::new(Log::new(0, 2));
+        let log = Arc::new(Log::new(0, 2, usize::MAX));
         let mut stream = log.since(0).unwrap();
         for v in 1..=3 {
             log.publish(event(v));
@@ -292,7 +382,7 @@ mod tests {
 
     #[test]
     fn a_reset_lags_every_open_stream() {
-        let log = Arc::new(Log::new(5, 8));
+        let log = Arc::new(Log::new(5, 8, usize::MAX));
         let mut stream = log.since(5).unwrap();
         log.reset(7);
         assert!(matches!(stream.try_next(), Some(Err(Error::Lagged { .. }))));
@@ -303,7 +393,7 @@ mod tests {
 
     #[test]
     fn a_future_version_is_an_error() {
-        let log = Arc::new(Log::new(3, 8));
+        let log = Arc::new(Log::new(3, 8, usize::MAX));
         assert!(matches!(
             log.since(4),
             Err(Error::FutureVersion {
@@ -315,7 +405,7 @@ mod tests {
 
     #[test]
     fn iteration_ends_when_the_log_closes() {
-        let log = Arc::new(Log::new(0, 8));
+        let log = Arc::new(Log::new(0, 8, usize::MAX));
         let mut stream = log.from_latest();
         log.publish(event(1));
         log.close();

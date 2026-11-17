@@ -111,3 +111,15 @@ fn seeds_586_and_1254_a_join_by_column_name_with_a_full_text_table_sees_every_co
         );
     }
 }
+
+/// A group's value is any of its members', so SQL leaves it open where a
+/// collation makes different values equal: over a `NOCASE` column, `SELECT
+/// a.c0, count(*) FROM t3 AS a GROUP BY a.c0` shows `'a'` or `'A'` by the
+/// order SQLite scans the rows in, which an update to an indexed column it
+/// never reads can change. The harness compares such results without the
+/// group's value; this seed held `'a'` where a fresh run showed `'A'`.
+#[test]
+fn seed_117131_a_groups_value_is_any_of_its_members() {
+    let _serial = SQLITE_PRNG.lock().unwrap_or_else(|e| e.into_inner());
+    replays(Harness::Live, 117131);
+}
