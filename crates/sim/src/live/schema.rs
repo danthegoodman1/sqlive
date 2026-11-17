@@ -1,7 +1,7 @@
 //! Random schemas: rowid tables with and without `INTEGER PRIMARY KEY`,
 //! composite keys, `WITHOUT ROWID` and `STRICT` tables, generated columns,
 //! declared affinities and collations, unique constraints, foreign keys with
-//! cascades, triggers, and indexes.
+//! cascades, triggers, indexes, views, and full-text tables.
 
 use crate::prng::Prng;
 
@@ -143,6 +143,51 @@ pub struct SchemaSpec {
     pub extra: Vec<String>,
     /// `CREATE VIEW` statements; view `i` is named `v{i}`.
     pub views: Vec<String>,
+    /// Views that join by column name; view `i` is named `j{i}`.
+    pub join_views: Vec<String>,
+    /// The full-text tables, in the schemas that have them.
+    pub full_text: Option<FullText>,
+}
+
+/// Full-text tables, which keep their rows in shadow tables or read them
+/// from elsewhere:
+/// - `docs`, an FTS5 table with the column `c0`;
+/// - `words`, the vocabulary of `docs`, which has no shadow tables;
+/// - `words_log`, an FTS5 table whose shadow tables' names start with the
+///   name of `words`;
+/// - `mirror`, an FTS5 table that reads its rows from the view `shown`.
+#[derive(Clone, Debug)]
+pub struct FullText {
+    /// The rowid table `shown` selects from, if the schema has one.
+    pub mirrored: Option<String>,
+}
+
+impl FullText {
+    fn ddl(&self) -> String {
+        let mut ddl = String::from(
+            "CREATE VIRTUAL TABLE docs USING fts5 (c0);\n\
+             CREATE VIRTUAL TABLE words USING fts5vocab (docs, row);\n\
+             CREATE VIRTUAL TABLE words_log USING fts5 (c0);",
+        );
+        if let Some(table) = &self.mirrored {
+            ddl.push_str(&format!(
+                "\nCREATE VIEW shown AS SELECT rowid AS id, c0 FROM {table};\n\
+                 CREATE VIRTUAL TABLE mirror USING fts5 (c0, content = 'shown', content_rowid = 'id');"
+            ));
+        }
+        ddl
+    }
+}
+
+/// Full-text tables for three schemas in ten.
+pub fn full_text(prng: &mut Prng, tables: &[TableSpec]) -> Option<FullText> {
+    if !prng.chance(0.3) {
+        return None;
+    }
+    let with_rowid: Vec<&TableSpec> = tables.iter().filter(|t| t.has_rowid()).collect();
+    Some(FullText {
+        mirrored: (!with_rowid.is_empty()).then(|| prng.pick(&with_rowid).name.clone()),
+    })
 }
 
 impl SchemaSpec {
@@ -150,6 +195,8 @@ impl SchemaSpec {
         let mut ddl: Vec<String> = self.tables.iter().map(TableSpec::ddl).collect();
         ddl.extend(self.extra.iter().cloned());
         ddl.extend(self.views.iter().cloned());
+        ddl.extend(self.join_views.iter().cloned());
+        ddl.extend(self.full_text.as_ref().map(FullText::ddl));
         ddl.join("\n")
     }
 }
@@ -316,7 +363,38 @@ pub fn generate(prng: &mut Prng) -> SchemaSpec {
         tables,
         extra,
         views,
+        join_views: Vec::new(),
+        full_text: None,
     }
+}
+
+/// Views that join two tables by column name, with `USING` or `NATURAL`.
+/// Every table has the columns `c0` and `c1`.
+pub fn join_views(prng: &mut Prng, tables: &[TableSpec]) -> Vec<String> {
+    (0..prng.below(3))
+        .map(|v| {
+            let table = &tables[prng.index(tables.len())];
+            let other = &tables[prng.index(tables.len())];
+            let kind = *prng.pick(&["JOIN", "LEFT JOIN"]);
+            let left = &table.columns[prng.index(table.columns.len())].name;
+            let right = &other.columns[prng.index(other.columns.len())].name;
+            let body = match prng.below(3) {
+                0 => format!(
+                    "SELECT a.{left} AS x, b.{right} AS y FROM {} AS a {kind} {} AS b USING (c0)",
+                    table.name, other.name
+                ),
+                1 => format!(
+                    "SELECT a.{left} AS x, count(*) AS n FROM {} AS a NATURAL {kind} {} AS b GROUP BY a.{left}",
+                    table.name, other.name
+                ),
+                _ => format!(
+                    "SELECT c1, count(b.{right}) AS n FROM {} AS a {kind} {} AS b USING (c1) GROUP BY c1",
+                    table.name, other.name
+                ),
+            };
+            format!("CREATE VIEW j{v} AS {body};")
+        })
+        .collect()
 }
 
 /// A view: a filter, a left join, or a grouped count.

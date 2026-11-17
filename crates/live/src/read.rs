@@ -74,6 +74,8 @@ impl Drop for Reader {
 struct Cached {
     /// The tables the text reads, in order of their lowercase names.
     reads: Box<[Arc<ColumnsRead>]>,
+    /// The text reads something that changes without row events.
+    every_commit: bool,
     /// How the text numbers its parameters, and its constraint plan;
     /// `None` when SQLite numbers the parameters differently.
     planned: Option<(Parameters, Plan)>,
@@ -159,7 +161,8 @@ impl Reader {
         }
         let (prepared, mut reads) = deps::collect(&self.slot, || conn.prepare(sql));
         let statement = prepared?;
-        deps::resolve(conn, &mut reads)?;
+        let explains = statement.is_explain() != 0;
+        let every_commit = deps::resolve(conn, sql, &self.schema, explains, &mut reads)?;
         let planned = constraints::number_parameters(sql)
             .filter(|n| n.agrees(&statement))
             .map(|numbered| {
@@ -180,6 +183,7 @@ impl Reader {
             });
         let cached = Arc::new(Cached {
             reads: reads.into_values().map(|read| read.finish()).collect(),
+            every_commit,
             planned,
             boundary_column,
         });
@@ -431,7 +435,7 @@ impl Snapshot<'_> {
         Ok(QueryResult {
             rows: out,
             version: self.version,
-            read_set: ReadSet::new(self.version, tables),
+            read_set: ReadSet::new(self.version, tables, cached.every_commit),
             hash,
             unchanged,
         })

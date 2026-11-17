@@ -4,7 +4,8 @@
 //! Replica tables have no types or constraints, so values stay exactly as the
 //! events carry them, but key columns keep their collations, so a `WITHOUT
 //! ROWID` key matches rows the way the real table does. Each applied change
-//! must touch exactly the rows it claims to.
+//! must touch exactly the rows it claims to. A virtual table's shadow tables
+//! replicate as the tables they are.
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, params_from_iter};
@@ -30,11 +31,12 @@ fn quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// The user tables of the main database, as SQLite reports them.
+/// The user tables of the main database, shadow tables included, as SQLite
+/// reports them.
 pub fn shapes(conn: &Connection) -> rusqlite::Result<Vec<Shape>> {
     let mut list = conn.prepare(
         "SELECT name, wr FROM pragma_table_list
-         WHERE schema = 'main' AND type = 'table'
+         WHERE schema = 'main' AND type IN ('table', 'shadow')
            AND substr(name, 1, 7) <> 'sqlite_' AND name <> '_sqlive_meta'
          ORDER BY name",
     )?;

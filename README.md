@@ -8,10 +8,9 @@ columns, and key ranges the result depends on. Every committed write emits a
 SqLive reports what changed and what each query depends on. Your app tracks
 subscriptions and pushes updates to clients.
 
-Status: Phases 0 to 11 in [`PLAN.md`](PLAN.md) are built and tested. Phases 12 to 14 are
-open, and Phase 12 lists query shapes whose read sets miss changes today, joins with
-`USING` or `NATURAL` among them. SqLive is young and unpublished; expect the API to
-change.
+Status: Phases 0 to 12 in [`PLAN.md`](PLAN.md) are built and tested. Phases 13 and 14,
+which speed up large events and bound the memory events take, are open. SqLive is young
+and unpublished; expect the API to change.
 
 ## Install
 
@@ -46,6 +45,8 @@ db.write(|tx| {
 connections (`readers`), how many events the log retains (`log_capacity`), the busy
 timeout, and the WAL checkpoint threshold (`checkpoint_pages`). SqLive puts the database
 in WAL mode with `synchronous = FULL` and keeps its version in a `_sqlive_meta` table.
+The database must store text as UTF-8, SQLite's default: SqLive compares text by its
+UTF-8 bytes, so `open` returns `Error::Unsupported` for a UTF-16 database.
 Dropping the `LiveDb` closes its writer last, so when no other connection has the
 database open, SQLite checkpoints the WAL into the database file and deletes it.
 
@@ -133,10 +134,18 @@ lets it:
   `GROUP BY` or `DISTINCT`.
 
 A read set names every table and column the query reads, through views, CTEs,
-subqueries and joins. A read of a full-text (FTS5) table covers its shadow tables,
-which carry its changes, and its external content table, if it has one. A read of
-`_sqlive_meta` or of SQLite's internal tables, such as `sqlite_sequence`, intersects
-every commit.
+subqueries and joins. Some reads widen it:
+
+- A join with `USING` or `NATURAL`, in the query or in a view it names, counts every
+  column of each table the query opens, since SQLite matches the join columns without
+  reporting them. Row filters still apply. If the query also opens a virtual table or
+  a table-valued function, every commit intersects.
+- A full-text (FTS5) table covers its shadow tables, which carry its changes, and its
+  external content table, if it has one.
+- Every commit intersects a read of `_sqlive_meta`; of SQLite's internal tables, such
+  as `sqlite_sequence`; of a pragma function or `dbstat`, which report the database's
+  own state; and of a virtual table whose rows SqLive cannot follow, such as
+  `fts5vocab` or a full-text table whose content is a view.
 
 ## React to changes
 
@@ -228,12 +237,13 @@ for event in db.changes_since(result.version)? {
   commit newer than the query's version. The [chat example](#example-live-chat) runs
   the query and the insert under the same lock its loop holds while checking a commit.
 
-To index read sets yourself, first check `ReadSet::every_commit()`: a read set that
-reads `_sqlive_meta` or one of SQLite's internal tables intersects every commit. Then
-read each table's `filter()` from `ReadSet::tables()`: either `Filter::All` or
-`Filter::AnyOf` conjunctions of `Constraint { column, collation, condition }`.
-`Constraint::matches(row)` applies SQLite's comparison rules (storage class,
-collation, `NULL` handling) for you.
+To index read sets yourself, first check `ReadSet::every_commit()`: when it is set,
+every commit intersects. Then read each table's `filter()` from `ReadSet::tables()`:
+either `Filter::All` or `Filter::AnyOf` conjunctions of
+`Constraint { column, collation, condition }`. `Constraint::matches(row)` applies
+SQLite's comparison rules (storage class, collation, `NULL` handling) for you. An
+update counts when it changes a column the table's `columns()` list, or any column
+when `every_column()` is set.
 
 ## Guarantees
 
@@ -241,8 +251,12 @@ collation, `NULL` handling) for you.
   transaction's event. Versions have no gaps.
 - **Net:** each event lists one change per row: the first old value and the final new
   value.
-- **Conservative:** `intersects` returns false only when a change cannot affect the
-  result. It may return true for a change that leaves the result the same.
+- **Conservative:** `intersects` returns false only when a change cannot affect what
+  SQL determines of the result. It may return true for a change that leaves the result
+  the same. Where SQL leaves a result open, a fresh run can differ with no intersecting
+  event: the order of rows without a complete `ORDER BY`, the rows a `LIMIT` keeps
+  without one, a bare column in an aggregate query, which SQLite takes from a row of
+  its choosing, and functions that read the clock or draw random numbers.
 - **Hashes:** a `ResultHash` covers the result's column names, then each row in order,
   and each value in it with its storage class (reals by their bits). Any difference in
   a column name, a value, a storage class, the row order or the row count changes it.
@@ -285,7 +299,9 @@ collation, `NULL` handling) for you.
 - A snapshot can see a commit a moment before its event is published. It then waits
   for the publish, so `changes_since(result.version)` always succeeds.
 - The **authorizer** reports every table and column a query reads, through views,
-  subqueries, and CTEs. A SQL parser plans constraints from the `WHERE` clause and a
+  subqueries, and CTEs. It hears nothing of the columns a `USING` or `NATURAL` join
+  matches, so a query that joins that way takes its tables from the b-trees its
+  bytecode opens. A SQL parser plans constraints from the `WHERE` clause and a
   `LIMIT` window. Each reader keeps these reads, the plan and the prepared statement
   by SQL text until the schema changes, so a repeated query binds its parameters,
   steps, and adds a bound from the window's last row.

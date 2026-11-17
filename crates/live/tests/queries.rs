@@ -5,10 +5,17 @@ mod common;
 
 use common::open;
 use sqlive::rusqlite::{named_params, params};
-use sqlive::{CommitEvent, LiveDb, Options};
+use sqlive::{CommitEvent, Error, LiveDb, Options, Value};
 
 fn ints(row: &sqlive::rusqlite::Row<'_>) -> sqlive::rusqlite::Result<i64> {
     row.get(0)
+}
+
+/// Every column of a row.
+fn values(row: &sqlive::rusqlite::Row<'_>) -> sqlive::rusqlite::Result<Vec<Value>> {
+    (0..row.as_ref().column_count())
+        .map(|i| row.get(i))
+        .collect()
 }
 
 /// The event a write publishes.
@@ -344,6 +351,10 @@ fn a_full_text_query_depends_on_its_shadow_tables() {
         event.changes.iter().all(|c| c.table.starts_with("docs_")),
         "writes reach only the shadow tables: {event:?}"
     );
+    assert!(
+        event.changes.iter().any(|c| c.table == "docs_idx"),
+        "the index entries FTS5 holds back for the commit are in the event: {event:?}"
+    );
     assert!(read_set.intersects(&event), "{read_set}");
 }
 
@@ -409,4 +420,261 @@ fn an_external_content_query_depends_on_its_content_table() {
     assert!(read_set.tables().any(|t| t.name() == "items"), "{read_set}");
     let event = commit(&db, "UPDATE items SET body = 'hello there'");
     assert!(read_set.intersects(&event), "{read_set}");
+}
+
+/// Tables `a` and `b` that share the column `k`, a view that joins them by
+/// it, and a table no query here reads.
+fn joined(name: &str) -> LiveDb {
+    open(
+        name,
+        "CREATE TABLE a (k, x);
+         CREATE TABLE b (k, y);
+         CREATE TABLE other (z);
+         CREATE VIEW v AS SELECT a.x AS x FROM a JOIN b USING (k);
+         CREATE VIEW ones AS SELECT 1 AS one FROM a NATURAL JOIN b;
+         CREATE VIEW outer_ones AS SELECT one FROM ones;
+         INSERT INTO a VALUES (1, 'one'), (2, 'two');
+         INSERT INTO b VALUES (1, 'uno');",
+    )
+}
+
+#[test]
+fn a_join_by_column_name_reads_every_column_of_the_tables_it_opens() {
+    for sql in [
+        "SELECT a.x FROM a JOIN b USING (k)",
+        "SELECT a.x FROM a NATURAL JOIN b",
+        "SELECT a.x FROM a natural left join b WHERE b.y IS NOT NULL",
+        "SELECT count(*) FROM a JOIN b USING (k)",
+        "SELECT x FROM v",
+        // SQLite merges each of these views into the query before the
+        // authorizer hears of the view.
+        "SELECT count(*) FROM v",
+        "SELECT count(*) FROM ones",
+        "SELECT count(*) FROM \"Outer_Ones\"",
+        "SELECT a.x FROM a JOIN b USING (k) WHERE a.x <> ?1",
+        "WITH q AS (SELECT a.x FROM a JOIN b USING (k)) SELECT * FROM q",
+        "SELECT (SELECT count(*) FROM a JOIN b USING (k))",
+    ] {
+        // Each write moves the join column of one table, which the query
+        // names nowhere else.
+        for write in ["UPDATE a SET k = k + 10", "UPDATE b SET k = 7"] {
+            let db = joined("using");
+            let run = || {
+                if sql.contains("?1") {
+                    db.query(sql, ["none"], values).unwrap()
+                } else {
+                    db.query(sql, (), values).unwrap()
+                }
+            };
+            let before = run();
+            assert_eq!(before.read_set.to_string(), "a[*]; b[*]", "{sql}");
+            let elsewhere = commit(&db, "INSERT INTO other VALUES (1)");
+            assert!(!before.read_set.intersects(&elsewhere), "{sql}");
+            let event = commit(&db, write);
+            assert_ne!(before.rows, run().rows, "{write} changes {sql}");
+            assert!(
+                before.read_set.intersects(&event),
+                "{write} skips {sql}: {}",
+                before.read_set
+            );
+        }
+    }
+}
+
+#[test]
+fn a_join_by_column_name_keeps_its_row_filters() {
+    let db = joined("using-filter");
+    let read_set = db
+        .query(
+            "SELECT b.y FROM a JOIN b USING (k) WHERE a.x = 'one'",
+            (),
+            values,
+        )
+        .unwrap()
+        .read_set;
+    assert_eq!(read_set.to_string(), "a[*] where x = 'one'; b[*]");
+    let outside = commit(&db, "UPDATE a SET k = 5 WHERE x = 'two'");
+    assert!(!read_set.intersects(&outside), "a row the filter rejects");
+    let inside = commit(&db, "UPDATE a SET k = 5 WHERE x = 'one'");
+    assert!(
+        read_set.intersects(&inside),
+        "the join column of a row it allows"
+    );
+}
+
+#[test]
+fn a_join_by_column_name_with_a_virtual_table_sees_every_commit() {
+    let db = open(
+        "using-virtual",
+        "CREATE TABLE a (body, x);
+         CREATE TABLE other (z);
+         CREATE VIRTUAL TABLE docs USING fts5 (body);",
+    );
+    let read_set = db
+        .query("SELECT a.x FROM a JOIN docs USING (body)", (), values)
+        .unwrap()
+        .read_set;
+    assert!(read_set.every_commit(), "{read_set}");
+    assert!(read_set.intersects(&commit(&db, "INSERT INTO other VALUES (1)")));
+}
+
+#[test]
+fn reads_of_the_databases_own_state_see_every_commit() {
+    let fill = "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+                INSERT INTO t SELECT i FROM n";
+    for (sql, write) in [
+        (
+            "SELECT user_version FROM pragma_user_version",
+            "PRAGMA user_version = 7",
+        ),
+        ("SELECT page_count FROM pragma_page_count", fill),
+        ("SELECT sum(pgsize) FROM dbstat", fill),
+        (
+            "SELECT count(*) FROM t JOIN pragma_table_info('t')",
+            "INSERT INTO t VALUES (1)",
+        ),
+        ("SELECT term FROM vocab", "INSERT INTO docs VALUES ('milk')"),
+    ] {
+        // The shadow tables of `vocab_idx` belong to it, though their names
+        // start with the name of `vocab`, which has none.
+        let db = open(
+            "engine",
+            "CREATE TABLE t (a);
+             CREATE VIRTUAL TABLE docs USING fts5 (body);
+             CREATE VIRTUAL TABLE vocab USING fts5vocab (docs, row);
+             CREATE VIRTUAL TABLE vocab_idx USING fts5 (body);",
+        );
+        let before = db.query(sql, (), values).unwrap();
+        assert!(before.read_set.every_commit(), "{sql}: {}", before.read_set);
+        let event = commit(&db, write);
+        let after = db.query(sql, (), values).unwrap();
+        assert_ne!(before.rows, after.rows, "{write} changes {sql}");
+        assert!(before.read_set.intersects(&event), "{write} skips {sql}");
+    }
+}
+
+#[test]
+fn a_json_list_and_the_schema_table_keep_row_level_read_sets() {
+    let db = open(
+        "pure",
+        "CREATE TABLE t (a); CREATE TABLE other (z); INSERT INTO t VALUES (1), (2), (3);",
+    );
+    let listed = db
+        .query(
+            "SELECT a FROM t WHERE a IN (SELECT value FROM json_each(?1)) ORDER BY a",
+            ["[1, 3]"],
+            ints,
+        )
+        .unwrap();
+    assert_eq!(listed.rows, [1, 3]);
+    let schema = db
+        .query("SELECT name FROM sqlite_schema", (), values)
+        .unwrap()
+        .read_set;
+    for read_set in [&listed.read_set, &schema] {
+        assert!(!read_set.every_commit(), "{read_set}");
+        let elsewhere = commit(&db, "INSERT INTO other VALUES (1)");
+        assert!(!read_set.intersects(&elsewhere), "{read_set}");
+    }
+    assert!(
+        listed
+            .read_set
+            .intersects(&commit(&db, "DELETE FROM t WHERE a = 3"))
+    );
+    assert!(schema.intersects(&commit(&db, "CREATE TABLE more (y)")));
+}
+
+#[test]
+fn a_common_table_expression_keeps_a_row_level_read_set() {
+    let db = open(
+        "cte",
+        "CREATE TABLE t (a); CREATE TABLE other (z); INSERT INTO t VALUES (1), (2);",
+    );
+    // SQLite keeps each of these expressions apart from the query that reads
+    // it, and reports the expression's name as a table.
+    for sql in [
+        "WITH q AS (SELECT a FROM t LIMIT 5) SELECT count(*) FROM q",
+        "WITH q AS MATERIALIZED (SELECT a FROM t) SELECT count(*) FROM q",
+        "WITH RECURSIVE n (i) AS (SELECT a FROM t UNION SELECT i + 1 FROM n WHERE i < 3)
+         SELECT count(*) FROM n",
+    ] {
+        let read_set = db.query(sql, (), ints).unwrap().read_set;
+        assert!(!read_set.every_commit(), "{sql}: {read_set}");
+        let elsewhere = commit(&db, "INSERT INTO other VALUES (1)");
+        assert!(!read_set.intersects(&elsewhere), "{sql}: {read_set}");
+        let event = commit(&db, "INSERT INTO t VALUES (7)");
+        assert!(read_set.intersects(&event), "{sql}: {read_set}");
+    }
+}
+
+#[test]
+fn an_explain_of_a_join_by_column_name_runs() {
+    let db = joined("explain");
+    let result = db
+        .query("EXPLAIN SELECT a.x FROM a JOIN b USING (k)", (), values)
+        .unwrap();
+    assert!(!result.rows.is_empty());
+    assert!(!result.read_set.every_commit());
+}
+
+#[test]
+fn a_nan_parameter_reads_as_the_null_sqlite_binds() {
+    let db = open(
+        "nan",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a REAL); INSERT INTO t VALUES (1, 1.5);",
+    );
+    let sql = "SELECT id FROM t WHERE a IS ?1";
+    let before = db.query(sql, [f64::NAN], ints).unwrap();
+    assert_eq!(before.rows, [0i64; 0]);
+    assert_eq!(before.read_set.to_string(), "t[a, id] where a IS NULL");
+    let event = commit(&db, "INSERT INTO t VALUES (2, NULL)");
+    assert_eq!(db.query(sql, [f64::NAN], ints).unwrap().rows, [2]);
+    assert!(before.read_set.intersects(&event));
+    let named = db
+        .query(
+            "SELECT id FROM t WHERE a IS :a",
+            named_params! { ":a": f64::NAN },
+            ints,
+        )
+        .unwrap();
+    assert_eq!(named.read_set.to_string(), "t[a, id] where a IS NULL");
+}
+
+#[test]
+fn a_utf16_database_fails_to_open_and_stays_as_it_was() {
+    let path = common::temp_db("utf16");
+    let journal_mode = |path: &str| {
+        sqlive::rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap()
+    };
+    sqlive::rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (name TEXT);")
+        .unwrap();
+    match LiveDb::open(&path) {
+        Err(Error::Unsupported(what)) => assert!(what.contains("UTF-16le"), "{what}"),
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("a UTF-16 database opened"),
+    }
+    assert_eq!(journal_mode(&path), "delete");
+}
+
+#[test]
+fn a_full_text_query_whose_content_is_a_view_sees_every_commit() {
+    let db = open(
+        "content-view",
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, body TEXT);
+         CREATE VIEW shown AS SELECT id, body FROM items;
+         CREATE VIRTUAL TABLE f USING fts5 (body, content = 'Shown', content_rowid = 'id');
+         INSERT INTO items VALUES (1, 'hello');
+         INSERT INTO f (rowid, body) VALUES (1, 'hello');",
+    );
+    let sql = "SELECT body FROM f WHERE f MATCH 'hello'";
+    let before = db.query(sql, (), values).unwrap();
+    assert!(before.read_set.every_commit(), "{}", before.read_set);
+    let event = commit(&db, "UPDATE items SET body = 'hello there'");
+    assert_ne!(before.rows, db.query(sql, (), values).unwrap().rows);
+    assert!(before.read_set.intersects(&event));
 }

@@ -17,7 +17,7 @@ pub struct ReadSet {
     version: Version,
     /// In order of their lowercase names.
     tables: Box<[TableRead]>,
-    /// The query reads a table that changes without row events, so every
+    /// The query reads something that changes without row events, so every
     /// commit counts.
     every_commit: bool,
 }
@@ -39,9 +39,12 @@ pub(crate) struct ColumnsRead {
     key: String,
     /// Lowercase names of the columns read, in order.
     columns: Box<[String]>,
-    /// Every change to the table counts, as for a virtual table's shadow
-    /// tables.
+    /// An update to any column counts, as when a `USING` join reads
+    /// columns the authorizer leaves out.
     every_column: bool,
+    /// Every row counts, whatever the query's filter allows, as for a
+    /// virtual table's shadow tables.
+    every_row: bool,
 }
 
 /// The columns a statement reads from one table, as its preparation
@@ -51,6 +54,7 @@ pub(crate) struct Recorded {
     name: String,
     columns: BTreeSet<String>,
     every_column: bool,
+    every_row: bool,
 }
 
 impl Recorded {
@@ -59,6 +63,7 @@ impl Recorded {
             name: name.to_owned(),
             columns: BTreeSet::new(),
             every_column: false,
+            every_row: false,
         }
     }
 
@@ -70,8 +75,16 @@ impl Recorded {
         }
     }
 
+    /// Counts an update to any column of the rows the query's filter
+    /// allows.
     pub(crate) fn record_every_column(&mut self) {
         self.every_column = true;
+    }
+
+    /// Counts every change to the table.
+    pub(crate) fn record_every_change(&mut self) {
+        self.every_column = true;
+        self.every_row = true;
     }
 
     /// The table's name, as SQLite spells it.
@@ -85,6 +98,7 @@ impl Recorded {
             name: self.name,
             columns: self.columns.into_iter().collect(),
             every_column: self.every_column,
+            every_row: self.every_row,
         })
     }
 }
@@ -100,7 +114,7 @@ impl TableRead {
     /// The table's reads, narrowed to the rows `filter` allows; a table
     /// every change counts for keeps them all.
     pub(crate) fn new(columns: Arc<ColumnsRead>, filter: Filter) -> TableRead {
-        let filter = if columns.every_column {
+        let filter = if columns.every_row {
             Filter::All
         } else {
             filter
@@ -118,7 +132,8 @@ impl TableRead {
         self.columns.columns.iter().map(String::as_str)
     }
 
-    /// Whether the query depends on every column, so any change counts.
+    /// Whether the query depends on every column, so an update to any of
+    /// them counts.
     pub fn every_column(&self) -> bool {
         self.columns.every_column
     }
@@ -183,16 +198,18 @@ fn cmp_ignoring_case(a: &str, b: &str) -> Ordering {
 
 impl ReadSet {
     /// A read set of `tables`, which come in order of their lowercase
-    /// names.
-    pub(crate) fn new(version: Version, tables: Box<[TableRead]>) -> ReadSet {
+    /// names. `every_commit` is set when the query reads something besides
+    /// them that changes without row events.
+    pub(crate) fn new(version: Version, tables: Box<[TableRead]>, every_commit: bool) -> ReadSet {
         debug_assert!(
             tables
                 .windows(2)
                 .all(|pair| pair[0].columns.key < pair[1].columns.key)
         );
-        let every_commit = tables
-            .iter()
-            .any(|table| changes_without_events(&table.columns.key));
+        let every_commit = every_commit
+            || tables
+                .iter()
+                .any(|table| changes_without_events(&table.columns.key));
         ReadSet {
             version,
             tables,
@@ -206,7 +223,8 @@ impl ReadSet {
     }
 
     /// Whether every commit after the version intersects, as when the query
-    /// reads SqLive's version table or one of SQLite's internal tables.
+    /// reads SqLive's version table, one of SQLite's internal tables, a
+    /// pragma function, or a virtual table whose rows SqLive cannot follow.
     pub fn every_commit(&self) -> bool {
         self.every_commit
     }
@@ -225,9 +243,8 @@ impl ReadSet {
 
     /// Whether `event` may have changed the query's result. False for an
     /// event at or below the read set's version, which the result already
-    /// reflects; true for a schema change, and for every commit when the
-    /// query reads SqLive's version table or one of SQLite's internal
-    /// tables.
+    /// reflects; true for a schema change, and for every commit when
+    /// [`ReadSet::every_commit`] is set.
     pub fn intersects(&self, event: &CommitEvent) -> bool {
         if event.version <= self.version {
             return false;

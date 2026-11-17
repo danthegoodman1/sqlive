@@ -84,6 +84,14 @@ impl LiveDb {
     pub fn open_with(path: impl AsRef<str>, options: Options) -> Result<LiveDb> {
         let path = path.as_ref().to_owned();
         let mut conn = open_connection(&path, &options, false)?;
+        // SqLive compares text by its UTF-8 bytes, while a UTF-16 database
+        // orders and matches text by its UTF-16 code units.
+        let encoding: String = conn.query_row("PRAGMA encoding", [], |r| r.get(0))?;
+        if encoding != "UTF-8" {
+            return Err(Error::Unsupported(format!(
+                "text encoding {encoding}; SqLive needs UTF-8"
+            )));
+        }
         let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Unsupported(format!(
@@ -497,6 +505,9 @@ fn read_meta(conn: &Connection) -> rusqlite::Result<Meta> {
 }
 
 /// Advances the version, recording the schema cookie the commit leaves.
+/// `RETURNING` makes SQLite open a statement transaction, which tells each
+/// virtual table to write what it holds back for the commit, as FTS5 holds
+/// its index entries, while the changes are still recorded.
 fn bump_version(conn: &Connection, schema: i64) -> rusqlite::Result<Version> {
     conn.prepare_cached(&format!(
         "UPDATE {META_TABLE} SET version = version + 1, schema = ?1 WHERE id = 0 RETURNING version"

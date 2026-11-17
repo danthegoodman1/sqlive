@@ -83,7 +83,18 @@ impl LiveOptions {
             reopen: *prng.pick(&[0.0, 0.01]),
             peek: *prng.pick(&[0.05, 0.3]),
             faults: FaultConfig::from_prng(&mut prng),
-            schema: schema::generate(&mut Prng::stream(seed, "live schema")),
+            schema: {
+                let mut schema = schema::generate(&mut Prng::stream(seed, "live schema"));
+                schema.join_views = schema::join_views(
+                    &mut Prng::stream(seed, "live schema join views"),
+                    &schema.tables,
+                );
+                schema.full_text = schema::full_text(
+                    &mut Prng::stream(seed, "live schema full text"),
+                    &schema.tables,
+                );
+                schema
+            },
             subscriptions: subscriptions.range(1..=8),
             snapshot: *subscriptions.pick(&[0.02, 0.1]),
         }
@@ -127,7 +138,7 @@ impl fmt::Display for LiveSummary {
             "{} writes ({} failed), {} statements ({} failed), {} events with {} changes ({} schema), \
              {} lags, {} rebuilds, {} replica checks ({} skipped), {} peeks, {} restarts ({} crashes, {} recovered unpublished commits), \
              {} rolled back, \
-             {} subscription checks, {} queries ({} constrained, {} windowed), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, {} index checks ({} hits), \
+             {} subscription checks, {} queries ({} constrained, {} windowed, {} of every commit; by shape {:?}), {} of {} events intersected, {} re-runs ({} unchanged), {} subscription lags, {} failed queries ({} snapshots ended), {} snapshot checks, {} index checks ({} hits), \
              I/O errors: {} read {} write {} sync {} busy, digest {:016x}",
             self.writes,
             self.failed_writes,
@@ -149,6 +160,8 @@ impl fmt::Display for LiveSummary {
             self.subscriptions.queries,
             self.subscriptions.constrained,
             self.subscriptions.windowed,
+            self.subscriptions.every_commit,
+            self.subscriptions.shapes,
             self.subscriptions.intersected,
             self.subscriptions.tested,
             self.subscriptions.reruns,
@@ -184,6 +197,10 @@ struct Live {
     /// Query shapes added after the first, drawn apart so existing seeds
     /// keep their queries.
     query_shapes: Prng,
+    /// The shapes added after those, each from its own stream.
+    more_shapes: queries::Shapes,
+    /// Writes to the full-text tables.
+    full_text: Prng,
     trace: Trace,
     serial: u64,
     summary: LiveSummary,
@@ -229,6 +246,8 @@ pub fn run(seed: u64, verbose: bool) -> Result<LiveSummary, String> {
         restarts: Prng::stream(seed, "live restarts"),
         queries: Prng::stream(seed, "live queries"),
         query_shapes: Prng::stream(seed, "live query shapes"),
+        more_shapes: queries::Shapes::from_seed(seed),
+        full_text: Prng::stream(seed, "live full text writes"),
         trace: Trace::new(verbose),
         serial: 0,
         summary: LiveSummary::default(),
@@ -435,7 +454,12 @@ impl Live {
                 subscription
             }
             None => {
-                let query = queries::query(&mut self.queries, &mut self.query_shapes, &self.schema);
+                let query = queries::query(
+                    &mut self.queries,
+                    &mut self.query_shapes,
+                    &mut self.more_shapes,
+                    &self.schema,
+                );
                 let kind = *self.queries.pick(&[Kind::Eager, Kind::Lagging]);
                 Subscription::new(id, query, kind)
             }
@@ -455,7 +479,12 @@ impl Live {
     /// across this step's write. `None` if an injected fault stopped the
     /// snapshot.
     fn hold<'d>(&mut self, db: &'d LiveDb) -> Result<Option<Hold<'d>>, String> {
-        let query = queries::query(&mut self.queries, &mut self.query_shapes, &self.schema);
+        let query = queries::query(
+            &mut self.queries,
+            &mut self.query_shapes,
+            &mut self.more_shapes,
+            &self.schema,
+        );
         let snapshot = match db.snapshot() {
             Ok(snapshot) => snapshot,
             Err(e) => {
@@ -573,10 +602,25 @@ impl Live {
             ));
         };
         if settle && found.len() != self.subscriptions.len() {
+            let behind: Vec<String> = self
+                .subscriptions
+                .iter()
+                .filter(|subscription| !subscription.caught_up(latest))
+                .map(|subscription| {
+                    format!(
+                        "subscription {}: {} {:?}, whose last failure was {:?}",
+                        subscription.id,
+                        subscription.query.sql,
+                        subscription.query.params,
+                        subscription.last_error
+                    )
+                })
+                .collect();
             return Err(format!(
-                "{} of {} subscriptions caught up with faults off",
+                "{} of {} subscriptions caught up with faults off; behind: {}",
                 found.len(),
-                self.subscriptions.len()
+                self.subscriptions.len(),
+                behind.join("; ")
             ));
         }
         for (i, expected) in found {
@@ -672,7 +716,19 @@ impl Live {
     }
 
     fn write(&mut self) -> Result<(), String> {
-        let txn = writes::transaction(&mut self.prng, &self.schema);
+        let mut txn = writes::transaction(&mut self.prng, &self.schema);
+        // A statement that writes a full-text table runs with fault
+        // injection suspended. After a read error inside an insert, FTS5
+        // keeps the row and size totals it failed to load, and stores them
+        // at the next commit, where the integrity check finds them wrong;
+        // plain SQLite does the same.
+        let mut full_text_at = None;
+        if self.schema.full_text.is_some() && self.full_text.chance(0.4) {
+            let at = self.full_text.index(txn.statements.len() + 1);
+            txn.statements
+                .insert(at, writes::full_text_statement(&mut self.full_text));
+            full_text_at = Some(at);
+        }
         let before = self.db().version();
         let peeks: Vec<bool> = txn
             .statements
@@ -693,8 +749,13 @@ impl Live {
         let mut finished = false;
         let (oracle, vfs) = (self.oracle(), &self.vfs);
         let result = self.db().write(|tx| {
-            for (statement, peek) in txn.statements.iter().zip(&peeks) {
-                let outcome = tx.execute(&statement.sql, params_from_iter(&statement.params));
+            for (i, (statement, peek)) in txn.statements.iter().zip(&peeks).enumerate() {
+                let execute = || tx.execute(&statement.sql, params_from_iter(&statement.params));
+                let outcome = if full_text_at == Some(i) {
+                    vfs.quietly(execute)
+                } else {
+                    execute()
+                };
                 let failed = outcome.is_err();
                 // Checked after each statement, before a later `SAVEPOINT`
                 // can open a new transaction.

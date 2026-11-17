@@ -1,13 +1,17 @@
-//! The tables and columns a query reads, as SQLite's authorizer reports them
-//! while it prepares the statement: through views, subqueries, CTEs and
-//! joins alike.
+//! The tables and columns a query reads. SQLite's authorizer reports them
+//! while it prepares the statement, through views, subqueries, CTEs and
+//! joins alike, except for the columns a `USING` or `NATURAL` join matches:
+//! SQLite resolves those itself. A statement that joins that way, in its
+//! own text or in a view it names, takes its tables from the b-trees its
+//! bytecode opens, and every column of each counts.
 
 use crate::read_set::Recorded;
-use rusqlite::Connection;
+use crate::schema::Schema;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::{Connection, OptionalExtension};
 use sqlite3_parser::lexer::Scanner;
 use sqlite3_parser::lexer::sql::{TokenType, Tokenizer};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// Each table a query reads, by lowercase name.
@@ -63,50 +67,196 @@ pub(crate) fn collect<T>(slot: &Slot, prepare: impl FnOnce() -> T) -> (T, Reads)
     (prepared, reads)
 }
 
-/// Drops the views a query reads, whose base tables the authorizer reports
-/// too, and adds each virtual table's shadow tables, which hold its rows and
-/// carry its changes, along with an FTS table's external content table,
-/// which it reads rows from as the query runs. Any change to these counts.
-pub(crate) fn resolve(conn: &Connection, reads: &mut Reads) -> rusqlite::Result<()> {
-    let mut kind = conn
-        .prepare_cached("SELECT type FROM pragma_table_list WHERE schema = 'main' AND name = ?1")?;
+/// SQLite's schema table, as the authorizer reports it.
+const SCHEMA_TABLE: &str = "sqlite_master";
+
+/// Table-valued functions whose rows depend on their arguments alone.
+const PURE_FUNCTIONS: [&str; 4] = ["json_each", "json_tree", "jsonb_each", "jsonb_tree"];
+
+/// Completes the reads the authorizer recorded while SQLite prepared `sql`,
+/// and returns whether every commit counts, whatever rows it changes.
+/// `explains` is set for an `EXPLAIN`, which reads no rows.
+///
+/// - A view drops out, since the authorizer reports its base tables too.
+/// - A virtual table adds its shadow tables, which hold its rows and carry
+///   its changes, and an FTS table's external content table, which it reads
+///   rows from as the query runs. Any change to these counts.
+/// - Every commit counts for a virtual table that keeps its rows in neither,
+///   as `fts5vocab` reads another table's index; for an FTS table whose
+///   content is a view; and for a table-valued function that reads the
+///   database's own state, as the pragma functions and `dbstat` do.
+/// - A statement that joins by column name adds each table its bytecode
+///   opens, and every column of each table counts. Every commit counts when
+///   it opens a table the bytecode leaves unnamed, such as a virtual table.
+pub(crate) fn resolve(
+    conn: &Connection,
+    sql: &str,
+    schema: &Schema,
+    explains: bool,
+    reads: &mut Reads,
+) -> rusqlite::Result<bool> {
+    let mut kind = conn.prepare_cached(
+        "SELECT type FROM pragma_table_list WHERE schema = 'main' AND name = ?1 COLLATE NOCASE",
+    )?;
+    let mut module = conn
+        .prepare_cached("SELECT count(*) FROM pragma_module_list WHERE name = ?1 COLLATE NOCASE")?;
     let mut shadows = conn.prepare_cached(
         "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'shadow'",
     )?;
+    let mut declared =
+        conn.prepare_cached("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1")?;
+    let mut every_commit = false;
     let names: Vec<String> = reads.values().map(|t| t.name().to_owned()).collect();
     for name in names {
-        let found = match kind.query_row([&name], |r| r.get::<_, String>(0)) {
-            Ok(found) => found,
-            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
-            Err(e) => return Err(e),
-        };
-        if found == "view" {
-            reads.remove(&name.to_ascii_lowercase());
-        }
-        if found != "virtual" {
-            continue;
-        }
-        let prefix = format!("{}_", name.to_ascii_lowercase());
-        let mut tables: Vec<String> = shadows
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?
-            .into_iter()
-            .filter(|table| table.to_ascii_lowercase().starts_with(&prefix))
-            .collect();
-        let declared: String = conn.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-            [&name],
-            |r| r.get(0),
-        )?;
-        tables.extend(content_table(&declared));
-        for table in tables {
-            reads
-                .entry(table.to_ascii_lowercase())
-                .or_insert_with(|| Recorded::new(&table))
-                .record_every_column();
+        let key = name.to_ascii_lowercase();
+        let found = kind
+            .query_row([&name], |r| r.get::<_, String>(0))
+            .optional()?;
+        match found.as_deref() {
+            Some("view") => {
+                reads.remove(&key);
+            }
+            Some("virtual") => {
+                // SQLite gives a shadow table to the virtual table named
+                // before its last underscore.
+                let mut tables: Vec<String> = shadows
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?
+                    .into_iter()
+                    .filter(|table| {
+                        table
+                            .rsplit_once('_')
+                            .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(&name))
+                    })
+                    .collect();
+                let definition: String = declared.query_row([&name], |r| r.get(0))?;
+                if let Some(content) = content_table(&definition) {
+                    let content_kind = kind
+                        .query_row([&content], |r| r.get::<_, String>(0))
+                        .optional()?;
+                    every_commit |= !matches!(content_kind.as_deref(), Some("table" | "shadow"));
+                    tables.push(content);
+                }
+                every_commit |= tables.is_empty();
+                for table in tables {
+                    reads
+                        .entry(table.to_ascii_lowercase())
+                        .or_insert_with(|| Recorded::new(&table))
+                        .record_every_change();
+                }
+            }
+            Some(_) => {}
+            // A table-valued function, which is a module, or a name the
+            // statement defines itself, as for a common table expression.
+            None => {
+                let is_function = module.query_row([&name], |r| r.get::<_, i64>(0))? > 0;
+                every_commit |= is_function && !PURE_FUNCTIONS.contains(&key.as_str());
+            }
         }
     }
-    Ok(())
+    if !explains && joins_by_name(sql, &schema.views_joined_by_name) {
+        every_commit |= !add_opened(conn, sql, reads)?;
+        for read in reads.values_mut() {
+            read.record_every_column();
+        }
+    }
+    Ok(every_commit)
+}
+
+/// The lowercase names of the views that join tables by column name, in
+/// their own definitions or in those of the views they name. SQLite can
+/// merge a view into the statement that reads it before the authorizer
+/// hears of the view, so these come from the schema.
+pub(crate) fn views_joined_by_name(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
+    let views: Vec<(String, String)> = conn
+        .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'view'")?
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?.to_ascii_lowercase(), r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut joined = BTreeSet::new();
+    loop {
+        let found: Vec<&String> = views
+            .iter()
+            .filter(|(name, definition)| {
+                !joined.contains(name) && joins_by_name(definition, &joined)
+            })
+            .map(|(name, _)| name)
+            .collect();
+        if found.is_empty() {
+            return Ok(joined);
+        }
+        joined.extend(found.into_iter().cloned());
+    }
+}
+
+/// Whether SQL joins tables by column name: with `USING` or `NATURAL`, or
+/// through one of `views`, which do. Any token that spells a view's name
+/// counts as naming it, and SQL that does not tokenize might join so.
+fn joins_by_name(sql: &str, views: &BTreeSet<String>) -> bool {
+    let mut scanner = Scanner::new(Tokenizer::new());
+    let input = sql.as_bytes();
+    loop {
+        match scanner.scan(input) {
+            Ok((_, None, _)) => return false,
+            Ok((_, Some((_, TokenType::TK_USING)), _)) => return true,
+            Ok((_, Some((token, kind)), _)) => {
+                if kind == TokenType::TK_JOIN_KW && token.eq_ignore_ascii_case(b"natural") {
+                    return true;
+                }
+                if views.is_empty() {
+                    continue;
+                }
+                let Ok(text) = std::str::from_utf8(token) else {
+                    return true;
+                };
+                let mut name = unquote(text);
+                name.make_ascii_lowercase();
+                if views.contains(&name) {
+                    return true;
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
+/// Adds each table of the main database whose b-tree, or whose index's, the
+/// bytecode of `sql` opens. Returns false if the statement opens anything
+/// else, such as a virtual table, whose name the bytecode leaves out.
+fn add_opened(conn: &Connection, sql: &str, reads: &mut Reads) -> rusqlite::Result<bool> {
+    let mut explain = conn.prepare(&format!("EXPLAIN {sql}"))?;
+    // The table each b-tree belongs to, by root page.
+    let owners: BTreeMap<i64, String> = conn
+        .prepare_cached("SELECT rootpage, tbl_name FROM sqlite_schema WHERE rootpage > 0")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut named = true;
+    // The statement's parameters stay unbound.
+    let mut rows = explain.raw_query();
+    while let Some(row) = rows.next()? {
+        match row.get_ref(1)?.as_str()? {
+            "OpenRead" | "OpenWrite" | "ReopenIdx" => {
+                let (root, database): (i64, i64) = (row.get(3)?, row.get(4)?);
+                let table = match (database, root) {
+                    (0, 1) => Some(SCHEMA_TABLE),
+                    (0, root) => owners.get(&root).map(String::as_str),
+                    _ => None,
+                };
+                match table {
+                    Some(table) => {
+                        reads
+                            .entry(table.to_ascii_lowercase())
+                            .or_insert_with(|| Recorded::new(table));
+                    }
+                    None => named = false,
+                }
+            }
+            "VOpen" => named = false,
+            _ => {}
+        }
+    }
+    Ok(named)
 }
 
 /// The external content table a `CREATE VIRTUAL TABLE` statement names with
@@ -146,5 +296,65 @@ fn unquote(text: &str) -> String {
         }
         (Some(b'['), Some(b']')) => text[1..text.len() - 1].to_owned(),
         _ => text.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joins_by_name_finds_using_and_natural_in_any_case() {
+        let none = BTreeSet::new();
+        for sql in [
+            "SELECT 1 FROM a JOIN b USING (k)",
+            "SELECT 1 FROM a natural join b",
+            "SELECT 1 FROM a NATURAL LEFT OUTER JOIN b",
+            "WITH q AS (SELECT 1 FROM a JOIN b using(k)) SELECT * FROM q",
+            "CREATE VIEW v AS SELECT a.x FROM a LEFT JOIN b USING (k)",
+            "SELECT 'unterminated",
+        ] {
+            assert!(joins_by_name(sql, &none), "{sql}");
+        }
+        for sql in [
+            "SELECT 1 FROM a JOIN b ON a.k = b.k",
+            "SELECT 'using', \"natural\" FROM a LEFT JOIN b ON 1",
+            "SELECT 1 FROM a CROSS JOIN b -- natural using",
+        ] {
+            assert!(!joins_by_name(sql, &none), "{sql}");
+        }
+    }
+
+    #[test]
+    fn joins_by_name_finds_a_view_under_any_spelling_of_its_name() {
+        let views = BTreeSet::from(["pairs".to_owned(), "odd name".to_owned()]);
+        for sql in [
+            "SELECT count(*) FROM pairs",
+            "SELECT count(*) FROM main.PAIRS AS p",
+            "SELECT count(*) FROM \"Pairs\"",
+            "SELECT count(*) FROM 'pairs'",
+            "SELECT count(*) FROM [odd name]",
+            "SELECT count(*) FROM `Odd Name`",
+        ] {
+            assert!(joins_by_name(sql, &views), "{sql}");
+        }
+        assert!(!joins_by_name("SELECT count(*) FROM pair", &views));
+    }
+
+    #[test]
+    fn views_joined_by_name_follow_the_views_they_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE a (k, x);
+             CREATE TABLE b (k, y);
+             CREATE VIEW plain AS SELECT x FROM a;
+             CREATE VIEW Joined AS SELECT 1 AS one FROM a JOIN b USING (k);
+             CREATE VIEW outer_view AS SELECT one FROM \"joined\";
+             CREATE VIEW outermost AS SELECT count(*) AS n FROM outer_view, plain;",
+        )
+        .unwrap();
+        let joined = views_joined_by_name(&conn).unwrap();
+        let names: Vec<&str> = joined.iter().map(String::as_str).collect();
+        assert_eq!(names, ["joined", "outer_view", "outermost"]);
     }
 }
