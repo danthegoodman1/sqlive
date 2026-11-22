@@ -26,7 +26,7 @@ const NUMBER = 1
 const TEXT = 2
 const BLOB = 3
 const BIGINT = 4
-/** Float64 slots before the packed values: cells, slots, texts, then three the call fills. */
+/** Float64 slots before the packed values: cells, slots, texts and columns, then two the call fills. */
 const HEADER = 6
 
 class Views {
@@ -76,7 +76,7 @@ function unpack(views, chunks, blobs) {
       case TEXT: {
         const units = u32[length++]
         // A text that does not fit the rest of its chunk starts the next.
-        if (at + units > chunk.length) {
+        while (at + units > chunk.length) {
           chunk = chunks[next++]
           at = 0
         }
@@ -116,12 +116,14 @@ function compile(columns) {
   }
 }
 
-function shapeOf(key) {
+/** The row constructor for `width` columns whose names `key` joins with NUL. */
+function shapeOf(key, width) {
   let shape = shapes.get(key)
-  if (shape === undefined) {
+  if (shape === undefined || shape.width !== width) {
     if (shapes.size >= MAX_SHAPES) shapes.clear()
-    const columns = key === '' ? [] : key.split('\0')
-    shape = { width: columns.length, make: compile(columns) }
+    // One column's key is its name, which may be empty.
+    const columns = width === 0 ? [] : key.split('\0')
+    shape = { width, make: compile(columns) }
     shapes.set(key, shape)
   }
   return shape
@@ -132,7 +134,7 @@ function toRows(views, parts) {
   const values = unpack(views, parts[1], parts[3])
   const count = values.length
   if (count === 0) return []
-  const { width, make } = shapeOf(parts[2])
+  const { width, make } = shapeOf(parts[2], views.f64[3])
   const rows = new Array(count / width)
   for (let i = 0, r = 0; i < count; i += width) rows[r++] = make(values, i)
   return rows
@@ -141,8 +143,8 @@ function toRows(views, parts) {
 function toResult(parts) {
   const views = viewsOf(parts[0])
   // Read the header before anything else can pack into the scratch buffer.
-  const version = views.f64[3]
-  const unchanged = views.f64[4] === 1
+  const version = views.f64[4]
+  const unchanged = views.f64[5] === 1
   return {
     rows: unchanged ? [] : toRows(views, parts),
     version,
@@ -859,6 +861,8 @@ class LiveDb {
 
   /** Runs `VACUUM` on the writer thread and resolves with the version of its event. */
   vacuum() {
+    const outer = writing.getStore()
+    if (outer !== undefined && outer.open && outer.db === this.#native) return Promise.reject(nestedWrite())
     return new Promise((resolve, reject) => {
       const id = nextJob()
       jobs.set(id, new VacuumJob(this.#native, this.#hub, resolve, reject))

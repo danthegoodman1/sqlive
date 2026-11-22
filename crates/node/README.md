@@ -125,7 +125,8 @@ it with `using`. A query may not write, or run `PRAGMA`, `ATTACH`, `DETACH` or
 transaction statements; pragma functions such as `pragma_table_info('todos')` work.
 
 Parameters are an array for `?` and `?N`, or an object for `:name`, `@name` and
-`$name`. A key may carry its prefix; a bare key takes the prefix the SQL uses.
+`$name`. A key may carry its prefix; a bare key takes the prefix the SQL uses. A
+named parameter the object leaves out binds `NULL`, as in SQLite.
 
 | SQLite | JavaScript |
 | --- | --- |
@@ -190,7 +191,7 @@ Errors carry a `code`: SQLite's name for a SQLite failure, such as
 | `ERR_SQLIVE_ROLLED_BACK` | SQLite rolled a write back after an error, so nothing committed |
 | `ERR_SQLIVE_SNAPSHOT_ENDED` | SQLite ended a snapshot's read transaction; start a new one |
 | `ERR_SQLIVE_UNSUPPORTED` | A query that writes, or a database SqLive cannot follow |
-| `ERR_SQLIVE_PARAMETERS` | A parameter missing, extra or misnamed |
+| `ERR_SQLIVE_PARAMETERS` | Too few or too many positional values, or a name the statement lacks |
 | `ERR_SQLIVE_TRANSACTION_ENDED` | A `tx` used after its callback finished |
 | `ERR_SQLIVE_WRITE_PENDING` | A write inside a write, or `writeSync` while one is queued |
 | `ERR_SQLIVE_CLOSED` | The database or snapshot is closed |

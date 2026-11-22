@@ -109,11 +109,7 @@ pub(crate) unsafe fn result_array(
     into: Option<(&mut NativeIndex, f64)>,
 ) -> Result<sys::napi_value> {
     unsafe {
-        let extra = [
-            result.version as f64,
-            f64::from(u8::from(result.unchanged)),
-            0.0,
-        ];
+        let extra = [result.version as f64, f64::from(u8::from(result.unchanged))];
         let [buffer, chunks, key, blobs] = rows.finish(env, scratch, extra)?;
         let read_set = match into {
             Some((index, key)) => {

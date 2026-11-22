@@ -25,8 +25,8 @@ const TEXT: u8 = 2;
 const BLOB: u8 = 3;
 const BIGINT: u8 = 4;
 
-/// The buffer's header: cells, slots and texts, then three numbers the
-/// caller passes, each as a float64.
+/// The buffer's header: cells, slots, texts and columns, then two numbers
+/// the caller passes, each as a float64.
 const HEADER: usize = 6;
 
 /// Rows packed on any thread; `finish` hands them to JavaScript. Each
@@ -172,7 +172,10 @@ impl Packed {
             lossy = String::from_utf8_lossy(bytes);
             (lossy.as_ref(), lossy.encode_utf16().count(), false)
         };
-        let fits = self.used > 0 && self.chunks[self.used - 1].units + units <= CHUNK;
+        // An empty value fits any chunk, so no chunk holds nothing but
+        // empty values after the first.
+        let fits =
+            self.used > 0 && (units == 0 || self.chunks[self.used - 1].units + units <= CHUNK);
         if !fits {
             if self.used == self.chunks.len() {
                 self.chunks.push(Chunk {
@@ -197,6 +200,7 @@ impl Packed {
     /// Drops the packed rows, as an unchanged re-run does.
     pub(crate) fn clear(&mut self) {
         self.keyed = false;
+        self.columns = 0;
         self.key.clear();
         self.tags.clear();
         self.slots.clear();
@@ -216,7 +220,7 @@ impl Packed {
         mut self,
         env: sys::napi_env,
         scratch: Option<(*mut u8, usize)>,
-        extra: [f64; 3],
+        extra: [f64; 2],
     ) -> Result<[sys::napi_value; 4]> {
         if let Some(i) = self.out_of_range {
             return Err(Fail::Range(format!(
@@ -248,9 +252,9 @@ impl Packed {
                 self.tags.len() as f64,
                 self.slots.len() as f64,
                 self.lengths.len() as f64,
+                self.columns as f64,
                 extra[0],
                 extra[1],
-                extra[2],
             ];
             let mut at = 0;
             for value in header {

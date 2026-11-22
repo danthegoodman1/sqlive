@@ -112,7 +112,10 @@ test('a subscription that falls behind the log re-runs and catches up', async (t
   const { db } = await todos(t, { logCapacity: 2 })
   const subscription = db.subscribe('SELECT title FROM todos ORDER BY id')
   assert.deepEqual((await subscription.next()).value.rows, [])
-  // Synchronous writes give the follower no chance to keep up.
+  // The follower receives the first event, which the subscription does not
+  // read; the synchronous writes after it leave the log before the follower
+  // runs again, so only a re-run after the lag can show them.
+  db.writeSync((tx) => tx.run('INSERT INTO tags VALUES (?, 1)', ['other']))
   for (let i = 0; i < 5; i++) db.writeSync((tx) => tx.run('INSERT INTO todos (list_id, title) VALUES (1, ?)', [`t${i}`]))
   const { value } = await subscription.next()
   assert.deepEqual(value.rows.map((row) => row.title), ['t0', 't1', 't2', 't3', 't4'])

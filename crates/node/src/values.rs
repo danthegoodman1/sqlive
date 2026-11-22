@@ -176,8 +176,18 @@ unsafe fn bytes_of(env: sys::napi_env, value: sys::napi_value) -> Result<Option<
                 &mut buffer,
                 &mut offset,
             ))?;
-            len *= element_size(kind);
-            return Ok(Some(copy(data, len)));
+            // `len` counts elements. The array's own `byteLength` covers
+            // every element type, those Node-API has no name for included.
+            let mut bytes = ptr::null_mut();
+            check(sys::napi_get_named_property(
+                env,
+                value,
+                c"byteLength".as_ptr(),
+                &mut bytes,
+            ))?;
+            let mut byte_length = 0f64;
+            check(sys::napi_get_value_double(env, bytes, &mut byte_length))?;
+            return Ok(Some(copy(data, byte_length as usize)));
         }
         check(sys::napi_is_dataview(env, value, &mut is))?;
         if is {
@@ -202,16 +212,6 @@ unsafe fn bytes_of(env: sys::napi_env, value: sys::napi_value) -> Result<Option<
         }
     }
     Ok(None)
-}
-
-fn element_size(kind: sys::napi_typedarray_type) -> usize {
-    use sys::TypedarrayType as T;
-    match kind {
-        T::int8_array | T::uint8_array | T::uint8_clamped_array => 1,
-        T::int16_array | T::uint16_array => 2,
-        T::int32_array | T::uint32_array | T::float32_array => 4,
-        _ => 8,
-    }
 }
 
 unsafe fn copy(data: *const std::ffi::c_void, len: usize) -> Vec<u8> {
@@ -346,37 +346,64 @@ pub(crate) unsafe fn params(
 
 /// The parameter name `key` stands for in `sql`: `key` itself if it starts
 /// with a prefix, otherwise `key` with the first prefix the SQL uses it
-/// with, or `:` if the SQL uses none.
+/// with outside literals, quoted names and comments, or `:` if none.
 fn prefixed(sql: &str, key: String) -> String {
     if key.starts_with([':', '@', '$']) {
         return key;
     }
     let bytes = sql.as_bytes();
-    let first = (*b":@$")
-        .into_iter()
-        .filter_map(|prefix| {
-            let mut from = 0;
-            while let Some(at) = find(&bytes[from..], prefix, key.as_bytes()) {
-                let at = from + at;
-                if bytes
-                    .get(at + 1 + key.len())
-                    .is_none_or(|b| !is_name_byte(*b))
-                {
-                    return Some((at, prefix));
-                }
-                from = at + 1;
+    let name = key.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"' | b'`') => i = skip_quoted(bytes, i + 1, quote),
+            b'[' => i = find_from(bytes, i + 1, b"]").map_or(bytes.len(), |end| end + 1),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i = find_from(bytes, i + 2, b"\n").map_or(bytes.len(), |end| end + 1);
             }
-            None
-        })
-        .min();
-    let prefix = first.map_or(':', |(_, prefix)| char::from(prefix));
-    format!("{prefix}{key}")
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = find_from(bytes, i + 2, b"*/").map_or(bytes.len(), |end| end + 2);
+            }
+            prefix @ (b':' | b'@' | b'$') => {
+                // `$` may sit inside an identifier, as in `a$id`.
+                let starts = prefix != b'$' || i == 0 || !is_name_byte(bytes[i - 1]);
+                let rest = &bytes[i + 1..];
+                if starts
+                    && rest.starts_with(name)
+                    && rest.get(name.len()).is_none_or(|b| !is_name_byte(*b))
+                {
+                    return format!("{}{key}", char::from(prefix));
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    format!(":{key}")
 }
 
-fn find(haystack: &[u8], prefix: u8, name: &[u8]) -> Option<usize> {
-    haystack
-        .windows(name.len() + 1)
-        .position(|window| window[0] == prefix && &window[1..] == name)
+/// The index just past a quoted run that opened before `from`, where a
+/// doubled quote stands for itself.
+fn skip_quoted(bytes: &[u8], mut from: usize, quote: u8) -> usize {
+    while from < bytes.len() {
+        if bytes[from] == quote {
+            if bytes.get(from + 1) == Some(&quote) {
+                from += 2;
+                continue;
+            }
+            return from + 1;
+        }
+        from += 1;
+    }
+    bytes.len()
+}
+
+fn find_from(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|at| from + at)
 }
 
 fn is_name_byte(b: u8) -> bool {
@@ -397,5 +424,20 @@ mod tests {
         assert_eq!(prefixed(sql, "@kept".into()), "@kept");
         // A longer name that starts with the key does not count.
         assert_eq!(prefixed("SELECT :listing, @list", "list".into()), "@list");
+    }
+
+    #[test]
+    fn literals_quoted_names_and_comments_hold_no_parameters() {
+        let key = || "id".to_owned();
+        assert_eq!(prefixed("SELECT 'a:id' AS s, $id AS v", key()), "$id");
+        assert_eq!(prefixed("SELECT 'it''s :id', @id", key()), "@id");
+        assert_eq!(
+            prefixed("SELECT \"x:id\", [y:id], `z:id`, @id", key()),
+            "@id"
+        );
+        assert_eq!(prefixed("SELECT 1 -- :id\n, $id", key()), "$id");
+        assert_eq!(prefixed("SELECT /* :id */ @id", key()), "@id");
+        assert_eq!(prefixed("SELECT a$id, @id FROM t", key()), "@id");
+        assert_eq!(prefixed("SELECT ':id", key()), ":id");
     }
 }

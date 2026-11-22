@@ -17,10 +17,10 @@ use napi::sys;
 use napi_derive::napi;
 use sqlive::rusqlite::{self, Statement, Transaction};
 use sqlive::{LiveDb, Options, ParamValues, Version};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
@@ -70,8 +70,6 @@ struct Slot {
     /// Set when the callback finishes: whether it succeeded.
     gate: Mutex<Option<bool>>,
     finished: Condvar,
-    /// Asynchronous writes and vacuums queued or under way.
-    pending: AtomicUsize,
     /// The writer's statement cache has room for a write's statements.
     sized: AtomicBool,
 }
@@ -90,6 +88,13 @@ impl Slot {
         self.job.store(0, Ordering::Release);
         self.tx.store(ptr::null_mut(), Ordering::Release);
     }
+
+    /// Ends the open callback, if any, so its writer commits or rolls back.
+    fn finish(&self, succeeded: bool) {
+        self.close();
+        *crate::lock(&self.gate) = Some(succeeded);
+        self.finished.notify_one();
+    }
 }
 
 enum Job {
@@ -105,32 +110,12 @@ enum Message {
     Done(u32, sqlive::Result<Version>),
 }
 
-/// A thread-safe function, which Node-API lets any thread call.
+/// A thread-safe function, which Node-API lets any thread call and release.
 struct Tsfn(sys::napi_threadsafe_function);
 
 // SAFETY: Node-API's thread-safe functions may be called and released from
-// any thread.
+// any thread while the environment lives.
 unsafe impl Send for Tsfn {}
-
-impl Tsfn {
-    /// Queues `message` for the JavaScript thread; false once the
-    /// environment is shutting down.
-    fn send(&self, message: Message) -> bool {
-        let data = Box::into_raw(Box::new(message));
-        let status = unsafe {
-            sys::napi_call_threadsafe_function(
-                self.0,
-                data.cast(),
-                sys::ThreadsafeFunctionCallMode::nonblocking,
-            )
-        };
-        if status != sys::Status::napi_ok {
-            drop(unsafe { Box::from_raw(data) });
-            return false;
-        }
-        true
-    }
-}
 
 impl Drop for Tsfn {
     fn drop(&mut self) {
@@ -141,6 +126,72 @@ impl Drop for Tsfn {
             )
         };
     }
+}
+
+/// What the writer thread, the JavaScript thread and the environment's
+/// cleanup hook share. Each thread holds its own count on the dispatcher
+/// and releases it once done with it. Node destroys a thread-safe function
+/// as its environment tears down, so the cleanup hook, which runs first,
+/// releases both counts and takes the dispatcher away from the writer
+/// thread.
+struct Writer {
+    slot: Arc<Slot>,
+    /// The writer thread's count, released when the thread ends.
+    dispatch: Mutex<Option<Tsfn>>,
+    /// The JavaScript thread's count, released when the database is
+    /// collected; while it holds, that thread may refer and unrefer the
+    /// dispatcher.
+    js: Mutex<Option<Tsfn>>,
+    /// The writer thread's queue; dropping it ends the thread once the
+    /// queue drains.
+    jobs: Mutex<Option<mpsc::Sender<Job>>>,
+    /// Set once the cleanup hook has run, which freed its reference.
+    /// Node reports success for removing a hook that already ran.
+    torn_down: AtomicBool,
+}
+
+impl Writer {
+    /// Queues `message` for the JavaScript thread; false once the
+    /// environment is tearing down.
+    fn send(&self, message: Message) -> bool {
+        let dispatch = crate::lock(&self.dispatch);
+        let Some(tsfn) = dispatch.as_ref() else {
+            return false;
+        };
+        let data = Box::into_raw(Box::new(message));
+        let status = unsafe {
+            sys::napi_call_threadsafe_function(
+                tsfn.0,
+                data.cast(),
+                sys::ThreadsafeFunctionCallMode::nonblocking,
+            )
+        };
+        if status != sys::Status::napi_ok {
+            drop(unsafe { Box::from_raw(data) });
+            return false;
+        }
+        true
+    }
+
+    /// Stops every use of the environment: the queue closes, the dispatcher
+    /// is released, and a write whose callback can no longer finish rolls
+    /// back.
+    fn shut(&self) {
+        crate::lock(&self.jobs).take();
+        drop(crate::lock(&self.dispatch).take());
+        drop(crate::lock(&self.js).take());
+        if self.slot.job.load(Ordering::Acquire) != 0 {
+            self.slot.finish(false);
+        }
+    }
+}
+
+/// Runs as the environment tears down, as when Node exits or a worker
+/// terminates, before Node destroys the dispatcher.
+unsafe extern "C" fn teardown(writer: *mut c_void) {
+    let writer = unsafe { Arc::from_raw(writer.cast_const().cast::<Writer>()) };
+    writer.torn_down.store(true, Ordering::Release);
+    writer.shut();
 }
 
 /// Calls `dispatch(kind, job, payload)` on the JavaScript thread: kind 0
@@ -190,18 +241,18 @@ fn callback_failed() -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure("the write callback failed".into())
 }
 
-/// Runs queued jobs until the database closes, then releases the
-/// dispatcher. It owns the dispatcher's only handle: a release from the
-/// JavaScript thread could run inside Node's own teardown of the
-/// dispatcher, which holds the lock a release takes.
-fn run_writer(db: Arc<LiveDb>, slot: Arc<Slot>, jobs: mpsc::Receiver<Job>, tsfn: Tsfn) {
+/// Runs queued jobs until the queue closes, then releases the dispatcher.
+/// The release happens here, on this thread: from the JavaScript thread it
+/// could run inside Node's own teardown of the dispatcher, which holds the
+/// lock a release takes.
+fn run_writer(db: Arc<LiveDb>, writer: Arc<Writer>, jobs: mpsc::Receiver<Job>) {
     for job in jobs {
         let id = match job {
             Job::Write(id) | Job::Vacuum(id) => id,
         };
-        let run = std::panic::AssertUnwindSafe(|| run_job(&db, &slot, &tsfn, job));
+        let run = std::panic::AssertUnwindSafe(|| run_job(&db, &writer, job));
         let message = std::panic::catch_unwind(run).unwrap_or_else(|_| {
-            slot.close();
+            writer.slot.close();
             Message::Done(
                 id,
                 Err(sqlive::Error::Unsupported(
@@ -209,18 +260,19 @@ fn run_writer(db: Arc<LiveDb>, slot: Arc<Slot>, jobs: mpsc::Receiver<Job>, tsfn:
                 )),
             )
         });
-        slot.pending.fetch_sub(1, Ordering::AcqRel);
-        tsfn.send(message);
+        writer.send(message);
     }
+    drop(crate::lock(&writer.dispatch).take());
 }
 
-fn run_job(db: &LiveDb, slot: &Slot, tsfn: &Tsfn, job: Job) -> Message {
+fn run_job(db: &LiveDb, writer: &Writer, job: Job) -> Message {
+    let slot = &writer.slot;
     match job {
         Job::Write(id) => {
             let outcome = db.write(|tx| {
                 *crate::lock(&slot.gate) = None;
                 slot.open(id, tx);
-                if !tsfn.send(Message::Begin(id)) {
+                if !writer.send(Message::Begin(id)) {
                     slot.close();
                     return Err(callback_failed());
                 }
@@ -302,17 +354,49 @@ pub struct NativeDb {
     slot: Arc<Slot>,
     /// The writer thread, started by the first asynchronous write.
     writer: RefCell<Option<WriterHandle>>,
+    /// Asynchronous writes and vacuums queued and not yet settled in
+    /// JavaScript.
+    outstanding: Cell<usize>,
 }
 
 struct WriterHandle {
-    /// Dropping it stops the thread once its queued jobs finish.
-    jobs: mpsc::Sender<Job>,
-    /// The dispatcher the writer thread owns. This thread only refers and
-    /// unrefers it while `jobs` keeps the writer thread, and so the
-    /// dispatcher, alive.
+    env: sys::napi_env,
+    writer: Arc<Writer>,
+    /// The dispatcher, which this thread refers and unrefers while
+    /// `writer.js` holds its count.
     dispatch: sys::napi_threadsafe_function,
-    /// The dispatcher keeps the event loop alive while writes are pending.
+    /// The dispatcher keeps the event loop alive while jobs are outstanding.
     referenced: bool,
+    /// The strong reference the cleanup hook owns while registered.
+    hook: *const Writer,
+}
+
+impl WriterHandle {
+    /// Whether this thread may still refer and unrefer the dispatcher.
+    fn live(&self) -> bool {
+        crate::lock(&self.writer.js).is_some()
+    }
+}
+
+impl Drop for WriterHandle {
+    /// Closes the queue, releases this thread's count on the dispatcher, and
+    /// unregisters the cleanup hook. Teardown may have run the hook
+    /// already, which then released both counts.
+    fn drop(&mut self) {
+        crate::lock(&self.writer.jobs).take();
+        drop(crate::lock(&self.writer.js).take());
+        if self.writer.torn_down.load(Ordering::Acquire) {
+            return;
+        }
+        unsafe {
+            sys::napi_remove_env_cleanup_hook(
+                self.env,
+                Some(teardown),
+                self.hook.cast_mut().cast(),
+            );
+            drop(Arc::from_raw(self.hook));
+        }
+    }
 }
 
 impl NativeDb {
@@ -344,12 +428,14 @@ impl NativeDb {
         let Some(handle) = writer.as_mut() else {
             return Err(closed());
         };
-        self.slot.pending.fetch_add(1, Ordering::AcqRel);
-        if handle.jobs.send(job).is_err() {
-            self.slot.pending.fetch_sub(1, Ordering::AcqRel);
+        let sent = crate::lock(&handle.writer.jobs)
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(job).is_ok());
+        if !sent {
             return Err(closed());
         }
-        if !handle.referenced {
+        self.outstanding.set(self.outstanding.get() + 1);
+        if !handle.referenced && handle.live() {
             check(unsafe { sys::napi_ref_threadsafe_function(env.raw(), handle.dispatch) })?;
             handle.referenced = true;
         }
@@ -384,22 +470,45 @@ fn start_writer(
         ))?;
         check(sys::napi_unref_threadsafe_function(raw, tsfn))?;
     }
-    let owned = Tsfn(tsfn);
+    // The creation's count is this thread's; the writer thread takes a
+    // second.
+    let js = Tsfn(tsfn);
+    check(unsafe { sys::napi_acquire_threadsafe_function(tsfn) })?;
     let (jobs, receive) = mpsc::channel();
+    let writer = Arc::new(Writer {
+        slot,
+        dispatch: Mutex::new(Some(Tsfn(tsfn))),
+        js: Mutex::new(Some(js)),
+        jobs: Mutex::new(Some(jobs)),
+        torn_down: AtomicBool::new(false),
+    });
+    // Registered after the dispatcher, so it runs before Node destroys it:
+    // cleanup hooks run newest first.
+    let hook = Arc::into_raw(writer.clone());
+    if let Err(fail) = check(unsafe {
+        sys::napi_add_env_cleanup_hook(raw, Some(teardown), hook.cast_mut().cast())
+    }) {
+        drop(unsafe { Arc::from_raw(hook) });
+        writer.shut();
+        return Err(fail);
+    }
+    let handle = WriterHandle {
+        env: raw,
+        writer: writer.clone(),
+        dispatch: tsfn,
+        referenced: false,
+        hook,
+    };
     std::thread::Builder::new()
         .name("sqlive-writer".to_owned())
-        .spawn(move || run_writer(db, slot, receive, owned))
+        .spawn(move || run_writer(db, writer, receive))
         .map_err(|error| {
             Fail::State(
                 c"ERR_SQLIVE_WRITER",
                 format!("the writer thread did not start: {error}"),
             )
         })?;
-    Ok(WriterHandle {
-        jobs,
-        dispatch: tsfn,
-        referenced: false,
-    })
+    Ok(handle)
 }
 
 #[napi]
@@ -430,7 +539,11 @@ impl NativeDb {
     #[napi]
     pub fn close(&self) {
         self.db.borrow_mut().take();
-        self.writer.borrow_mut().take();
+        // The writer thread finishes the queued jobs; the handle stays to
+        // let the event loop go once they settle.
+        if let Some(handle) = self.writer.borrow().as_ref() {
+            crate::lock(&handle.writer.jobs).take();
+        }
     }
 
     #[napi]
@@ -560,21 +673,22 @@ impl NativeDb {
     /// rolls back otherwise.
     #[napi]
     pub fn finish_write(&self, job: u32, succeeded: bool) {
-        if self.slot.job.load(Ordering::Acquire) != job {
-            return;
+        if self.slot.job.load(Ordering::Acquire) == job {
+            self.slot.finish(succeeded);
         }
-        self.slot.close();
-        *crate::lock(&self.slot.gate) = Some(succeeded);
-        self.slot.finished.notify_one();
     }
 
-    /// Lets the event loop exit once no asynchronous write is pending.
+    /// Records that JavaScript settled a job, and lets the event loop exit
+    /// once none is outstanding.
     #[napi]
     pub fn settled(&self, env: &Env) -> napi::Result<()> {
+        self.outstanding
+            .set(self.outstanding.get().saturating_sub(1));
         let mut writer = self.writer.borrow_mut();
         if let Some(handle) = writer.as_mut()
             && handle.referenced
-            && self.slot.pending.load(Ordering::Acquire) == 0
+            && self.outstanding.get() == 0
+            && handle.live()
         {
             check(unsafe { sys::napi_unref_threadsafe_function(env.raw(), handle.dispatch) })
                 .map_err(|fail| raise(env.raw(), fail))?;
@@ -588,9 +702,7 @@ impl NativeDb {
     #[napi]
     pub fn write_sync(&self, env: &Env, job: u32, callback: Unknown<'_>) -> napi::Result<f64> {
         let raw = env.raw();
-        if self.slot.pending.load(Ordering::Acquire) != 0
-            || self.slot.job.load(Ordering::Acquire) != 0
-        {
+        if self.outstanding.get() != 0 || self.slot.job.load(Ordering::Acquire) != 0 {
             return Err(raise(
                 raw,
                 Fail::State(
@@ -683,7 +795,7 @@ impl NativeDb {
                 left -= 1;
             }
             drop(rows);
-            let parts = packed.finish(raw, crate::rows::scratch(raw, scratch.raw())?, [0.0; 3])?;
+            let parts = packed.finish(raw, crate::rows::scratch(raw, scratch.raw())?, [0.0; 2])?;
             let mut array = ptr::null_mut();
             check(sys::napi_create_array_with_length(
                 raw,
@@ -721,7 +833,7 @@ impl NativeDb {
         });
         let busy_timeout = match options.busy_timeout {
             None => defaults.busy_timeout,
-            Some(ms) if ms.is_finite() && ms >= 0.0 => Duration::from_secs_f64(ms / 1000.0),
+            Some(ms) if let Ok(timeout) = Duration::try_from_secs_f64(ms / 1000.0) => timeout,
             Some(ms) => {
                 return Err(Fail::Range(format!(
                     "busyTimeout must be a non-negative number of milliseconds, not {ms}"
@@ -755,10 +867,10 @@ impl NativeDb {
                 job: AtomicU32::new(0),
                 gate: Mutex::new(None),
                 finished: Condvar::new(),
-                pending: AtomicUsize::new(0),
                 sized: AtomicBool::new(false),
             }),
             writer: RefCell::new(None),
+            outstanding: Cell::new(0),
         })
     }
 }

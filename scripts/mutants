@@ -595,8 +595,7 @@ MUTANTS = [
     ),
     (
         "node: a bare parameter key always takes the colon prefix",
-        [(NODE_VALUES, "let prefix = first.map_or(':', |(_, prefix)| char::from(prefix));",
-          "let prefix = first.map_or(':', |_| ':');")],
+        [(NODE_VALUES, 'return format!("{}{key}", char::from(prefix));', 'return format!(":{key}");')],
     ),
     (
         "node: non-ASCII text counts its bytes as UTF-16 units",
@@ -609,7 +608,7 @@ MUTANTS = [
     ),
     (
         "node: text never moves to its next chunk",
-        [(NODE_JS, "if (at + units > chunk.length) {", "if (false) {")],
+        [(NODE_JS, "while (at + units > chunk.length) {", "while (false) {")],
     ),
     (
         "node: event rows swap their old and new values",
@@ -643,6 +642,32 @@ MUTANTS = [
         "node: a lagged follower stops without re-running",
         [(NODE_JS, "this.#follow(this.#db.changesSince(this.#db.version))\n    for (const id of [...this.#subscriptions.keys()]) this.#rerun(id)",
           "this.#follow(this.#db.changesSince(this.#db.version))")],
+    ),
+    (
+        "node: teardown leaves an open write waiting",
+        [(NODE_DB, "if self.slot.job.load(Ordering::Acquire) != 0 {\n            self.slot.finish(false);\n        }", "")],
+    ),
+    (
+        "node: the cleanup hook's reference is freed twice",
+        [(NODE_DB, "if self.writer.torn_down.load(Ordering::Acquire) {\n            return;\n        }", "")],
+    ),
+    (
+        "node: the event loop is let go before every job settles",
+        [(NODE_DB, "&& self.outstanding.get() == 0\n            && handle.live()", "&& handle.live()")],
+    ),
+    (
+        "node: rows take their width from their column names",
+        [(NODE_JS, "shapeOf(parts[2], views.f64[3])",
+          "shapeOf(parts[2], parts[2] === '' ? 0 : parts[2].split('\\0').length)")],
+    ),
+    (
+        "node: a typed array binds one byte per element",
+        [(NODE_VALUES, "return Ok(Some(copy(data, byte_length as usize)));", "return Ok(Some(copy(data, len)));")],
+    ),
+    (
+        "node: a vacuum may run inside a write",
+        [(NODE_JS, "vacuum() {\n    const outer = writing.getStore()\n    if (outer !== undefined && outer.open && outer.db === this.#native) return Promise.reject(nestedWrite())",
+          "vacuum() {")],
     ),
     (
         "node: subscription re-runs ignore the previous hash",

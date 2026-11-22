@@ -55,11 +55,21 @@ test('values round-trip with their storage classes', async (t) => {
   assert.ok(Buffer.isBuffer(rows[13].x))
 })
 
+test('a typed array binds exactly its own bytes', async (t) => {
+  const { db } = await withTable(t)
+  const arrays = [new Float64Array([1.5]), new BigInt64Array([1n, 2n]), new Int16Array([1, 2, 3])]
+  if (typeof Float16Array === 'function') arrays.push(new Float16Array(4))
+  await db.write((tx) => arrays.forEach((array, i) => tx.run('INSERT INTO v VALUES (?, ?)', [i, array])))
+  const { rows } = db.query('SELECT length(x) AS n FROM v ORDER BY id')
+  assert.deepEqual(rows.map((row) => row.n), arrays.map((array) => array.byteLength))
+})
+
 test('text across many chunks comes back whole', async (t) => {
   const { db } = await withTable(t)
   // Long and non-ASCII values, past the 4,096 UTF-16 units one chunk holds.
   const texts = Array.from({ length: 300 }, (_, i) => `${i}:${'é🌍x'.repeat(i % 7)}${'y'.repeat(i % 50)}`)
-  texts.push('z'.repeat(9000), '', 'end')
+  // An empty value between two that each fill a chunk alone.
+  texts.push('z'.repeat(9000), '', 'w'.repeat(5000), '', '', 'end')
   await db.write((tx) => texts.forEach((text, i) => tx.run('INSERT INTO v VALUES (?, ?)', [i, text])))
   const { rows } = db.query('SELECT x, length(x) AS n FROM v ORDER BY id')
   assert.deepEqual(rows.map((row) => row.x), texts)
@@ -101,6 +111,17 @@ test('parameters bind by position, number and name', async (t) => {
   assert.throws(() => db.query('SELECT ?', [{}]), { name: 'TypeError', code: 'ERR_INVALID_ARG_TYPE' })
   assert.throws(() => db.query('SELECT ?', 5), { name: 'TypeError' })
   assert.throws(() => db.query(5), { name: 'TypeError' })
+})
+
+test('a lone column with an empty name', (t) => {
+  const { db } = tempDb(t)
+  assert.deepEqual(db.query('SELECT 1 AS ""').rows, [{ '': 1 }])
+  assert.deepEqual(db.query('SELECT 1 AS "", 2 AS ""').rows, [{ '': 2 }])
+})
+
+test('a bare key ignores prefixes inside literals and comments', (t) => {
+  const { db } = tempDb(t)
+  assert.deepEqual(db.query("SELECT 'a:id' AS s, $id AS v /* @id */", { id: 5 }).rows, [{ s: 'a:id', v: 5 }])
 })
 
 test('rows key by column name, keeping the last of duplicate names', async (t) => {
@@ -214,6 +235,7 @@ test('a write inside a write refuses instead of deadlocking', async (t) => {
   const { db } = await withTable(t)
   await db.write(async () => {
     await assert.rejects(db.write(() => {}), { code: 'ERR_SQLIVE_WRITE_PENDING' })
+    await assert.rejects(db.vacuum(), { code: 'ERR_SQLIVE_WRITE_PENDING' })
     assert.throws(() => db.writeSync(() => {}), { code: 'ERR_SQLIVE_WRITE_PENDING' })
   })
   const pending = db.write(() => {})
@@ -315,19 +337,55 @@ test('options are checked', (t) => {
   const { dir } = tempDb(t)
   assert.throws(() => new LiveDb(join(dir, 'a.db'), { logCapacity: -1 }), { name: 'RangeError' })
   assert.throws(() => new LiveDb(join(dir, 'b.db'), { busyTimeout: Number.NaN }), { name: 'RangeError' })
+  assert.throws(() => new LiveDb(join(dir, 'b.db'), { busyTimeout: 1e300 }), { name: 'RangeError' })
   const open = new LiveDb(join(dir, 'c.db'), { tableChanges: Infinity, logBytes: 1 << 20, readers: 2 })
   open.close()
 })
 
-test('the process exits once no write is pending', (t) => {
+test('the process exits once no write is pending, and not before', (t) => {
   const { dir } = tempDb(t)
   const script = `
     const { LiveDb } = require(${JSON.stringify(require.resolve('../index.js'))})
     const db = new LiveDb(${JSON.stringify(join(dir, 'exit.db'))})
-    db.write((tx) => tx.exec('CREATE TABLE t (x)')).then(({ version }) => console.log('committed', version))
+    // Twenty megabytes, so the vacuum still runs after the write settles.
+    db.write((tx) => tx.exec(\`
+      CREATE TABLE t (x);
+      WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000)
+      INSERT INTO t SELECT randomblob(1000) FROM n;
+    \`)).then(({ version }) => console.log('committed', version))
+    db.vacuum().then((version) => console.log('vacuumed', version))
   `
   const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 20_000 })
   assert.equal(child.signal, null, 'the process exited on its own')
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout.trim(), 'committed 1')
+  assert.deepEqual(child.stdout.trim().split('\n'), ['committed 1', 'vacuumed 2'])
+})
+
+test('a worker that ends inside a write rolls it back and lets the lock go', async (t) => {
+  const { dir } = tempDb(t)
+  const path = join(dir, 'worker.db')
+  const setup = new LiveDb(path)
+  setup.writeSync((tx) => tx.exec('CREATE TABLE t (x)'))
+  setup.close()
+  const { Worker } = await import('node:worker_threads')
+  const worker = new Worker(
+    `
+    const { parentPort } = require('node:worker_threads')
+    const { LiveDb } = require(${JSON.stringify(require.resolve('../index.js'))})
+    const db = new LiveDb(${JSON.stringify(path)})
+    db.write(async (tx) => {
+      tx.run('INSERT INTO t VALUES (1)')
+      parentPort.postMessage('open')
+      await new Promise(() => {})
+    })
+    `,
+    { eval: true },
+  )
+  await new Promise((resolve) => worker.once('message', resolve))
+  await worker.terminate()
+  const db = new LiveDb(path)
+  t.after(() => db.close())
+  const { version } = await db.write((tx) => tx.run('INSERT INTO t VALUES (2)'))
+  assert.equal(version, 2)
+  assert.deepEqual(db.query('SELECT x FROM t').rows, [{ x: 2 }])
 })
