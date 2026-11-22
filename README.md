@@ -18,7 +18,8 @@ unpublished; expect the API to change.
 sqlive = { git = "https://github.com/danthegoodman1/sqlive" }
 ```
 
-The crate bundles SQLite built with `SQLITE_ENABLE_PREUPDATE_HOOK`.
+The crate bundles SQLite built with `SQLITE_ENABLE_PREUPDATE_HOOK`. For Node.js,
+`npm install sqlive` ([Node.js](#nodejs)).
 
 ## Open a database
 
@@ -261,6 +262,46 @@ SQLite's comparison rules (storage class, collation, `NULL` handling) for you. A
 update counts when it changes a column the table's `columns()` list, or any column
 when `every_column()` is set. A table in an event's `whole_tables` affects each read
 set whose `reads_rows_of(table)` is true.
+
+## Node.js
+
+The `sqlive` npm package binds this library through napi-rs, with prebuilt addons for
+Linux x64 and arm64 (glibc 2.34 or later, or musl), macOS arm64 and Windows x64, on
+Node.js 22 or later. It keeps the guarantees below, and its
+[README](crates/node/README.md) documents the API.
+
+```js
+import { LiveDb } from 'sqlive'
+
+const db = new LiveDb('app.db')
+await db.write((tx) => tx.exec('CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, list_id INTEGER, title TEXT)'))
+
+for await (const { rows } of db.subscribe('SELECT id, title FROM todos WHERE list_id = ? ORDER BY id DESC LIMIT 50', [5])) {
+  render(rows) // the current rows, then each result whose rows changed
+}
+
+// Elsewhere:
+await db.write((tx) => tx.run('INSERT INTO todos (list_id, title) VALUES (?, ?)', [5, 'Buy milk']))
+```
+
+- **Reads run on the calling thread.** `db.query(sql, params)` returns `{ rows, version,
+  readSet, hash }`, and `db.rerun(sql, params, hash)` reports `unchanged`, as in Rust.
+  A query reads pages already in memory, so handing it to a thread would cost more
+  than running it. `queryAsync` runs one on libuv's thread pool, for queries long
+  enough to stall the event loop.
+- **Writes commit on a writer thread.** `await db.write((tx) => …)` runs the callback
+  on the calling thread, where each `tx.run` costs microseconds, then commits on the
+  database's writer thread, so the event loop runs while the drive syncs. The
+  callback may be `async`; its transaction stays open across awaits.
+  `db.writeSync` commits on the calling thread.
+- **Live queries.** `db.subscribe` keeps one `ReadSetIndex` and one change stream per
+  database, re-runs the subscriptions each commit affects, and yields only results
+  whose rows changed. `db.changesSince(version)` is an async iterator of commit
+  events, and `ReadSetIndex` is there for apps that run the loop themselves.
+- **Values.** Integers are numbers, and an integer past 53 bits throws a `RangeError`
+  unless the database opens with `safeIntegers: true`, which reads every integer as a
+  `bigint`. Blobs are `Buffer`s. Errors carry SQLite's code names, such as
+  `SQLITE_CONSTRAINT_UNIQUE`, or `ERR_SQLIVE_*` codes such as `ERR_SQLIVE_LAGGED`.
 
 ## Guarantees
 
@@ -520,6 +561,63 @@ room. The server and the load generator share the machine.
   most twice a second. Sending them on every change took 8.5 cores at 100 posts per
   second with 10,000 viewers, about a million stats events a second.
 
+### Node.js against Rust
+
+`npm run bench` in `crates/node` runs `sqlive-bench`'s workloads through the Node
+binding, on Node.js 24.18.0. Both ran back to back on the machine above.
+
+| Chat query, 1 thread | Rust µs | Node µs | `node:sqlite` µs |
+| --- | ---: | ---: | ---: |
+| `query` | 6.1 | 7.9 | 6.0 |
+| `rerun`, unchanged | 6.1 | 7.7 | |
+
+A query costs 1.8 µs more from Node: about 1.4 µs for the call itself (crossing into
+the addon, converting the parameters, and handing back the result and its read set)
+and 15 ns for each value. The rows cross packed: numbers in a reused buffer, text in a
+few shared strings that JavaScript slices, and one constructor per column list builds
+the objects. Against `node:sqlite`, which returns rows alone, the 1.9 µs buys the read
+set and the hash.
+
+| Throughput | Rust | Node | `node:sqlite` |
+| --- | ---: | ---: | ---: |
+| Full scan of 120,000 rows, rows/s | 4,972,937 | 3,639,995 | 3,094,914 |
+| Chat queries on 8 threads, queries/s | 674,662 | 200,820 | |
+| `affected` over 100,000 read sets, events/s | 124,673 | 107,560 | |
+
+Node's eight threads are `queryAsync` calls on a pool of eight, 64 in flight. Each
+call costs the JavaScript thread about 5 µs to schedule and convert, so the thread
+pool suits queries that run longer than that. Building the 100,000 read sets took
+0.83 s, against 0.56 s in Rust.
+
+| Writes on the drive, rows/s | Rust | Node `write` | Node `writeSync` |
+| --- | ---: | ---: | ---: |
+| Insert 1 row per commit | 239 | 242 | 243 |
+| Insert 1,000 rows per commit | 151,443 | 121,470 | 122,623 |
+| Update 1,000 rows per commit | 193,140 | 202,161 | 209,055 |
+| Delete 1,000 rows per commit | 170,298 | 161,722 | 161,283 |
+
+| Writes on tmpfs, rows/s | Rust | Node `write` | Node `writeSync` |
+| --- | ---: | ---: | ---: |
+| Insert 1 row per commit | 58,820 | 31,596 | 66,739 |
+| Insert 1,000 rows per commit | 1,026,990 | 465,027 | 559,058 |
+| Update 1,000 rows per commit | 1,628,531 | 1,522,088 | 1,769,155 |
+| Delete 1,000 rows per commit | 1,648,565 | 1,421,712 | 1,628,857 |
+
+On the drive, fsync sets the pace in both. On tmpfs, `write` adds about 16 µs to a
+commit, for the hops to the writer thread and back, and each `tx.run` costs about
+0.8 µs more than a Rust statement, for the call and its SQL text and parameters.
+
+While 1,000 single-row commits ran back to back on the drive, a 1 ms timer measured
+how long the event loop stalled:
+
+| Commits by | Timer ticks | Gap p50 | p99 | Max |
+| --- | ---: | ---: | ---: | ---: |
+| `write` | 3,952 | 1.06 ms | 1.94 ms | 2.01 ms |
+| `writeSync` | 999 | 4.03 ms | 7.90 ms | 9.99 ms |
+
+`write` leaves the loop free while the drive syncs; `writeSync` holds it for each
+fsync.
+
 ## Example: live chat
 
 ```console
@@ -563,8 +661,19 @@ cargo test --workspace
 cargo run --release -p sqlive-sim [-- SEED] [--seeds N]
 scripts/mutants
 cargo run --release -p sqlive-bench [writes|queries|index|memory]
+
+cd crates/node
+npm ci && npm run build
+npm test
+npm run bench [-- writes|queries|index]
 ```
 
 The simulator runs SQLite on a deterministic in-memory VFS with injected faults and
 crashes, and checks live results against fresh queries. See `PLAN.md` for the testing
-strategy.
+strategy. The Node tests check subscriptions, events and the index against SQLite
+itself, through `node:sqlite`.
+
+To release the npm package, bump its version in a pull request
+(`node scripts/release.mjs version X.Y.Z` in `crates/node`). Once CI passes on `main`,
+the release workflow publishes the addons that CI run built and tested, skipping any
+package version npm already has, and creates the GitHub release `node-vX.Y.Z`.

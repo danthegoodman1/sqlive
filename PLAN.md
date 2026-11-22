@@ -15,7 +15,7 @@ Non-goals until a phase names them: writers in other processes, ATTACHed databas
 - The library starts no threads, reads no clocks and iterates only ordered collections. Events list changes in first-touch order. `clippy.toml` in `crates/live` and `crates/sim` enforces this, so a seed replays exactly.
 - Every feature ships with simulator coverage, a property that fails on a wrong answer, and a planted bug the simulator catches.
 - Build the smallest implementation that meets the phase gate.
-- Execution order: Phase 0 through Phase 14.
+- Execution order: Phase 0 through Phase 15.
 
 ## Testing Strategy
 
@@ -606,3 +606,39 @@ Status ledger:
 | Complete | Gate | The log stays within its budget | `sqlive-bench memory`, one 200,000-row insert then three updates of every row. Default options: 3.0 MB at the peak, and four events that name `chats`, under 1 KB, left in the log. With `table_changes: usize::MAX`: 216 MB at the peak and 97 MB left, the newest event. With `log_bytes: usize::MAX` as well: 374 MB and 353 MB. `sqlive-bench writes` on tmpfs stays within 2% of the README's figures: 58,343 one-row commits a second, and 983,285, 1,626,471 and 1,597,993 rows a second in commits of 1,000. |
 | Complete | Gate | 10,000-seed sweep | `scripts/check 10000`: fmt, clippy and every test pass, 0 of 10,000 seeds failed. |
 | Complete | Gate | Code review | `/code-review high`, 10 findings, none a wrong answer in the cap, `whole_tables`, the index or the log budget. Fixed: the README told a replica to resume from the version at which it read a named table again, which loses other tables' changes, and now tells it to keep following and skip that table's earlier rows, as the simulator's replicas do; the simulator checks the cap on every event and that a current replica never lags; capture keeps one count for each table in place of two maps, and releases rows in passes that cost in proportion to what it holds; the benchmark's peak no longer counts a reallocated block twice; the docs of `CommitEvent::changes`, `capture.rs` and the crate say that an event can name a table in place of its rows. Answered under "Out of scope": the cap bounds rows, not bytes. Answered in Phase 12: seed 117131, outside the gate's range, held `'a'` for a group whose fresh value was `'A'`; SQL leaves a group's value open, so the harness now compares grouped results without it, the README's **Conservative** guarantee names the case, and the seed is a regression test. |
+
+## Phase 15: Node.js Binding
+
+Goal:
+Node.js apps use SqLive through an npm package, `sqlive`, built on napi-rs. Reads cost close to what they cost in Rust; writes never block the event loop on fsync; live queries take one call. CI builds and tests the addon on every platform it ships for, and a version bump on `main` publishes it.
+
+Scope:
+- 15A Crate `crates/node` (`sqlive-node`, a cdylib) and the package's JavaScript layer (`index.js`, `index.d.ts`). The binding starts one writer thread per database, which `crates/live` may not.
+- 15B Reads. `query`, `rerun` and `snapshot.query` run on the calling thread; `queryAsync` and `rerunAsync` run on libuv's thread pool. Rows cross packed: numbers in an 8-byte slot of a reused buffer, text in strings of at most 4,096 UTF-16 units that JavaScript slices, blobs as `Buffer`s; a constructor compiled once per column list builds the row objects. A read set crosses as a type-tagged external.
+- 15C Writes. `write(fn)` runs `fn` on the JavaScript thread, holding the transaction across its awaits, while the writer thread waits; then the writer thread commits. `writeSync` commits on the calling thread and refuses while an asynchronous write is pending. `vacuum` runs on the writer thread. A write inside a write refuses instead of deadlocking, and a `tx` works only during its own callback.
+- 15D Change streams as async iterators, woken by the binding's own commits; events stay in Rust until JavaScript reads `changes`. `ReadSetIndex` with number and string keys.
+- 15E `subscribe(sql, params)`: one index and one follower per database; re-runs store their read sets straight into the index; a lagged follower re-runs every subscription.
+- 15F Values: integers within 53 bits as numbers and the rest a `RangeError`, or every integer a `bigint` with `safeIntegers`; `-0` binds as a real; errors carry SQLite's code names or `ERR_SQLIVE_*` codes with their fields.
+- 15G Packaging and release: six platform packages (`sqlive-<target>`), CI jobs that build and test each and upload its addon, and `.github/workflows/release.yml`, which publishes the addons a green push to `main` built whenever the package version is new to npm.
+- 15H Benchmarks: `npm run bench` runs `sqlive-bench`'s workloads; the README compares the two.
+
+Out of scope:
+- Linux on 32-bit or other architectures, macOS on Intel, and Windows on arm64.
+- Group commit: queued writes each commit alone.
+- Sharing a database between worker threads; each worker opens its own `LiveDb`.
+- Simulator coverage. The binding adds no change capture or read-set logic: its properties check its conversions and its loops against SQLite itself, through `node:sqlite`.
+
+Completion gate:
+`npm test` passes on Node 22 and 24 and on every CI target; the properties hold over 20 seeds; `scripts/mutants --layers node` catches every Phase 15 planted bug; the README carries the Node benchmarks beside Rust's.
+
+Testing plan:
+- `test/basics.test.mjs`: value round trips with their storage classes, parameter forms, write outcomes and their refusals, snapshots, closing, and a process that exits once idle.
+- `test/changes.test.mjs`: event shape, streams, lag, the change cap, read sets, the index, and a follower that falls behind the log.
+- `test/live.test.mjs`: seeded random writes in all three write modes, some rolled back; each subscription's rows equal a fresh `node:sqlite` query, a replica built from events equals a table dump, `affected` equals testing every read set, and each delivery's hash differs from the one before.
+- Planted bugs: `-0` bound as an integer; bare keys given the colon prefix; non-ASCII text measured in bytes; large integers rounded; text that never moves to its next chunk; event rows swapped; a failed callback committed by the writer, or reported as a success; a kept transaction reaching a later write; a write that wakes no stream; a subscription skipping a key; a lagged follower that stops; re-runs that ignore the previous hash.
+- `scripts/release.test.mjs`: version changes, drift, staging and idempotent publishing.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |

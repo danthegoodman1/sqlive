@@ -1,0 +1,19 @@
+[package]
+name = "sqlive-node"
+version = "0.1.0"
+description = "Node.js bindings for SqLive"
+edition.workspace = true
+rust-version = "1.88"
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi9", "dyn-symbols"] }
+napi-derive = "3"
+sqlive.workspace = true
+
+[build-dependencies]
+napi-build = "2"

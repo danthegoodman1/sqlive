@@ -8,6 +8,7 @@
 - Changes come from the preupdate hook on the writer connection. The VFS in `crates/sim` serves only the simulator.
 - All writes run through `LiveDb::write` on one writer connection. Queries run on read-only connections.
 - `crates/live` starts no threads, reads no clocks, and iterates only ordered collections; `clippy.toml` in `crates/live` and `crates/sim` enforces this.
+- `crates/node` is the Node.js binding, published to npm as `sqlive`. Its reads run on the calling thread; its writes commit on one writer thread per database. A change to its API updates `crates/node/README.md` and `index.d.ts`.
 
 ## Testing
 
@@ -22,6 +23,12 @@
 scripts/check [SEEDS]                                   # fmt, clippy, tests, sweep
 cargo test --workspace
 cargo run --release -p sqlive-sim [-- SEED] [--seeds N]  # SIM_TRACE=1 prints a run
-scripts/mutants [--only NAME]
+scripts/mutants [--only NAME] [--layers unit,sim,chat,seeds,node]
 cargo run -p chat-example                               # http://127.0.0.1:3000
+
+cd crates/node
+npm ci && npm run build                                 # sqlive.<target>.node
+npm test                                                # SQLIVE_SEED=N SQLIVE_SEEDS=1 replays a property run
+npm run bench [-- writes|queries|index]
+node scripts/release.mjs version X.Y.Z                  # a merged version bump publishes to npm
 ```

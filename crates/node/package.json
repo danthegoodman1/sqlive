@@ -1,0 +1,65 @@
+{
+  "name": "sqlive",
+  "version": "0.1.0",
+  "description": "Live queries for SQLite: each query returns its rows and a read set, and each commit an event that says which queries to re-run",
+  "keywords": [
+    "sqlite",
+    "live-query",
+    "reactive",
+    "changefeed",
+    "subscriptions"
+  ],
+  "author": "Dan Goodman",
+  "homepage": "https://github.com/danthegoodman1/sqlive#nodejs",
+  "bugs": {
+    "url": "https://github.com/danthegoodman1/sqlive/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danthegoodman1/sqlive.git",
+    "directory": "crates/node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "README.md",
+    "binding.js",
+    "index.js",
+    "index.mjs",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "napi": {
+    "binaryName": "sqlive",
+    "targets": [
+      "aarch64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-unknown-linux-musl",
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl"
+    ]
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:debug": "node scripts/build.mjs --debug",
+    "test": "node --test --test-timeout=120000 test/*.test.mjs",
+    "test:release": "node --test scripts/*.test.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "bench": "UV_THREADPOOL_SIZE=8 node bench/bench.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
+  }
+}

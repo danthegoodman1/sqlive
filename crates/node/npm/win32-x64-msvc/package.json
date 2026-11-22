@@ -1,0 +1,28 @@
+{
+  "name": "sqlive-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "The win32-x64-msvc native addon of sqlive",
+  "author": "Dan Goodman",
+  "homepage": "https://github.com/danthegoodman1/sqlive#nodejs",
+  "bugs": {
+    "url": "https://github.com/danthegoodman1/sqlive/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danthegoodman1/sqlive.git",
+    "directory": "crates/node"
+  },
+  "main": "sqlive.win32-x64-msvc.node",
+  "files": [
+    "sqlive.win32-x64-msvc.node"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
+}

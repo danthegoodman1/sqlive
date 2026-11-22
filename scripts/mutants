@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Plants known bugs, one at a time, in a scratch copy of the workspace and
 reports which layer catches each: the library's unit tests, the simulator's
-tests (scenarios and regression seeds), the chat example's tests, or a seed
-sweep.
+tests (scenarios and regression seeds), the chat example's tests, a seed
+sweep, or the Node binding's tests.
 
     scripts/mutants [--seeds N] [--only NAME]... [--check] [--no-baseline]
 
@@ -40,6 +40,12 @@ COMPARE = "crates/live/src/compare.rs"
 INDEX = "crates/live/src/index.rs"
 HASH = "crates/live/src/hash.rs"
 CHAT = "examples/chat/src/lib.rs"
+NODE_VALUES = "crates/node/src/values.rs"
+NODE_ROWS = "crates/node/src/rows.rs"
+NODE_DB = "crates/node/src/db.rs"
+NODE_EVENTS = "crates/node/src/events.rs"
+NODE_QUERY = "crates/node/src/query.rs"
+NODE_JS = "crates/node/index.js"
 
 STEP_TIMEOUT = 900
 
@@ -582,6 +588,67 @@ MUTANTS = [
         "a whole table reaches only the index keys that read every row",
         [(INDEX, "self.whole.iter().chain(columns)", "self.whole.iter().chain(columns.take(0))")],
     ),
+    # Phase 15
+    (
+        "node: -0 binds as the integer 0",
+        [(NODE_VALUES, "&& !(n == 0.0 && n.is_sign_negative())", "")],
+    ),
+    (
+        "node: a bare parameter key always takes the colon prefix",
+        [(NODE_VALUES, "let prefix = first.map_or(':', |(_, prefix)| char::from(prefix));",
+          "let prefix = first.map_or(':', |_| ':');")],
+    ),
+    (
+        "node: non-ASCII text counts its bytes as UTF-16 units",
+        [(NODE_ROWS, "(lossy.as_ref(), lossy.encode_utf16().count(), false)",
+          "(lossy.as_ref(), lossy.len(), false)")],
+    ),
+    (
+        "node: integers past 53 bits round silently",
+        [(NODE_ROWS, "self.out_of_range.get_or_insert(i);", "")],
+    ),
+    (
+        "node: text never moves to its next chunk",
+        [(NODE_JS, "if (at + units > chunk.length) {", "if (false) {")],
+    ),
+    (
+        "node: event rows swap their old and new values",
+        [(NODE_EVENTS, 'c"old", keys.row(env, change.old.as_ref(), integers)?',
+          'c"old", keys.row(env, change.new.as_ref(), integers)?')],
+    ),
+    (
+        "node: the writer commits a callback that failed",
+        [(NODE_DB, "if succeeded { Ok(()) } else { Err(callback_failed()) }", "Ok(())")],
+    ),
+    (
+        "node: a kept transaction reaches into a later write",
+        [(NODE_DB, "if job == 0 || self.slot.job.load(Ordering::Acquire) != job || tx.is_null() {",
+          "if job == 0 || tx.is_null() {")],
+    ),
+    (
+        "node: a failed callback reports success to the writer",
+        [(NODE_JS, "this.db.finishWrite(id, succeeded)", "this.db.finishWrite(id, true)")],
+    ),
+    (
+        "node: an asynchronous write wakes no stream",
+        [(NODE_JS, "this.hub.seen = Math.max(this.hub.seen, payload)\n    this.hub.notify()\n    if (this.failed)",
+          "this.hub.seen = Math.max(this.hub.seen, payload)\n    if (this.failed)")],
+    ),
+    (
+        "node: subscriptions skip the first key an event affects",
+        [(NODE_JS, "for (const id of this.#index.affected(step.value)) this.#rerun(id)",
+          "for (const id of this.#index.affected(step.value).slice(1)) this.#rerun(id)")],
+    ),
+    (
+        "node: a lagged follower stops without re-running",
+        [(NODE_JS, "this.#follow(this.#db.changesSince(this.#db.version))\n    for (const id of [...this.#subscriptions.keys()]) this.#rerun(id)",
+          "this.#follow(this.#db.changesSince(this.#db.version))")],
+    ),
+    (
+        "node: subscription re-runs ignore the previous hash",
+        [(NODE_QUERY, "let previous = previous_hash(previous)?;\n    let mut rows = Packed::new(integers);",
+          "let previous = previous_hash(previous)?.filter(|_| false);\n    let mut rows = Packed::new(integers);")],
+    ),
 ]
 
 
@@ -594,11 +661,11 @@ def main():
     parser.add_argument("--check", action="store_true", help="only check that every mutant applies")
     parser.add_argument("--no-baseline", action="store_true",
                         help="skip checking that the unmutated code passes every layer")
-    parser.add_argument("--layers", default="unit,sim,chat,seeds",
-                        help="comma-separated layers to run: unit, sim, chat, seeds")
+    parser.add_argument("--layers", default="unit,sim,chat,seeds,node",
+                        help="comma-separated layers to run: unit, sim, chat, seeds, node")
     args = parser.parse_args()
 
-    unknown_layers = set(args.layers.split(",")) - {"unit", "sim", "chat", "seeds"}
+    unknown_layers = set(args.layers.split(",")) - {"unit", "sim", "chat", "seeds", "node"}
     if unknown_layers:
         sys.exit(f"unknown layers: {sorted(unknown_layers)}")
     root = Path(__file__).resolve().parent.parent
@@ -660,7 +727,8 @@ def fresh_copy(root, copy):
     rebuild every workspace crate, so no crate keeps an earlier build."""
     if copy.exists():
         shutil.rmtree(copy)
-    shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target", ".git", "*.db*"),
+    shutil.copytree(root, copy,
+                    ignore=shutil.ignore_patterns("target", ".git", "*.db*", "node_modules", "*.node"),
                     copy_function=shutil.copy)
 
 
@@ -682,6 +750,10 @@ def catch(copy, target, seeds, chosen):
         ("chat", "chat tests", ["cargo", "test", "-q", "--release", "-p", "chat-example"]),
         ("seeds", "seeds", ["cargo", "run", "-q", "--release", "-p", "sqlive-sim", "--", "0",
                             "--seeds", str(seeds)]),
+        # The release build above already holds the addon; the tests need
+        # no npm packages.
+        ("node", "node tests", ["sh", "-c", "cd crates/node && node scripts/build.mjs --profile release "
+                                "> /dev/null && node --test --test-timeout=60000 test/*.test.mjs"]),
     ]
     chosen = set(chosen.split(","))
     for key, layer, command in layers:
