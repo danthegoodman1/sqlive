@@ -19,7 +19,7 @@ sqlive = { git = "https://github.com/danthegoodman1/sqlive" }
 ```
 
 The crate bundles SQLite built with `SQLITE_ENABLE_PREUPDATE_HOOK`. For Node.js,
-`npm install @sqlive/sqlive` ([Node.js](#nodejs)).
+`npm install @danthegoodman/sqlive` ([Node.js](#nodejs)).
 
 ## Open a database
 
@@ -265,13 +265,13 @@ set whose `reads_rows_of(table)` is true.
 
 ## Node.js
 
-The `@sqlive/sqlive` npm package binds this library through napi-rs, with prebuilt addons for
+The `@danthegoodman/sqlive` npm package binds this library through napi-rs, with prebuilt addons for
 Linux x64 and arm64 (glibc 2.34 or later, or musl), macOS arm64 and Windows x64, on
 Node.js 22 or later. It keeps the guarantees below, and its
 [README](crates/node/README.md) documents the API.
 
 ```js
-import { LiveDb } from '@sqlive/sqlive'
+import { LiveDb } from '@danthegoodman/sqlive'
 
 const db = new LiveDb('app.db')
 await db.write((tx) => tx.exec('CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, list_id INTEGER, title TEXT)'))

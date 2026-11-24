@@ -10,8 +10,8 @@
 #
 # npm authenticates this workflow through trusted publishing, so the
 # repository stores no npm token, and every version carries a provenance
-# statement. Each of the seven packages, `@sqlive/sqlive` and the six
-# `@sqlive/sqlive-<target>`, trusts this file. A new package trusts it once it
+# statement. Each of the seven packages, `@danthegoodman/sqlive` and the six
+# `@danthegoodman/sqlive-<target>`, trusts this file. A new package trusts it once it
 # exists, through its settings on npmjs.com or with
 #
 #     npm trust github <package> --file release.yml --repo danthegoodman1/sqlive --allow-publish

@@ -1,5 +1,5 @@
 // Type-checked by `npm run typecheck`, never run.
-import { LiveDb, ReadSetIndex, type CommitEvent, type QueryResult, type SqliveError } from '@sqlive/sqlive'
+import { LiveDb, ReadSetIndex, type CommitEvent, type QueryResult, type SqliveError } from '@danthegoodman/sqlive'
 
 interface Todo {
   id: number

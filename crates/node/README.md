@@ -1,4 +1,4 @@
-# @sqlive/sqlive
+# @danthegoodman/sqlive
 
 Live queries for SQLite, in Node.js. Every query returns its rows plus a **read set**:
 the tables, columns and key ranges the result depends on. Every committed write
@@ -11,7 +11,7 @@ library. Its guarantees are SqLive's; the
 [repository README](https://github.com/danthegoodman1/sqlive#guarantees) states them.
 
 ```console
-npm install @sqlive/sqlive
+npm install @danthegoodman/sqlive
 ```
 
 Node.js 22 or later. Prebuilt for Linux x64 and arm64 (glibc 2.34 or later, or musl),
@@ -20,7 +20,7 @@ macOS arm64, and Windows x64.
 ## A live query
 
 ```js
-import { LiveDb } from '@sqlive/sqlive'
+import { LiveDb } from '@danthegoodman/sqlive'
 
 const db = new LiveDb('app.db')
 
@@ -164,7 +164,7 @@ Rust until you read `changes`.
 run the loop yourself, store each query's read set under a key:
 
 ```js
-import { ReadSetIndex } from '@sqlive/sqlive'
+import { ReadSetIndex } from '@danthegoodman/sqlive'
 
 const index = new ReadSetIndex()
 index.insert(subscriptionId, result.readSet)

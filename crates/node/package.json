@@ -1,5 +1,5 @@
 {
-  "name": "@sqlive/sqlive",
+  "name": "@danthegoodman/sqlive",
   "version": "0.1.0",
   "description": "Live queries for SQLite: each query returns its rows and a read set, and each commit an event that says which queries to re-run",
   "keywords": [

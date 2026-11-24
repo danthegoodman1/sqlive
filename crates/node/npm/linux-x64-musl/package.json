@@ -1,7 +1,7 @@
 {
-  "name": "@sqlive/sqlive-linux-x64-musl",
+  "name": "@danthegoodman/sqlive-linux-x64-musl",
   "version": "0.1.0",
-  "description": "The linux-x64-musl native addon of @sqlive/sqlive",
+  "description": "The linux-x64-musl native addon of @danthegoodman/sqlive",
   "author": "Dan Goodman",
   "homepage": "https://github.com/danthegoodman1/sqlive#nodejs",
   "bugs": {
