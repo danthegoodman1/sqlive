@@ -1,0 +1,131 @@
+# Publishes the Node package to npm when a push to main carries a version in
+# crates/node/package.json that npm does not have yet. It ships the addons
+# that push's CI run built and tested, then creates the GitHub release
+# node-v<version> on that commit. A version with a prerelease suffix, such
+# as 0.2.0-rc.1, publishes under the `next` dist-tag.
+#
+# To release, bump the version in a pull request:
+#
+#     cd crates/node && node scripts/release.mjs version 0.2.0
+#
+# Setup, once:
+# - Add an NPM_TOKEN secret, a granular token that may publish `sqlive` and
+#   the six `sqlive-<target>` packages, for the first release, which
+#   creates them.
+# - Then configure trusted publishing on npmjs.com for each of the seven
+#   packages, naming this repository and `release.yml`, and delete the
+#   secret. npm authenticates this workflow over OIDC from then on, and
+#   every version carries a provenance statement.
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  actions: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: crates/node
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.SHA }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@11.12.1
+
+      - name: Decide whether to release
+        id: version
+        run: |
+          node scripts/release.mjs check
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "sqlive@$version" version > /dev/null 2>&1; then
+            echo "sqlive@$version is on npm already"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find the CI run that built this commit
+        if: steps.version.outputs.release == 'true'
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main \
+              --event push --commit "$SHA" --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          fi
+          if [ -z "$RUN_ID" ]; then
+            echo "no successful CI run on main built $SHA" >&2
+            exit 1
+          fi
+          echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: steps.version.outputs.release == 'true'
+        with:
+          pattern: node-*
+          path: addons
+          merge-multiple: true
+          run-id: ${{ steps.ci.outputs.id }}
+          github-token: ${{ github.token }}
+
+      - name: Stage the addons into their packages
+        if: steps.version.outputs.release == 'true'
+        run: |
+          node scripts/release.mjs stage ../../addons
+          npm pack --dry-run
+
+      # Each package version that npm already has is skipped, so a rerun
+      # finishes a release that failed partway.
+      - name: Publish
+        if: steps.version.outputs.release == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/release.mjs publish
+
+      - name: Create the GitHub release
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="node-v$VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$tag exists"
+            exit 0
+          fi
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --title "sqlive $VERSION for Node.js" \
+            --notes "Published to npm: https://www.npmjs.com/package/sqlive/v/$VERSION" "${prerelease[@]}"

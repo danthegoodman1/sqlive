@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,3 +36,191 @@ jobs:
         run: cargo run --release -p sqlive-sim -- ${{ github.sha }}
       - name: Sweep 1,000 seeds
         run: cargo run --release -p sqlive-sim -- 0 --seeds 1000
+
+  # The Node addon, built and tested on each platform it ships for. Each job
+  # uploads its addon; the release workflow publishes the ones a push to main
+  # built. libsqlite3-sys runs bindgen, so every build needs libclang.
+
+  node-linux-gnu:
+    name: node (linux-${{ matrix.arch }}-gnu)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            image: quay.io/pypa/manylinux_2_34_x86_64@sha256:249cdcdcd91ba0639b50140a5a4cd09eead2056e2f76267e7919678a66f9d33d
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_34_aarch64@sha256:8621bc7caecfd1e7818a800e8ae8c979936665f180a93e13efeed54cbb026d74
+    runs-on: ${{ matrix.runner }}
+    # glibc 2.34 is the oldest the addon supports: Debian 12, Ubuntu 22.04,
+    # RHEL 9 and Amazon Linux 2023 have it.
+    container:
+      image: ${{ matrix.image }}
+    defaults:
+      run:
+        working-directory: crates/node
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: dnf install -y clang
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: node-linux-${{ matrix.arch }}-gnu
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/node/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: node scripts/glibc.mjs sqlive.linux-${{ matrix.arch }}-gnu.node 2.34
+      - run: npm test
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: node-linux-${{ matrix.arch }}-gnu
+          path: crates/node/sqlive.linux-${{ matrix.arch }}-gnu.node
+          if-no-files-found: error
+
+  node-linux-musl:
+    name: node (linux-${{ matrix.arch }}-musl)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # JavaScript actions cannot run in an Alpine container on arm64, so the
+      # whole build runs in one `docker run`.
+      - name: Build and test on Alpine
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 sh -euc '
+              apk add --no-cache rustup build-base clang-dev
+              rustup-init -y --profile minimal --default-toolchain none
+              . "$HOME/.cargo/env"
+              rustup install
+              cd crates/node
+              npm ci
+              npm run build
+              npm test
+            '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: node-linux-${{ matrix.arch }}-musl
+          path: crates/node/sqlive.linux-${{ matrix.arch }}-musl.node
+          if-no-files-found: error
+
+  node-macos:
+    name: node (darwin-arm64)
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: crates/node
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: node-darwin-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/node/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: node-darwin-arm64
+          path: crates/node/sqlive.darwin-arm64.node
+          if-no-files-found: error
+
+  node-windows:
+    name: node (win32-x64-msvc)
+    runs-on: windows-2025
+    defaults:
+      run:
+        working-directory: crates/node
+    env:
+      # The runner image's LLVM.
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: node-win32-x64-msvc
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/node/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: node-win32-x64-msvc
+          path: crates/node/sqlive.win32-x64-msvc.node
+          if-no-files-found: error
+
+  node-22:
+    name: node (Node 22)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: crates/node
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: node-22
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/node/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  node-package:
+    name: node (package)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: crates/node
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/node/package-lock.json
+      - run: npm ci
+      - run: node scripts/release.mjs check
+      - run: npm run test:release
+      - run: npm run typecheck
+      - run: npm pack --dry-run

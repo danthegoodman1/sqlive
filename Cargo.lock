@@ -168,7 +168,7 @@ checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -178,12 +178,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "convert_case"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1af709f1f33454bf52eadfc8c78b3b9ef9cb26fb54d16dc9cd9a7299f899fd1b"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "ctor"
+version = "1.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea691ed9f36489d087419b8b2ba3ef27d89621380b4178c73e2445a379e4e0f4"
+dependencies = [
+ "link-section",
 ]
 
 [[package]]
@@ -236,10 +254,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
+name = "futures-channel"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
+name = "futures-io"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
 name = "futures-macro"
@@ -253,6 +313,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-sink"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
+
+[[package]]
 name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -264,9 +330,13 @@ version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
+ "futures-channel",
  "futures-core",
+ "futures-io",
  "futures-macro",
+ "futures-sink",
  "futures-task",
+ "memchr",
  "pin-project-lite",
  "slab",
 ]
@@ -407,6 +477,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -417,6 +497,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "link-section"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d9aae57673c1a235149777a74d152f3210ebd3e3b13346d2cdb6809e566bd3c"
 
 [[package]]
 name = "log"
@@ -458,6 +544,70 @@ dependencies = [
  "wasi",
  "windows-sys",
 ]
+
+[[package]]
+name = "napi"
+version = "3.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "567c62b9c2d0fae123713f766686ad66a2c75b45ba3ee01ed8b06a7e99bc435b"
+dependencies = [
+ "bitflags",
+ "ctor",
+ "futures",
+ "libc",
+ "napi-build",
+ "napi-sys",
+ "nohash-hasher",
+ "rustc-hash",
+]
+
+[[package]]
+name = "napi-build"
+version = "2.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b899b545d3aa6dca985939059f258c5488d34e4ecf39c274e20009748f4b846d"
+
+[[package]]
+name = "napi-derive"
+version = "3.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94c8098ed9d61a1bbd019519c637817531b0e24023ef4b5678f2f0cbe24bed9c"
+dependencies = [
+ "convert_case",
+ "ctor",
+ "napi-derive-backend",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "napi-derive-backend"
+version = "7.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "314cd6ca42bd978fd8bae84b4137e1322bbf3e83552fca8dbd7d18034188ff3a"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "semver",
+ "syn",
+]
+
+[[package]]
+name = "napi-sys"
+version = "3.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d153beb7d5c973f4b9395be8a83054a28968b61188f1dd1a2cc2321af22daea2"
+dependencies = [
+ "libloading 0.9.1",
+]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -575,6 +725,12 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"
@@ -722,6 +878,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlive-node"
+version = "0.1.0"
+dependencies = [
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "sqlive",
+]
+
+[[package]]
 name = "sqlive-sim"
 version = "0.1.0"
 dependencies = [
@@ -846,6 +1012,12 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "vcpkg"

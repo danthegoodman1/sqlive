@@ -1,0 +1,31 @@
+{
+  "name": "sqlive-linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "The linux-x64-gnu native addon of sqlive",
+  "author": "Dan Goodman",
+  "homepage": "https://github.com/danthegoodman1/sqlive#nodejs",
+  "bugs": {
+    "url": "https://github.com/danthegoodman1/sqlive/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danthegoodman1/sqlive.git",
+    "directory": "crates/node"
+  },
+  "main": "sqlive.linux-x64-gnu.node",
+  "files": [
+    "sqlive.linux-x64-gnu.node"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "libc": [
+    "glibc"
+  ]
+}

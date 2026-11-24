@@ -15,7 +15,7 @@ Non-goals until a phase names them: writers in other processes, ATTACHed databas
 - The library starts no threads, reads no clocks and iterates only ordered collections. Events list changes in first-touch order. `clippy.toml` in `crates/live` and `crates/sim` enforces this, so a seed replays exactly.
 - Every feature ships with simulator coverage, a property that fails on a wrong answer, and a planted bug the simulator catches.
 - Build the smallest implementation that meets the phase gate.
-- Execution order: Phase 0 through Phase 14.
+- Execution order: Phase 0 through Phase 15.
 
 ## Testing Strategy
 
@@ -606,3 +606,53 @@ Status ledger:
 | Complete | Gate | The log stays within its budget | `sqlive-bench memory`, one 200,000-row insert then three updates of every row. Default options: 3.0 MB at the peak, and four events that name `chats`, under 1 KB, left in the log. With `table_changes: usize::MAX`: 216 MB at the peak and 97 MB left, the newest event. With `log_bytes: usize::MAX` as well: 374 MB and 353 MB. `sqlive-bench writes` on tmpfs stays within 2% of the README's figures: 58,343 one-row commits a second, and 983,285, 1,626,471 and 1,597,993 rows a second in commits of 1,000. |
 | Complete | Gate | 10,000-seed sweep | `scripts/check 10000`: fmt, clippy and every test pass, 0 of 10,000 seeds failed. |
 | Complete | Gate | Code review | `/code-review high`, 10 findings, none a wrong answer in the cap, `whole_tables`, the index or the log budget. Fixed: the README told a replica to resume from the version at which it read a named table again, which loses other tables' changes, and now tells it to keep following and skip that table's earlier rows, as the simulator's replicas do; the simulator checks the cap on every event and that a current replica never lags; capture keeps one count for each table in place of two maps, and releases rows in passes that cost in proportion to what it holds; the benchmark's peak no longer counts a reallocated block twice; the docs of `CommitEvent::changes`, `capture.rs` and the crate say that an event can name a table in place of its rows. Answered under "Out of scope": the cap bounds rows, not bytes. Answered in Phase 12: seed 117131, outside the gate's range, held `'a'` for a group whose fresh value was `'A'`; SQL leaves a group's value open, so the harness now compares grouped results without it, the README's **Conservative** guarantee names the case, and the seed is a regression test. |
+
+## Phase 15: Node.js Binding
+
+Goal:
+Node.js apps use SqLive through an npm package, `sqlive`, built on napi-rs. Reads cost close to what they cost in Rust; writes never block the event loop on fsync; live queries take one call. CI builds and tests the addon on every platform it ships for, and a version bump on `main` publishes it.
+
+Scope:
+- 15A Crate `crates/node` (`sqlive-node`, a cdylib) and the package's JavaScript layer (`index.js`, `index.d.ts`). The binding starts one writer thread per database, which `crates/live` may not.
+- 15B Reads. `query`, `rerun` and `snapshot.query` run on the calling thread; `queryAsync` and `rerunAsync` run on libuv's thread pool. Rows cross packed: numbers in an 8-byte slot of a reused buffer, text in strings of at most 4,096 UTF-16 units that JavaScript slices, blobs as `Buffer`s; a constructor compiled once per column list builds the row objects. A read set crosses as a type-tagged external.
+- 15C Writes. `write(fn)` runs `fn` on the JavaScript thread, holding the transaction across its awaits, while the writer thread waits; then the writer thread commits. `writeSync` commits on the calling thread and refuses while an asynchronous write is pending. `vacuum` runs on the writer thread. A write inside a write refuses instead of deadlocking, and a `tx` works only during its own callback.
+- 15D Change streams as async iterators, woken by the binding's own commits; events stay in Rust until JavaScript reads `changes`. `ReadSetIndex` with number and string keys.
+- 15E `subscribe(sql, params)`: one index and one follower per database; re-runs store their read sets straight into the index; a lagged follower re-runs every subscription.
+- 15F Values: integers within 53 bits as numbers and the rest a `RangeError`, or every integer a `bigint` with `safeIntegers`; `-0` binds as a real; errors carry SQLite's code names or `ERR_SQLIVE_*` codes with their fields.
+- 15G Packaging and release: six platform packages (`sqlive-<target>`), CI jobs that build and test each and upload its addon, and `.github/workflows/release.yml`, which publishes the addons a green push to `main` built whenever the package version is new to npm.
+- 15H Benchmarks: `npm run bench` runs `sqlive-bench`'s workloads; the README compares the two.
+
+Out of scope:
+- Linux on 32-bit or other architectures, macOS on Intel, and Windows on arm64.
+- Group commit: queued writes each commit alone.
+- Sharing a database between worker threads; each worker opens its own `LiveDb`.
+- Simulator coverage. The binding adds no change capture or read-set logic: its properties check its conversions and its loops against SQLite itself, through `node:sqlite`.
+
+Completion gate:
+`npm test` passes on Node 22 and 24 and on every CI target; the properties hold over 20 seeds; `scripts/mutants --layers node` catches every Phase 15 planted bug; the README carries the Node benchmarks beside Rust's.
+
+Testing plan:
+- `test/basics.test.mjs`: value round trips with their storage classes, parameter forms, write outcomes and their refusals, snapshots, closing, and a process that exits once idle.
+- `test/changes.test.mjs`: event shape, streams, lag, the change cap, read sets, the index, and a follower that falls behind the log.
+- `test/live.test.mjs`: seeded random writes in all three write modes, some rolled back; each subscription's rows equal a fresh `node:sqlite` query, a replica built from events equals a table dump, `affected` equals testing every read set, and each delivery's hash differs from the one before.
+- Planted bugs: `-0` bound as an integer; bare keys given the colon prefix; non-ASCII text measured in bytes; large integers rounded; text that never moves to its next chunk; event rows swapped; a failed callback committed by the writer, or reported as a success; a kept transaction reaching a later write; a write that wakes no stream; a subscription skipping a key; a lagged follower that stops; re-runs that ignore the previous hash; an open write left waiting at teardown; the cleanup hook's reference freed twice; the event loop let go before every job settles; rows that take their width from their column names; a typed array bound one byte per element; a vacuum allowed inside a write.
+- `scripts/release.test.mjs`: version changes, drift, staging and idempotent publishing.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 15A: Crate and JavaScript layer | `crates/node/src/{db,query,rows,events,read_set,values,errors}.rs`; `crates/node/index.js`, `index.mjs`, `index.d.ts`, `binding.js`. `npm run typecheck` checks `test/types.ts` against the declarations. |
+| Complete | Decision | Reads on the calling thread, writes off the event loop | The owner chose, on 2026-11-22. A commit waits for fsync: on the drive, `writeSync` stalls the event loop 4.03 ms at the median and 9.99 ms at worst across 1,000 single-row commits, while under `write` a 1 ms timer never waits more than 2.01 ms. A hot query takes 7.9 µs, less than a trip through the thread pool. |
+| Complete | Work | 15B: Reads | `Packed` in `crates/node/src/rows.rs`, `unpack` in `index.js`, `read_set::to_js`. The chat query took 10.5 µs with one Node-API call per value; packing rows took it to 9.1, a type-tagged external in place of a class instance for the read set to 8.5, and reusing each thread's packer to 7.9. Rust takes 6.1 µs and `node:sqlite` 6.0. A full scan reads 3.64 million rows a second, against 4.97 million in Rust and 3.09 million through `node:sqlite`. |
+| Complete | Work | 15C: Writes | `NativeDb::queue`, `run_writer` and `write_sync` in `crates/node/src/db.rs`; `WriteJob` in `index.js`. The JavaScript and writer threads each hold a count on the dispatcher, and an environment cleanup hook, registered after it so it runs first, releases both and rolls back a write whose callback can no longer finish. Two failures led there: Node finalized `NativeDb` while tearing down the dispatcher, holding the lock the finalizer's release took, which hung exit on Node 24; and the writer thread released a dispatcher Node had already destroyed, which aborted exit on Node 22 (CI run on PR #2). `the process exits once no write is pending, and not before` and `a worker that ends inside a write rolls it back and lets the lock go` check both. |
+| Complete | Work | 15D: Change streams and the index | `ChangeStream` and `Hub` in `index.js`; `CommitEvent` and `NativeIndex` in Rust. A read wakes the streams only when it finds a version newer than any reported. `affected` handles 107,560 events a second over 100,000 read sets, against 124,673 in Rust. |
+| Complete | Work | 15E: `subscribe` | `Live` and `Subscription` in `index.js`; `NativeDb::query_into`. A subscription copies its parameters, so a caller's later change cannot reach its re-runs. |
+| Complete | Work | 15F: Values and errors | `crates/node/src/values.rs`, `errors.rs`. |
+| Complete | Work | 15G: Packaging and release | `crates/node/npm/*`, `scripts/release.mjs`, `scripts/build.mjs`, `scripts/glibc.mjs`; `.github/workflows/ci.yml` and `release.yml`, which `actionlint` passes. libsqlite3-sys runs bindgen, so every build needs libclang, and on musl its build scripts must link the C runtime dynamically to load it; the napi CLI always passes `--target`, which keeps them static, so `scripts/build.mjs` runs `cargo build` for the host. Built locally: linux-x64-gnu in the pinned manylinux_2_34 image, which needs at most GLIBC_2.34 and passes `npm test` on the host, and linux-x64-musl in Alpine, which passes `npm test` there. |
+| Complete | Decision | Release on a new version, not on every merge | A merged version bump releases; no bot commits to `main`. The workflow ships the addons the green CI run built, names the platform packages as optional dependencies only at publish time, so the lockfile never refers to an unpublished package, and skips each version npm has, so a rerun finishes a partial release. |
+| Complete | Work | 15H: Benchmarks | `crates/node/bench/bench.mjs`; README "Node.js against Rust", run back to back with `sqlive-bench`. |
+| Complete | Test | Unit and property tests | `npm test`: 39 tests, on Node 24.18.0 and 22.23.5, among them `live results match fresh queries` for seeds 1–3, 200 steps each. `SQLIVE_SEEDS=20 SQLIVE_STEPS=300` passes. `scripts/release.test.mjs`: 5 tests. `cargo test -p sqlive-node`: 3. |
+| Complete | Gate | CI on every target | PR #2, run 45064952969 on 3837126: `npm test` passes on linux-x64-gnu and linux-arm64-gnu in manylinux_2_34, linux-x64-musl and linux-arm64-musl in Alpine, darwin-arm64, win32-x64-msvc, and Node 22; the package job passes `release.mjs check`, the release tests, the typecheck and `npm pack`. |
+| Complete | Test | Phase 15 planted bugs | `scripts/mutants --layers node`: 19 of 19 caught. Two needed stronger tests. A lagged follower that stops without re-running survived until `a subscription that falls behind the log re-runs and catches up` let the follower take one event before the lag. Letting the event loop go before every job settles survived until the exit test's vacuum ran long enough to finish after the write settled. |
+| Complete | Gate | Code review | `/code-review high`, 10 findings, 7 reproduced. Fixed: an empty value between two that each fill a text chunk came back empty, as did the value after it; `vacuum` inside a write's callback deadlocked; a worker terminated inside a write left the writer waiting and the database locked; a huge `busyTimeout` aborted the process; a `Float16Array` parameter read past its buffer; a lone column with an empty name threw; a bare key took a prefix from inside a string literal; the event loop could exit before the last job settled, since the writer counted jobs done before JavaScript settled them; the ledger. Each has a test. Answered in the README: a named parameter the object leaves out binds `NULL`, as SQLite and SqLive's Rust API do. |

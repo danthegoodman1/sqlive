@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/bench", "crates/live", "crates/sim", "examples/chat"]
+members = ["crates/bench", "crates/live", "crates/node", "crates/sim", "examples/chat"]
 
 [workspace.package]
 edition = "2024"
@@ -15,3 +15,12 @@ sqlive = { path = "crates/live" }
 
 [profile.release]
 debug = 1
+
+# The Node addon ships stripped, with link-time optimization across SqLive,
+# rusqlite and napi-rs.
+[profile.node]
+inherits = "release"
+debug = false
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
