@@ -1,7 +1,7 @@
 {
-  "name": "sqlive-linux-arm64-musl",
+  "name": "@sqlive/sqlive-linux-arm64-musl",
   "version": "0.1.0",
-  "description": "The linux-arm64-musl native addon of sqlive",
+  "description": "The linux-arm64-musl native addon of @sqlive/sqlive",
   "author": "Dan Goodman",
   "homepage": "https://github.com/danthegoodman1/sqlive#nodejs",
   "bugs": {

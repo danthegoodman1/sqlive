@@ -50,7 +50,7 @@ test('stage copies every addon and names the platform packages', (t) => {
   writeFileSync(join(built, addonName(TARGETS[0].target)), TARGETS[0].target)
   stage(built, root)
   const main = readJson(join(root, 'package.json'))
-  assert.deepEqual(Object.keys(main.optionalDependencies), TARGETS.map(({ target }) => `sqlive-${target}`))
+  assert.deepEqual(Object.keys(main.optionalDependencies), TARGETS.map(({ target }) => `${main.name}-${target}`))
   for (const { target } of TARGETS) {
     assert.equal(readFileSync(join(root, 'npm', target, addonName(target)), 'utf8'), target)
   }
@@ -65,14 +65,14 @@ test('publish skips published versions and finishes with the main package', (t) 
   const calls = []
   const exec = (command, args) => {
     calls.push(args)
-    if (args[0] === 'view' && args[1].startsWith('sqlive-darwin-arm64@')) return main.version
+    if (args[0] === 'view' && args[1].startsWith(`${main.name}-darwin-arm64@`)) return main.version
     if (args[0] === 'view') throw new Error('E404')
     return ''
   }
   const done = publish({ root, exec })
   assert.equal(done.length, TARGETS.length)
-  assert.equal(done.at(-1), `sqlive@${main.version}`)
-  assert.ok(!done.some((name) => name.startsWith('sqlive-darwin-arm64@')))
+  assert.equal(done.at(-1), `${main.name}@${main.version}`)
+  assert.ok(!done.some((name) => name.startsWith(`${main.name}-darwin-arm64@`)))
   const published = calls.filter((args) => args[0] === 'publish')
   assert.ok(published.every((args) => args.includes('--provenance') && args.includes('--access')))
   assert.equal(distTag('1.0.0'), 'latest')

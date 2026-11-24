@@ -48,12 +48,13 @@ function load() {
   const name = target()
   const local = attempt(join(__dirname, `sqlive.${name}.node`))
   if (local) return local
-  const packaged = attempt(`sqlive-${name}`)
+  const main = require('./package.json')
+  const platform = `${main.name}-${name}`
+  const packaged = attempt(platform)
   if (packaged) {
-    const expected = require('./package.json').version
-    const actual = require(`sqlive-${name}/package.json`).version
-    if (actual !== expected) {
-      throw new Error(`sqlive ${expected} found sqlive-${name} ${actual}; reinstall so their versions match`)
+    const actual = require(`${platform}/package.json`).version
+    if (actual !== main.version) {
+      throw new Error(`${main.name} ${main.version} found ${platform} ${actual}; reinstall so their versions match`)
     }
     return packaged
   }

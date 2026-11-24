@@ -610,7 +610,7 @@ Status ledger:
 ## Phase 15: Node.js Binding
 
 Goal:
-Node.js apps use SqLive through an npm package, `sqlive`, built on napi-rs. Reads cost close to what they cost in Rust; writes never block the event loop on fsync; live queries take one call. CI builds and tests the addon on every platform it ships for, and a version bump on `main` publishes it.
+Node.js apps use SqLive through an npm package, `@sqlive/sqlive`, built on napi-rs. Reads cost close to what they cost in Rust; writes never block the event loop on fsync; live queries take one call. CI builds and tests the addon on every platform it ships for, and a version bump on `main` publishes it.
 
 Scope:
 - 15A Crate `crates/node` (`sqlive-node`, a cdylib) and the package's JavaScript layer (`index.js`, `index.d.ts`). The binding starts one writer thread per database, which `crates/live` may not.
@@ -619,7 +619,7 @@ Scope:
 - 15D Change streams as async iterators, woken by the binding's own commits; events stay in Rust until JavaScript reads `changes`. `ReadSetIndex` with number and string keys.
 - 15E `subscribe(sql, params)`: one index and one follower per database; re-runs store their read sets straight into the index; a lagged follower re-runs every subscription.
 - 15F Values: integers within 53 bits as numbers and the rest a `RangeError`, or every integer a `bigint` with `safeIntegers`; `-0` binds as a real; errors carry SQLite's code names or `ERR_SQLIVE_*` codes with their fields.
-- 15G Packaging and release: six platform packages (`sqlive-<target>`), CI jobs that build and test each and upload its addon, and `.github/workflows/release.yml`, which publishes the addons a green push to `main` built whenever the package version is new to npm.
+- 15G Packaging and release: six platform packages (`@sqlive/sqlive-<target>`), CI jobs that build and test each and upload its addon, and `.github/workflows/release.yml`, which publishes the addons a green push to `main` built whenever the package version is new to npm.
 - 15H Benchmarks: `npm run bench` runs `sqlive-bench`'s workloads; the README compares the two.
 
 Out of scope:
@@ -650,6 +650,7 @@ Status ledger:
 | Complete | Work | 15E: `subscribe` | `Live` and `Subscription` in `index.js`; `NativeDb::query_into`. A subscription copies its parameters, so a caller's later change cannot reach its re-runs. |
 | Complete | Work | 15F: Values and errors | `crates/node/src/values.rs`, `errors.rs`. |
 | Complete | Work | 15G: Packaging and release | `crates/node/npm/*`, `scripts/release.mjs`, `scripts/build.mjs`, `scripts/glibc.mjs`; `.github/workflows/ci.yml` and `release.yml`, which `actionlint` passes. libsqlite3-sys runs bindgen, so every build needs libclang, and on musl its build scripts must link the C runtime dynamically to load it; the napi CLI always passes `--target`, which keeps them static, so `scripts/build.mjs` runs `cargo build` for the host. Built locally: linux-x64-gnu in the pinned manylinux_2_34 image, which needs at most GLIBC_2.34 and passes `npm test` on the host, and linux-x64-musl in Alpine, which passes `npm test` there. |
+| Complete | Decision | npm name `@sqlive/sqlive` | npm refused the unscoped `sqlive` on 2026-11-24 as too similar to `sqlite` and `sqlite3`. The owner chose an `sqlive` org, as tinysandbox publishes `@tinysandbox/tinysandbox`; the platform packages are `@sqlive/sqlive-<target>`. A packed `@sqlive/sqlive` and `@sqlive/sqlive-linux-x64-gnu`, installed together, load and query from CommonJS and ESM. |
 | Complete | Decision | Release on a new version, not on every merge | A merged version bump releases; no bot commits to `main`. The workflow ships the addons the green CI run built, names the platform packages as optional dependencies only at publish time, so the lockfile never refers to an unpublished package, and skips each version npm has, so a rerun finishes a partial release. |
 | Complete | Work | 15H: Benchmarks | `crates/node/bench/bench.mjs`; README "Node.js against Rust", run back to back with `sqlive-bench`. |
 | Complete | Test | Unit and property tests | `npm test`: 39 tests, on Node 24.18.0 and 22.23.5, among them `live results match fresh queries` for seeds 1–3, 200 steps each. `SQLIVE_SEEDS=20 SQLIVE_STEPS=300` passes. `scripts/release.test.mjs`: 5 tests. `cargo test -p sqlive-node`: 3. |

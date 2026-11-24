@@ -1,7 +1,7 @@
 {
-  "name": "sqlive-win32-x64-msvc",
+  "name": "@sqlive/sqlive-win32-x64-msvc",
   "version": "0.1.0",
-  "description": "The win32-x64-msvc native addon of sqlive",
+  "description": "The win32-x64-msvc native addon of @sqlive/sqlive",
   "author": "Dan Goodman",
   "homepage": "https://github.com/danthegoodman1/sqlive#nodejs",
   "bugs": {

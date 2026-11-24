@@ -1,7 +1,7 @@
 {
-  "name": "sqlive-linux-x64-gnu",
+  "name": "@sqlive/sqlive-linux-x64-gnu",
   "version": "0.1.0",
-  "description": "The linux-x64-gnu native addon of sqlive",
+  "description": "The linux-x64-gnu native addon of @sqlive/sqlive",
   "author": "Dan Goodman",
   "homepage": "https://github.com/danthegoodman1/sqlive#nodejs",
   "bugs": {
