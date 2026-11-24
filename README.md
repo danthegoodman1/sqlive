@@ -19,7 +19,7 @@ sqlive = { git = "https://github.com/danthegoodman1/sqlive" }
 ```
 
 The crate bundles SQLite built with `SQLITE_ENABLE_PREUPDATE_HOOK`. For Node.js,
-`npm install sqlive` ([Node.js](#nodejs)).
+`npm install @danthegoodman/sqlive` ([Node.js](#nodejs)).
 
 ## Open a database
 
@@ -265,13 +265,13 @@ set whose `reads_rows_of(table)` is true.
 
 ## Node.js
 
-The `sqlive` npm package binds this library through napi-rs, with prebuilt addons for
+The `@danthegoodman/sqlive` npm package binds this library through napi-rs, with prebuilt addons for
 Linux x64 and arm64 (glibc 2.34 or later, or musl), macOS arm64 and Windows x64, on
 Node.js 22 or later. It keeps the guarantees below, and its
 [README](crates/node/README.md) documents the API.
 
 ```js
-import { LiveDb } from 'sqlive'
+import { LiveDb } from '@danthegoodman/sqlive'
 
 const db = new LiveDb('app.db')
 await db.write((tx) => tx.exec('CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, list_id INTEGER, title TEXT)'))
@@ -676,4 +676,5 @@ itself, through `node:sqlite`.
 To release the npm package, bump its version in a pull request
 (`node scripts/release.mjs version X.Y.Z` in `crates/node`). Once CI passes on `main`,
 the release workflow publishes the addons that CI run built and tested, skipping any
-package version npm already has, and creates the GitHub release `node-vX.Y.Z`.
+package version npm already has, and creates the GitHub release `node-vX.Y.Z`. npm
+trusts the workflow to publish each package, so the repository stores no npm token.

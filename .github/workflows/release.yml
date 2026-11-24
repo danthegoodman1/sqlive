@@ -8,14 +8,15 @@
 #
 #     cd crates/node && node scripts/release.mjs version 0.2.0
 #
-# Setup, once:
-# - Add an NPM_TOKEN secret, a granular token that may publish `sqlive` and
-#   the six `sqlive-<target>` packages, for the first release, which
-#   creates them.
-# - Then configure trusted publishing on npmjs.com for each of the seven
-#   packages, naming this repository and `release.yml`, and delete the
-#   secret. npm authenticates this workflow over OIDC from then on, and
-#   every version carries a provenance statement.
+# npm authenticates this workflow through trusted publishing, so the
+# repository stores no npm token, and every version carries a provenance
+# statement. Each of the seven packages, `@danthegoodman/sqlive` and the six
+# `@danthegoodman/sqlive-<target>`, trusts this file. A new package trusts it once it
+# exists, through its settings on npmjs.com or with
+#
+#     npm trust github <package> --file release.yml --repo danthegoodman1/sqlive --allow-publish
+#
+# and the trust lapses unless a publish uses it within 2 days.
 name: Release
 
 on:
@@ -64,10 +65,12 @@ jobs:
         id: version
         run: |
           node scripts/release.mjs check
+          name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if npm view "sqlive@$version" version > /dev/null 2>&1; then
-            echo "sqlive@$version is on npm already"
+          if npm view "$name@$version" version > /dev/null 2>&1; then
+            echo "$name@$version is on npm already"
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
             echo "release=true" >> "$GITHUB_OUTPUT"
@@ -109,14 +112,13 @@ jobs:
       # finishes a release that failed partway.
       - name: Publish
         if: steps.version.outputs.release == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: node scripts/release.mjs publish
 
       - name: Create the GitHub release
         if: steps.version.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.version.outputs.name }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           tag="node-v$VERSION"
@@ -127,5 +129,5 @@ jobs:
           prerelease=()
           if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
-            --title "sqlive $VERSION for Node.js" \
-            --notes "Published to npm: https://www.npmjs.com/package/sqlive/v/$VERSION" "${prerelease[@]}"
+            --title "$NAME $VERSION for Node.js" \
+            --notes "Published to npm: https://www.npmjs.com/package/$NAME/v/$VERSION" "${prerelease[@]}"
